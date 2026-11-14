@@ -1235,8 +1235,12 @@ mod tests {
             }),
             ..Default::default()
         };
+        // Any absolute path to an existing file passes the executable check; the test's own
+        // binary exists on every platform, unlike `/bin/sh`.
+        let executable = std::env::current_exe().unwrap();
+        let executable = executable.to_str().unwrap().to_owned();
         let request = |url: Option<&str>| {
-            let mut value = json!({"omp_executable":"/bin/sh","worker_config_approved":"on"});
+            let mut value = json!({"omp_executable":executable,"worker_config_approved":"on"});
             if let Some(url) = url {
                 value["coordinator_url"] = json!(url);
             }
