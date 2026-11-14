@@ -1,5 +1,5 @@
 use crate::api::{self, BoardTask, Mutation, TaskStatus};
-use leptos::{html, prelude::*, task::spawn_local};
+use leptos::{html, prelude::*, task::spawn_local, wasm_bindgen::JsCast, web_sys};
 
 #[derive(Clone, Copy)]
 struct Board {
@@ -14,6 +14,7 @@ struct Board {
     editing: RwSignal<Option<String>>,
     title: RwSignal<String>,
     description: RwSignal<String>,
+    title_error: RwSignal<Option<String>>,
     confirming_delete: RwSignal<Option<String>>,
     title_input: NodeRef<html::Input>,
     list_heading: NodeRef<html::H2>,
@@ -34,10 +35,29 @@ impl Board {
         }
     }
 
+    /// Return keyboard focus to a task's status control once the reloaded row
+    /// is rendered and re-enabled; fall back to the list heading when the task
+    /// is no longer shown (for example, filtered out by its new status).
+    fn focus_status(self, id: &str) {
+        let element_id = format!("task-status-{id}");
+        let list_heading = self.list_heading;
+        request_animation_frame(move || {
+            let target = document()
+                .get_element_by_id(&element_id)
+                .and_then(|element| element.dyn_into::<web_sys::HtmlElement>().ok());
+            if let Some(target) = target {
+                let _ = target.focus();
+            } else if let Some(heading) = list_heading.get_untracked() {
+                let _ = heading.focus();
+            }
+        });
+    }
+
     fn reset_form(self) {
         self.editing.set(None);
         self.title.set(String::new());
         self.description.set(String::new());
+        self.title_error.set(None);
     }
 
     fn edit(self, task: &BoardTask) {
@@ -98,6 +118,10 @@ impl Board {
                 || matches!(&mutation, Mutation::Delete { id }
                     if self.editing.get_untracked().as_ref() == Some(id));
             let message = mutation.success_message();
+            let status_task = match &mutation {
+                Mutation::Status { id, .. } => Some(id.clone()),
+                _ => None,
+            };
             match mutation.execute().await {
                 Ok(()) => {
                     if edits_form {
@@ -110,11 +134,18 @@ impl Board {
                             "{message} The list could not be refreshed: {error}"
                         )));
                     }
-                    self.focus_list();
+                    if status_task.is_none() {
+                        self.focus_list();
+                    }
                 }
                 Err(error) => self.error.set(Some(error)),
             }
             self.pending.set(false);
+            // The status control was disabled (and its row re-rendered) while
+            // saving; keep the keyboard user on it instead of the list heading.
+            if let Some(id) = status_task {
+                self.focus_status(&id);
+            }
         });
     }
 }
@@ -132,6 +163,7 @@ pub fn App() -> impl IntoView {
         status: RwSignal::new(None),
         editing: RwSignal::new(None),
         title: RwSignal::new(String::new()),
+        title_error: RwSignal::new(None),
         description: RwSignal::new(String::new()),
         confirming_delete: RwSignal::new(None),
         title_input: NodeRef::new(),
@@ -192,10 +224,12 @@ pub fn App() -> impl IntoView {
                         let title = board.title.get_untracked();
                         let description = board.description.get_untracked();
                         if title.trim().is_empty() {
-                            board.error.set(Some("Enter a title containing at least one non-space character.".to_owned()));
+                            // A validation problem, not a server failure: report it at the field.
+                            board.title_error.set(Some("Enter a title containing at least one non-space character.".to_owned()));
                             if let Some(input) = board.title_input.get() { let _ = input.focus(); }
                             return;
                         }
+                        board.title_error.set(None);
                         let mutation = match board.editing.get_untracked() {
                             Some(id) => Mutation::Edit { id, title, description },
                             None => Mutation::Create { title, description },
@@ -206,8 +240,18 @@ pub fn App() -> impl IntoView {
                             <legend class="visually-hidden">"Task details"</legend>
                             <label for="task-title">"Title "<span class="required">"(required)"</span></label>
                             <input id="task-title" name="title" type="text" required node_ref=board.title_input
+                                aria-invalid=move || board.title_error.get().is_some().then_some("true")
+                                aria-describedby=move || board.title_error.get().is_some().then_some("task-title-error")
                                 prop:value=move || board.title.get()
-                                on:input=move |event| board.title.set(event_target_value(&event)) />
+                                on:input=move |event| {
+                                    board.title.set(event_target_value(&event));
+                                    board.title_error.set(None);
+                                } />
+                            <Show when=move || board.title_error.get().is_some()>
+                                <p id="task-title-error" class="field-error" role="alert">
+                                    {move || board.title_error.get().unwrap_or_default()}
+                                </p>
+                            </Show>
                             <label for="task-description">"Description"</label>
                             <textarea id="task-description" name="description" rows="4"
                                 prop:value=move || board.description.get()
@@ -288,6 +332,14 @@ pub fn App() -> impl IntoView {
 #[component]
 fn TaskRow(task: BoardTask, board: Board) -> impl IntoView {
     let status_select = NodeRef::<html::Select>::new();
+    let delete_button = NodeRef::<html::Button>::new();
+    // Cancelling removes the focused confirmation; return focus to Delete.
+    let keep_task = move || {
+        board.confirming_delete.set(None);
+        if let Some(button) = delete_button.get_untracked() {
+            let _ = button.focus();
+        }
+    };
     let edit_task = task.clone();
     let status_id = task.id.clone();
     let confirm_id = task.id.clone();
@@ -332,14 +384,19 @@ fn TaskRow(task: BoardTask, board: Board) -> impl IntoView {
                     <div class="actions">
                         <button type="button" class="secondary" aria-label=edit_label disabled=move || board.busy()
                             on:click=move |_| board.edit(&edit_task)>"Edit"</button>
-                        <button type="button" class="danger secondary" aria-label=delete_label
+                        <button type="button" class="danger secondary" aria-label=delete_label node_ref=delete_button
                             aria-expanded=move || (board.confirming_delete.get().as_ref() == Some(&expanded_id)).to_string()
                             disabled=move || board.busy()
                             on:click=move |_| board.confirming_delete.set(Some(confirm_id.clone()))>"Delete"</button>
                     </div>
                 </div>
                 <Show when=move || board.confirming_delete.get().as_ref() == Some(&show_confirmation_id)>
-                    <div class="delete-confirmation" role="group" aria-label="Confirm task deletion">
+                    <div class="delete-confirmation" role="group" aria-label="Confirm task deletion"
+                        on:keydown=move |event| {
+                            if event.key() == "Escape" && !board.busy_untracked() {
+                                keep_task();
+                            }
+                        }>
                         <p>{format!("Permanently delete “{title}”? This cannot be undone.")}</p>
                         <div class="actions">
                             <button type="button" class="danger" disabled=move || board.busy()
@@ -347,7 +404,7 @@ fn TaskRow(task: BoardTask, board: Board) -> impl IntoView {
                                     board.mutate(Mutation::Delete { id: id.clone() });
                                 }}>"Confirm delete"</button>
                             <button type="button" class="secondary" disabled=move || board.busy()
-                                on:click=move |_| board.confirming_delete.set(None)>"Keep task"</button>
+                                on:click=move |_| keep_task()>"Keep task"</button>
                         </div>
                     </div>
                 </Show>

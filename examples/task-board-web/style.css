@@ -56,6 +56,9 @@ textarea { display: block; resize: vertical; min-height: 96px; }
 input:disabled, textarea:disabled, select:disabled { color: var(--muted); opacity: .65; }
 label { display: block; margin-bottom: 4px; color: var(--muted); font-weight: 400; }
 input + label, textarea + label { margin-top: 12px; }
+.field-error { margin: 4px 0 0; color: var(--danger); overflow-wrap: anywhere; }
+.field-error + label { margin-top: 12px; }
+input[aria-invalid="true"] { border-color: var(--danger); }
 :focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
 h2[tabindex]:focus { outline: 2px solid var(--focus); outline-offset: 4px; }
 fieldset { margin: 0; padding: 0; border: 0; min-width: 0; }
