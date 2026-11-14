@@ -15,7 +15,16 @@ Harness: [`wsl-e2e/setup.sh`](wsl-e2e/setup.sh) and [`wsl-e2e/scenario.sh`](wsl-
 (throwaway test scripts, not deployment). They expect `/root/hs` (Headscale binary, config, sqlite DB,
 API key) and `/root/ts` (Tailscale tarball) from the earlier
 [local Headscale run](local-headscale-integration.md), and a clone of this repository at `/root/dacs-src`.
-No secrets are in the repository. The test CA, operation token and API key exist only in WSL.
+No secrets are in the repository.
+
+Retained raw output (checked for keys and tokens before committing) is in [`wsl-e2e/logs/`](wsl-e2e/logs/):
+`paths.log` (direct and DERP transfers, rows 16–18), `revoke.log` (rows 19–21), `netadmin-audit.jsonl`
+(the six enroll/revoke audit entries) and `guest-tailscaled-excerpt.log` (home-DERP and state
+transitions cited for bug B and row 10).
+
+Teardown: after the run the namespaces, bridge, `/etc/hosts` entries, the throwaway CA (removed from the
+distro trust store), the operation token, `/root/dacs-e2e` and `/root/dacs-src` were deleted. Only
+`/root/hs` and `/root/ts` from the earlier run remain in the distro.
 
 ## Topology
 

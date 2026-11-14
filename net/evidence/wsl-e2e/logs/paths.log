@@ -1,0 +1,37 @@
+
+### path + transfer: direct
+{
+  "peer": "compile-guest",
+  "path": {
+    "path": "direct",
+    "endpoint": "10.99.0.12:41641"
+  },
+  "rtt_ms": 0.4,
+  "measured_at": "2026-11-14T20:09:23.464875352Z"
+}
+exit 0
+64 MiB in 0.17 s = 379.4 MiB/s
+{"host_name":"compile-guest","path_after":{"path":"direct","endpoint":"10.99.0.12:41641"},"rx_bytes":267072,"tx_bytes":72137832}
+{"host_name":"dacs-infra","path_after":{"path":"derp","region":"dacs"},"rx_bytes":0,"tx_bytes":0}
+[{"endpoint":{"host_name":"compile-guest","role":"scheduler","overlay_ip":"100.64.0.5","port":10600},"tcp":{"target":"100.64.0.5:10600","overlay_private":true,"reachable":true,"connect_ms":0.74482,"error":null},"path":{"peer":"100.64.0.5","path":{"path":"direct","endpoint":"10.99.0.12:41641"},"rtt_ms":0.6666666666666666,"measured_at":"2026-11-14T20:09:30.903894572Z"},"ok":true},{"endpoint":{"host_name":"compile-guest","role":"server","overlay_ip":"100.64.0.5","port":10501},"tcp":{"target":"100.64.0.5:10501","overlay_private":true,"reachable":true,"connect_ms":0.707931,"error":null},"path":{"peer":"100.64.0.5","path":{"path":"direct","endpoint":"10.99.0.12:41641"},"rtt_ms":0.6666666666666666,"measured_at":"2026-11-14T20:09:35.243666819Z"},"ok":true}]
+
+### block direct UDP between coordinator and guest (STUN/DERP to infra still allowed)
+
+### path + transfer: derp
+{
+  "peer": "compile-guest",
+  "path": {
+    "path": "derp",
+    "region": "dacs"
+  },
+  "rtt_ms": 1.2,
+  "measured_at": "2026-11-14T20:09:46.494423021Z"
+}
+exit 0
+64 MiB in 25.70 s = 2.5 MiB/s
+{"host_name":"compile-guest","path_after":{"path":"derp","region":"dacs"},"rx_bytes":1759120,"tx_bytes":72492496}
+{"host_name":"dacs-infra","path_after":{"path":"derp","region":"dacs"},"rx_bytes":0,"tx_bytes":0}
+[{"endpoint":{"host_name":"compile-guest","role":"scheduler","overlay_ip":"100.64.0.5","port":10600},"tcp":{"target":"100.64.0.5:10600","overlay_private":true,"reachable":true,"connect_ms":0.991378,"error":null},"path":{"peer":"100.64.0.5","path":{"path":"derp","region":"dacs"},"rtt_ms":1.0,"measured_at":"2026-11-14T20:10:19.296678642Z"},"ok":true},{"endpoint":{"host_name":"compile-guest","role":"server","overlay_ip":"100.64.0.5","port":10501},"tcp":{"target":"100.64.0.5:10501","overlay_private":true,"reachable":true,"connect_ms":1.008225,"error":null},"path":{"peer":"100.64.0.5","path":{"path":"derp","region":"dacs"},"rtt_ms":4.0,"measured_at":"2026-11-14T20:10:22.998483536Z"},"ok":true}]
+### after unblock
+{"peer":"compile-guest","path":{"path":"direct","endpoint":"10.99.0.12:41641"},"rtt_ms":0.1,"measured_at":"2026-11-14T20:10:36.928088877Z"}
+PATHS-DONE
