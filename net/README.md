@@ -217,7 +217,7 @@ before body parsing.
 |---|---|---|---|---|
 | GET | `/v1/health` | — | `{ok, contract_revision, headscale_pinned, headscale_error}` | 503 when Headscale is unhealthy (same body, `ok: false`) |
 | GET | `/v1/contract` | — | `{contract_revision, admin_disclosure_revision, admin_disclosure, tailnet_switch_disclosure, login_server, coordinator, key_ttl_minutes}` | 401 |
-| POST | `/v1/enrollments` | `EnrollmentRequest` | `EnrollmentGrant` | 400, 401, 409, 502 |
+| POST | `/v1/enrollments` | `EnrollmentRequest` | `EnrollmentGrant` | 400, 401, 403, 409, 502 |
 | POST | `/v1/memberships/query` | `MembershipQuery` | `NetworkMembership` | 401, 403, 502 |
 | POST | `/v1/revocations` | `RevocationRequest` | `RevocationOutcome` | 400, 401, 403, 502 |
 | GET | `/v1/nodes` | — | `Vec<OverlayNode>` (DACS-tagged nodes only, by `node_id`) | 401, 502 |
@@ -227,9 +227,9 @@ Error codes (`ApiError.code`):
 
 | Status | `code` | Cause |
 |---|---|---|
-| 400 | `bad_request` | `EnrollmentRequest` validation failed (including `infra` role); revocation without `auth_key_id`/`node_id` or `requested_by` |
+| 400 | `bad_request` | `EnrollmentRequest` validation failed; revocation without `auth_key_id`/`node_id` or `requested_by` |
 | 401 | `unauthorized` | Missing or invalid operation token |
-| 403 | `forbidden` | Membership/revocation targets a node or key that is not exclusively DACS-tagged (non-infra) |
+| 403 | `forbidden` | Enrollment requests the `infra` role; membership/revocation targets a node or key that is not exclusively DACS-tagged (non-infra) |
 | 409 | `conflict` | `host_name` already registered in Headscale |
 | 502 | `headscale_unavailable` | Headscale request failed or returned an unusable key |
 

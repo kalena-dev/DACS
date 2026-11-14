@@ -9,9 +9,10 @@
 use std::net::IpAddr;
 
 use dacs_net_contract::{
-    CONTRACT_REVISION, CompilerEndpoint, CompilerRole, CoordinatorEndpoints, EnrollmentGrant,
-    EnrollmentRequest, HostName, MembershipQuery, MembershipState, NetworkMembership, NodeRole,
-    OverlayNode, RevocationOutcome, RevocationRequest, Secret, is_overlay_ip,
+    CONTRACT_REVISION, CompilerEndpoint, CompilerRole, ContractError, CoordinatorEndpoints,
+    EnrollmentGrant, EnrollmentRequest, HostName, MembershipQuery, MembershipState,
+    NetworkMembership, NodeRole, OverlayNode, RevocationOutcome, RevocationRequest, Secret,
+    is_overlay_ip,
 };
 use time::OffsetDateTime;
 
@@ -103,8 +104,10 @@ impl<H: HeadscaleApi> Service<H> {
         req: &EnrollmentRequest,
         now: OffsetDateTime,
     ) -> Result<EnrollmentGrant, ServiceError> {
-        req.validate(now)
-            .map_err(|e| ServiceError::BadRequest(e.to_string()))?;
+        req.validate(now).map_err(|e| match e {
+            ContractError::Forbidden(_) => ServiceError::Forbidden(e.to_string()),
+            _ => ServiceError::BadRequest(e.to_string()),
+        })?;
         let tags = req.tags();
 
         let nodes = self.hs.list_nodes().await?;
@@ -673,6 +676,17 @@ mod tests {
         assert!(matches!(err, ServiceError::Forbidden(_)));
         assert_eq!(svc.hs.nodes.lock().unwrap().len(), 1);
         assert!(svc.nodes().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn infra_role_is_forbidden() {
+        let svc = service();
+        let req = request("edge", vec![NodeRole::Infra]);
+        assert!(matches!(
+            svc.enroll(&req, NOW).await,
+            Err(ServiceError::Forbidden(_))
+        ));
+        assert!(svc.hs.keys.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

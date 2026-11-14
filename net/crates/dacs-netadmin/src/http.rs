@@ -73,7 +73,11 @@ impl<S: Send + Sync, T: serde::de::DeserializeOwned> FromRequest<S> for ApiJson<
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
         match Json::<T>::from_request(req, state).await {
             Ok(Json(value)) => Ok(Self(value)),
-            Err(rejection) => Err(fail(rejection.status(), "bad_request", rejection.body_text())),
+            Err(rejection) => Err(fail(
+                rejection.status(),
+                "bad_request",
+                rejection.body_text(),
+            )),
         }
     }
 }
@@ -341,7 +345,9 @@ mod tests {
             .unwrap();
         let resp = app().oneshot(req).await.unwrap();
         assert!(resp.status().is_client_error());
-        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
         let err: ApiError = serde_json::from_slice(&body).unwrap();
         assert_eq!(err.code, "bad_request");
     }
