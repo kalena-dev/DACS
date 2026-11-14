@@ -159,39 +159,20 @@ impl Supervisor {
                     Some(process.start_time()) == receipt.start_time,
                     "PID reused; original process tree cannot be certified stopped"
                 );
-                #[cfg(unix)]
-                {
-                    use nix::{
-                        sys::signal::{Signal, killpg},
-                        unistd::Pid,
-                    };
-                    killpg(Pid::from_raw(pid as i32), Signal::SIGKILL)?;
-                }
                 #[cfg(windows)]
                 {
                     // Kill-on-close jobs normally already exited after owner loss.
                     // Never kill an arbitrary PID tree as a substitute for a lost job.
                     bail!("previous Windows job still active; owner must reconcile before restart");
                 }
-                #[cfg(unix)]
-                {
-                    let mut system = system;
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-                    anyhow::ensure!(
-                        system.process(sysinfo::Pid::from_u32(pid)).is_none(),
-                        "prior process has not terminated"
-                    );
-                }
             }
+            // Policy: a crashed worker's RPC pipes are gone, so surviving trees
+            // are never re-adopted; the whole process group is killed and its
+            // absence verified. The group id is the original leader PID. A PID
+            // is not reallocated while it still names a process group, so a live
+            // group whose leader already exited holds the original descendants.
             #[cfg(unix)]
-            {
-                use nix::{sys::signal::killpg, unistd::Pid};
-                match killpg(Pid::from_raw(pid as i32), None) {
-                    Err(nix::errno::Errno::ESRCH) => (),
-                    _ => bail!("prior process group remains or cannot be inspected"),
-                }
-            }
+            terminate_group(pid).await?;
             std::fs::remove_file(path)?;
             if let Some(attempt) = receipt.reservation_id {
                 stopped.push(attempt);
@@ -411,6 +392,34 @@ impl Supervisor {
         attempts.sort();
         attempts.dedup();
         attempts
+    }
+}
+
+/// Kill a prior worker's process group and wait until the kernel reports no
+/// member remains (ESRCH also excludes unreaped zombies). A signal alone is
+/// never reported as termination.
+#[cfg(unix)]
+async fn terminate_group(leader: u32) -> Result<()> {
+    use nix::{
+        errno::Errno,
+        sys::signal::{Signal, killpg},
+        unistd::Pid,
+    };
+    let group = Pid::from_raw(i32::try_from(leader).context("invalid process group")?);
+    match killpg(group, Signal::SIGKILL) {
+        Ok(()) | Err(Errno::ESRCH) => (),
+        Err(error) => bail!("prior process group cannot be signalled: {error}"),
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match killpg(group, None) {
+            Err(Errno::ESRCH) => return Ok(()),
+            Ok(()) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(25)).await
+            }
+            Ok(()) => bail!("prior process group has not terminated"),
+            Err(error) => bail!("prior process group cannot be inspected: {error}"),
+        }
     }
 }
 
