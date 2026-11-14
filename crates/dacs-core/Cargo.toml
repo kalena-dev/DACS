@@ -1,0 +1,20 @@
+[package]
+name = "dacs-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+dacs-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rusqlite.workspace = true
+sha2.workspace = true
+hex.workspace = true
+rand.workspace = true
+uuid.workspace = true
+chacha20poly1305 = "0.10"
+
+[dev-dependencies]
+tempfile.workspace = true

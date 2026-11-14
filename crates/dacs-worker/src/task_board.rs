@@ -6,7 +6,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};

@@ -1,0 +1,23 @@
+[package]
+name = "dacs-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+native = ["dep:tao", "dep:wry", "dep:url", "dep:anyhow"]
+
+[dependencies]
+dacs-protocol.workspace = true
+leptos.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+anyhow = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
+
+[target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))'.dependencies]
+tao = { version = "0.37", optional = true }
+wry = { version = "0.55", optional = true }

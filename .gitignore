@@ -1,7 +1,13 @@
-/target
-**/target
+/target/
+/.dacs/
+/.local/
+*.pem
+*.key
 *.db
-*.db-wal
 *.db-shm
-/.dacs-data
+*.db-wal
+.env
+**/target/
+/.dacs-data/
 .claude/worktrees/
+*.redb

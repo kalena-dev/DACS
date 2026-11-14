@@ -1,0 +1,36 @@
+[package]
+name = "dacs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+native = ["dacs-ui/native"]
+
+[dependencies]
+dacs-protocol.workspace = true
+dacs-core.workspace = true
+dacs-source.workspace = true
+dacs-setup.workspace = true
+dacs-ui.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+sha2.workspace = true
+hex.workspace = true
+rand.workspace = true
+tokio.workspace = true
+axum.workspace = true
+axum-server.workspace = true
+reqwest.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tower-http.workspace = true
+url.workspace = true
+rcgen = "0.13"
+
+[dev-dependencies]
+tempfile.workspace = true
