@@ -15,6 +15,10 @@ cargo test -p dacs-worker -p dacs-netclient -p dacs-netadmin -p dacs-net-contrac
 | `dacs-netclient` | 14 passed, 0 failed |
 | `dacs-net-contract` | 6 passed, 0 failed |
 
+Rerun at `2438f07` (after `bad9ad1` changed `crates/dacs-worker`): `dacs-worker` 29 passed, 0 failed;
+the network crates unchanged (16, 14 and 6 passed). `tests/windows_workflow.rs` contains no tests that
+run on macOS.
+
 These are unit tests on one macOS host. They do not establish a provider-backed OMP assignment, a live
 worker run, native macOS desktop interaction, Tailscale enrollment or multi-PC behaviour; those remain
 not run on this host.
