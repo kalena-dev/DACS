@@ -257,6 +257,18 @@ pub struct ControlMessage {
     pub payload: Value,
 }
 
+/// Coordinator-side facts about one queued `ControlMessage`. Kept out of the message
+/// itself: workers journal and compare the exact message form they receive.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageDelivery {
+    /// `ControlMessage::sequence` of the message described.
+    pub sequence: i64,
+    /// Coordinator clock (Unix seconds) when the message was queued; 0 when not recorded.
+    pub queued_at: i64,
+    /// The recipient acknowledged its journal through at least this message.
+    pub acknowledged: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageRecord {
     pub attempt_id: String,
@@ -294,6 +306,9 @@ pub struct Snapshot {
     pub usage: Vec<UsageRecord>,
     #[serde(default)]
     pub runtime_status: Vec<WorkerRuntimeStatus>,
+    /// One entry per message in `messages`.
+    #[serde(default)]
+    pub deliveries: Vec<MessageDelivery>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

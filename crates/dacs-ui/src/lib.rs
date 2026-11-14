@@ -9,7 +9,9 @@ use serde_json::{Value, json};
 #[cfg(feature = "native")]
 pub mod native;
 pub mod onboarding;
+mod overview;
 mod setup;
+pub use overview::{REFRESH_SECONDS, render_dashboard};
 pub use setup::render_setup;
 pub const CSS: &str = include_str!("style.css");
 
@@ -71,8 +73,20 @@ pub(crate) fn json_details(label: &str, value: &impl Serialize) -> AnyView {
 }
 
 pub(crate) fn page(title: &str, notice: Option<&str>, body: impl IntoView) -> String {
+    page_with(title, notice, None, body)
+}
+
+/// `refresh` makes the browser reload the page every that many seconds. It needs no
+/// script, so it works under the `script-src 'none'` policy and in the native shell.
+pub(crate) fn page_with(
+    title: &str,
+    notice: Option<&str>,
+    refresh: Option<u32>,
+    body: impl IntoView,
+) -> String {
     let active = match title {
-        "Dashboard" | "Candidate source" => "/",
+        "Dashboard" => "/",
+        "Manage" | "Candidate source" => "/manage",
         "Compiler pools" => "/builds",
         "Network" => "/network",
         "Local owner onboarding" => "/onboarding",
@@ -82,6 +96,7 @@ pub(crate) fn page(title: &str, notice: Option<&str>, body: impl IntoView) -> St
     };
     let navigation = [
         ("/", "Dashboard"),
+        ("/manage", "Manage"),
         ("/builds", "Compiler pools"),
         ("/network", "Network"),
         ("/onboarding", "Join a project"),
@@ -92,15 +107,20 @@ pub(crate) fn page(title: &str, notice: Option<&str>, body: impl IntoView) -> St
     }).collect_view();
     let title = format!("{title} · DACS");
     let notice = notice.map(|text| view! { <p class="notice" role="status">{text.to_owned()}</p> });
+    let footer = match refresh {
+        Some(seconds) => format!("Live view: reloads every {seconds} s. Unknown and not-run states are not successes."),
+        None => "State is a server snapshot. Refresh to see new events. Unknown and not-run states are not successes.".to_owned(),
+    };
+    let refresh = refresh.map(|seconds| view! { <meta http-equiv="refresh" content=seconds.to_string()/> });
     let html = view! {
         <html lang="en">
             <head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-                <meta name="referrer" content="strict-origin"/><title>{title}</title><link rel="stylesheet" href="/assets/dacs.css"/>
+                <meta name="referrer" content="strict-origin"/>{refresh}<title>{title}</title><link rel="stylesheet" href="/assets/dacs.css"/>
             </head>
             <body><a class="skip" href="#main">"Skip to content"</a>
                 <header class="app-rail"><a class="brand" href="/">"DACS"</a><p class="rail-label">"Workspace"</p><nav aria-label="Primary">{navigation}</nav></header>
                 <main id="main" tabindex="-1">{notice}{body}</main>
-                <footer class="app-footer">"State is a server snapshot. Refresh to see new events. Unknown and not-run states are not successes."</footer>
+                <footer class="app-footer">{footer}</footer>
             </body>
         </html>
     }.to_html();
@@ -162,7 +182,8 @@ pub fn render_compiler_pools(pools: &[dacs_protocol::workflow::PoolOwnership]) -
     )
 }
 
-pub fn render_dashboard(snapshot: &Snapshot, notice: Option<&str>, csrf: &str) -> String {
+/// Every coordinator control and the full record of state. The dashboard links here.
+pub fn render_manage(snapshot: &Snapshot, notice: Option<&str>, csrf: &str) -> String {
     let projects = snapshot
         .projects
         .iter()
@@ -213,11 +234,11 @@ pub fn render_dashboard(snapshot: &Snapshot, notice: Option<&str>, csrf: &str) -
         }
     }).collect_view();
     page(
-        "Dashboard",
+        "Manage",
         notice,
         view! {
-            <div class="heading"><h1>"Coordinator dashboard"</h1><div class="actions"><a class="button" href="/">"Refresh state"</a>{form("/ui/logout", csrf, (), "Sign out")}</div></div>
-            <nav class="sections" aria-label="Dashboard sections"><a href="#tasks">"Tasks and DAG"</a><a href="#workers">"Workers"</a><a href="#projects">"Projects"</a><a href="#attempts">"Attempts"</a><a href="#candidates">"Candidates"</a><a href="#publications">"Publication"</a><a href="#messages">"Messages"</a><a href="#events">"Events"</a><a href="#commands">"Commands"</a></nav>
+            <div class="heading"><h1>"Manage coordinator"</h1><div class="actions"><a class="button" href="/manage">"Refresh state"</a>{form("/ui/logout", csrf, (), "Sign out")}</div></div>
+            <nav class="sections" aria-label="Manage sections"><a href="#tasks">"Tasks and DAG"</a><a href="#workers">"Workers"</a><a href="#projects">"Projects"</a><a href="#attempts">"Attempts"</a><a href="#candidates">"Candidates"</a><a href="#publications">"Publication"</a><a href="#messages">"Messages"</a><a href="#events">"Events"</a><a href="#commands">"Commands"</a></nav>
             <aside class="warning"><details><summary>"Full-trust execution · elevated restrictions are not a sandbox"</summary><p>"Elevated restrictions are advisory, not a sandbox. Coordinator approval is separate from local owner consent, network membership, installed requirements and manual OMP login. Local runtime/desktop control and network readiness are unavailable until their adapters report them. No remote pause button is represented as local consent."</p></details></aside>
             <section id="tasks"><h2>{format!("Tasks and dependency graph ({})", snapshot.tasks.len())}</h2><p>"Dependency edges below point from a task to its prerequisites. Only accepted, integrated outputs release dependants."</p>{empty(snapshot.tasks.is_empty(), "No tasks have been created.")}{tasks}
                 <details><summary>"Create task with pinned contract"</summary>
@@ -429,7 +450,7 @@ mod tests {
 
     #[test]
     fn empty_snapshot_does_not_claim_execution() {
-        let html = render_dashboard(&Snapshot::default(), None, "csrf");
+        let html = render_manage(&Snapshot::default(), None, "csrf");
         assert!(html.contains("No attempts have been admitted."));
         assert!(html.contains("validation not run"));
         assert!(html.contains("unknown; no usage telemetry supplied"));
@@ -482,7 +503,7 @@ mod tests {
             kind: "pause_desktop".into(),
             payload: json!({"note":"<script>bad</script>"}),
         });
-        let html = render_dashboard(&snapshot, None, "csrf");
+        let html = render_manage(&snapshot, None, "csrf");
         assert!(html.contains("Estimated"));
         assert!(html.contains("Reported ACTIVE"));
         assert!(html.contains("request_desktop_pause"));
@@ -507,7 +528,7 @@ mod tests {
             desktop_paused: true,
             observed_at: 4,
         });
-        let html = render_dashboard(&snapshot, None, "csrf");
+        let html = render_manage(&snapshot, None, "csrf");
         assert!(html.contains("Reported paused"));
         assert!(!html.contains(">Request desktop pause</button>"));
     }

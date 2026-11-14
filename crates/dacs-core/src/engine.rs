@@ -87,8 +87,21 @@ pub(crate) fn execute(db: &Connection, p: &Principal, command: Command) -> Resul
             }
             status.worker_id = w.id.clone();
             status.observed_at = now();
+            // Workers report every poll. Only a changed status is an event, so routine
+            // polling does not push real activity out of the bounded event history.
+            let changed = get::<WorkerRuntimeStatus>(db, "runtime", &w.id)
+                .ok()
+                .is_none_or(|previous| {
+                    previous.provider_authenticated != status.provider_authenticated
+                        || previous.network_ready != status.network_ready
+                        || previous.desktop_session != status.desktop_session
+                        || previous.desktop_active != status.desktop_active
+                        || previous.desktop_paused != status.desktop_paused
+                });
             put(db, "runtime", &w.id, &w.project_id, &status)?;
-            event(db, Some(&w.project_id), "runtime_status", value(&status)?)?;
+            if changed {
+                event(db, Some(&w.project_id), "runtime_status", value(&status)?)?;
+            }
             value(&status)
         }
         Command::RequestDesktopPause { worker_id } => {

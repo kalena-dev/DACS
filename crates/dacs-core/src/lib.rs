@@ -152,14 +152,15 @@ fn message(
 ) -> Result<()> {
     let message_id = message_id.map(str::to_owned).unwrap_or_else(id);
     db.execute(
-        "INSERT INTO messages(id,worker,attempt,generation,kind,payload) VALUES(?1,?2,?3,?4,?5,?6)",
+        "INSERT INTO messages(id,worker,attempt,generation,kind,payload,at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
         params![
             message_id,
             worker,
             attempt.map(|a| a.id.as_str()),
             attempt.map(|a| a.generation as i64),
             kind,
-            payload.to_string()
+            payload.to_string(),
+            now()
         ],
     )
     .map_err(sql)?;
@@ -209,11 +210,27 @@ impl Store {
             CREATE TABLE IF NOT EXISTS credentials(hash TEXT PRIMARY KEY,worker TEXT NOT NULL UNIQUE);
             CREATE TABLE IF NOT EXISTS requests(principal TEXT NOT NULL,id TEXT NOT NULL,digest TEXT NOT NULL,response BLOB NOT NULL,PRIMARY KEY(principal,id));
             CREATE TABLE IF NOT EXISTS events(sequence INTEGER PRIMARY KEY AUTOINCREMENT,at INTEGER NOT NULL,project TEXT,kind TEXT NOT NULL,payload TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS messages(sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL,worker TEXT NOT NULL,attempt TEXT,generation INTEGER,kind TEXT NOT NULL,payload TEXT NOT NULL,UNIQUE(worker,id));
+            CREATE TABLE IF NOT EXISTS messages(sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL,worker TEXT NOT NULL,attempt TEXT,generation INTEGER,kind TEXT NOT NULL,payload TEXT NOT NULL,at INTEGER NOT NULL DEFAULT 0,UNIQUE(worker,id));
             CREATE TABLE IF NOT EXISTS acknowledgments(worker TEXT PRIMARY KEY,sequence INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS reservations(attempt TEXT PRIMARY KEY,worker TEXT NOT NULL,physical_host TEXT NOT NULL,resources TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS deferred(project TEXT PRIMARY KEY,contract INTEGER NOT NULL DEFAULT 0,requirements TEXT);
             PRAGMA user_version=1;").map_err(sql)?;
+        // Databases created before messages recorded their queue time lack the column.
+        let timed: bool = db
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name='at'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(sql)?
+            != 0;
+        if !timed {
+            db.execute(
+                "ALTER TABLE messages ADD COLUMN at INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(sql)?;
+        }
         let tx = db.transaction().map_err(sql)?;
         let existing: Option<String> = tx
             .query_row("SELECT value FROM meta WHERE key='admin_hash'", [], |r| {
@@ -446,7 +463,18 @@ impl Store {
             .into_iter()
             .filter(|s| workers.iter().any(|w| w.id == s.worker_id))
             .collect();
-        let mut stmt=db.prepare("SELECT m.sequence,m.id,m.worker,m.attempt,m.generation,m.kind,m.payload FROM messages m JOIN records w ON w.kind='worker' AND w.id=m.worker WHERE (?1 IS NULL OR w.project=?1) ORDER BY m.sequence DESC LIMIT 1000").map_err(sql)?;
+        let mut stmt = db
+            .prepare("SELECT worker,sequence FROM acknowledgments")
+            .map_err(sql)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            .map_err(sql)?;
+        let mut acknowledged = std::collections::HashMap::new();
+        for row in rows {
+            let (worker_id, sequence) = row.map_err(sql)?;
+            acknowledged.insert(worker_id, sequence);
+        }
+        let mut stmt=db.prepare("SELECT m.sequence,m.id,m.worker,m.attempt,m.generation,m.kind,m.payload,m.at FROM messages m JOIN records w ON w.kind='worker' AND w.id=m.worker WHERE (?1 IS NULL OR w.project=?1) ORDER BY m.sequence DESC LIMIT 1000").map_err(sql)?;
         let rows = stmt
             .query_map([scope.as_deref()], |r| {
                 Ok((
@@ -457,13 +485,20 @@ impl Store {
                     r.get::<_, Option<u64>>(4)?,
                     r.get::<_, String>(5)?,
                     r.get::<_, String>(6)?,
+                    r.get::<_, i64>(7)?,
                 ))
             })
             .map_err(sql)?;
         let mut messages = Vec::new();
+        let mut deliveries = Vec::new();
         for row in rows {
-            let (sequence, id, worker_id, attempt_id, generation, kind, payload) =
+            let (sequence, id, worker_id, attempt_id, generation, kind, payload, at) =
                 row.map_err(sql)?;
+            deliveries.push(MessageDelivery {
+                sequence,
+                queued_at: at,
+                acknowledged: acknowledged.get(&worker_id).is_some_and(|&through| through >= sequence),
+            });
             messages.push(ControlMessage {
                 sequence,
                 id,
@@ -475,6 +510,7 @@ impl Store {
             });
         }
         messages.reverse();
+        deliveries.reverse();
         Ok(Snapshot {
             projects,
             workers,
@@ -486,6 +522,7 @@ impl Store {
             messages,
             usage,
             runtime_status,
+            deliveries,
         })
     }
     pub fn invitation(&self, token: &str) -> Result<Invitation> {

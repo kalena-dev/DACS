@@ -215,6 +215,8 @@ fn browser_commands_require_origin_and_csrf_and_deduplicate_delivery() {
         .client
         .post(format!("{}/session", server.url))
         .header(header::ORIGIN, &server.url)
+        // A browser's other cookies for this host arrive as separate fields on HTTP/2.
+        .header(header::COOKIE, "unrelated=1")
         .header(header::COOKIE, &login_cookie)
         .header("sec-fetch-mode", "navigate")
         .header("sec-fetch-site", "same-origin")
@@ -233,9 +235,19 @@ fn browser_commands_require_origin_and_csrf_and_deduplicate_delivery() {
         .split(';')
         .next()
         .unwrap();
-    let dashboard = server
+    let live = server
         .client
         .get(&server.url)
+        .header(header::COOKIE, session_cookie)
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    assert!(live.contains("http-equiv=\"refresh\""));
+    assert!(!live.contains("action=\"/ui/create-project\""));
+    let dashboard = server
+        .client
+        .get(format!("{}/manage", server.url))
         .header(header::COOKIE, session_cookie)
         .send()
         .unwrap()
@@ -296,7 +308,7 @@ fn browser_commands_require_origin_and_csrf_and_deduplicate_delivery() {
     let render = || {
         server
             .client
-            .get(&server.url)
+            .get(format!("{}/manage", server.url))
             .header(header::COOKIE, session_cookie)
             .send()
             .unwrap()
@@ -384,6 +396,7 @@ fn tls_bootstrap_never_exposes_control_or_local_owner_routes() {
     );
     for path in [
         "/",
+        "/manage",
         "/login",
         "/api/state",
         "/api/commands",

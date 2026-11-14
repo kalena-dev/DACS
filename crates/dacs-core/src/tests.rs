@@ -1033,6 +1033,71 @@ fn usage_and_desktop_reports_are_real_scoped_records() {
 }
 
 #[test]
+fn unchanged_status_reports_add_no_event_and_deliveries_track_acknowledgment() {
+    let store = Store::open(":memory:", ADMIN).unwrap();
+    let project = create_project(&store);
+    let (w, p) = enroll(&store, &project, "host", 1);
+    let report = |paused: bool| {
+        command(
+            &store,
+            &p,
+            Command::ReportRuntimeStatus {
+                status: WorkerRuntimeStatus {
+                    worker_id: w.id.clone(),
+                    provider_authenticated: Some(true),
+                    network_ready: Some(true),
+                    desktop_session: None,
+                    desktop_active: false,
+                    desktop_paused: paused,
+                    observed_at: 0,
+                },
+            },
+        )
+        .unwrap();
+    };
+    let status_events = || {
+        store
+            .snapshot(&administrator())
+            .unwrap()
+            .events
+            .iter()
+            .filter(|e| e.kind == "runtime_status")
+            .count()
+    };
+    report(false);
+    let baseline = status_events();
+    report(false);
+    assert_eq!(status_events(), baseline, "a repeated status is not an event");
+    report(true);
+    assert_eq!(status_events(), baseline + 1, "a changed status is an event");
+
+    command(
+        &store,
+        &administrator(),
+        Command::RequestDesktopPause {
+            worker_id: w.id.clone(),
+        },
+    )
+    .unwrap();
+    let delivery = || {
+        let snapshot = store.snapshot(&administrator()).unwrap();
+        assert_eq!(snapshot.deliveries.len(), snapshot.messages.len());
+        snapshot.deliveries.last().cloned().unwrap()
+    };
+    let queued = delivery();
+    assert!(queued.queued_at > 0 && !queued.acknowledged);
+    command(
+        &store,
+        &p,
+        Command::AcknowledgeMessages {
+            through_sequence: queued.sequence,
+        },
+    )
+    .unwrap();
+    assert!(delivery().acknowledged);
+}
+
+#[test]
 fn application_messages_cannot_forge_worker_control_commands() {
     let store = Store::open(":memory:", ADMIN).unwrap();
     let project = create_project(&store);

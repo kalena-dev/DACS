@@ -23,7 +23,7 @@ use std::{
 };
 use tokio::sync::Notify;
 
-/// Notices kept per session until the dashboard renders them; oldest are dropped first.
+/// Notices kept per session until the Manage page renders them; oldest are dropped first.
 const MAX_PENDING_NOTICES: usize = 32;
 /// Slightly above the 20 s netadmin request timeout, so an in-flight call can finish.
 const MAINTENANCE_STOP_TIMEOUT: Duration = Duration::from_secs(25);
@@ -108,12 +108,13 @@ async fn blocking<T: Send + 'static>(
         .map_err(Into::into)
 }
 
+/// Browsers on HTTP/2 send each cookie as its own `cookie` field, so every field is read.
 fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers
-        .get(header::COOKIE)?
-        .to_str()
-        .ok()?
-        .split(';')
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
         .find_map(|part| {
             let (key, value) = part.trim().split_once('=')?;
             (key == name).then_some(value)
@@ -304,7 +305,34 @@ async fn login_submit(
     Ok(response)
 }
 
-async fn dashboard(State(app): State<App>, headers: HeaderMap) -> WebResult<Response> {
+#[derive(Deserialize)]
+struct DashboardQuery {
+    live: Option<String>,
+}
+
+/// Read-only and self-reloading, so it never consumes the session's pending notices:
+/// a notice such as an invitation URL must stay on screen until the user has read it.
+async fn dashboard(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Query(query): Query<DashboardQuery>,
+) -> WebResult<Response> {
+    let Ok((_, session)) = session(&app, &headers) else {
+        return Ok(Redirect::to("/login").into_response());
+    };
+    let principal = app.store.authenticate(&session.bearer)?;
+    let store = app.store.clone();
+    let snapshot = blocking(move || store.snapshot(&principal)).await?;
+    Ok(Html(dacs_ui::render_dashboard(
+        &snapshot,
+        &session.csrf,
+        local::now(),
+        query.live.as_deref() != Some("off"),
+    ))
+    .into_response())
+}
+
+async fn manage(State(app): State<App>, headers: HeaderMap) -> WebResult<Response> {
     let (id, session) = match session(&app, &headers) {
         Ok(value) => value,
         Err(_) => return Ok(Redirect::to("/login").into_response()),
@@ -320,7 +348,7 @@ async fn dashboard(State(app): State<App>, headers: HeaderMap) -> WebResult<Resp
         .map(|s| std::mem::take(&mut s.flash))
         .unwrap_or_default();
     let notice = (!notices.is_empty()).then(|| notices.join("\n\n"));
-    Ok(Html(dacs_ui::render_dashboard(
+    Ok(Html(dacs_ui::render_manage(
         &snapshot,
         notice.as_deref(),
         &session.csrf,
@@ -697,7 +725,7 @@ async fn ui_action(
         }
         session.flash.push(notice);
     }
-    Ok(Redirect::to("/").into_response())
+    Ok(Redirect::to("/manage").into_response())
 }
 
 async fn ui_action_result(
@@ -1155,6 +1183,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<Option<Value>> {
         .route("/health", get(health))
         .route("/assets/dacs.css", get(css))
         .route("/", get(dashboard))
+        .route("/manage", get(manage))
         .route("/network", get(network_page))
         .route("/builds", get(compiler_pools_page))
         .route("/login", get(login))
