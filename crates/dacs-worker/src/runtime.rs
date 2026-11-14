@@ -344,6 +344,7 @@ struct Running {
     stop: watch::Sender<bool>,
     join: tokio::task::JoinHandle<Result<()>>,
     desktop: bool,
+    resources: Resources,
 }
 
 /// Manually invoked; neither public installation nor invitation starts this loop.
@@ -368,6 +369,12 @@ pub async fn run(mut config: WorkerConfig) -> Result<()> {
     config.workspaces_dir = std::fs::canonicalize(&config.workspaces_dir)?;
     config.omp_executable =
         std::fs::canonicalize(&config.omp_executable).context("pinned OMP executable missing")?;
+    // Never advertise capacity the physical host cannot back; refuse before
+    // any lock, process launch or coordinator contact.
+    crate::capacity::check_declared(
+        &config.registration.capacity,
+        &crate::capacity::observe(&config.workspaces_dir)?,
+    )?;
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -593,6 +600,12 @@ pub async fn run(mut config: WorkerConfig) -> Result<()> {
                     journal.mark_command(&command.command_id,"done")?;
                     continue;
                 }
+                // Defense in depth against over-admission: OMP, its tools and
+                // build/compiler processes all run under this reservation.
+                if !crate::capacity::fits(running.values().map(|r| &r.resources), &attempt.resources, &config.registration.capacity) {
+                    tracing::warn!(attempt = %attempt.id, "assignment exceeds remaining declared capacity; held unstarted");
+                    continue;
+                }
                 // Previously admitted work resumes even while draining. No local
                 // task creation or reservation growth occurs during outages.
                 let (stop, receiver) = watch::channel(false);
@@ -602,8 +615,9 @@ pub async fn run(mut config: WorkerConfig) -> Result<()> {
                 let attempt = attempt.clone();
                 let id = attempt.id.clone();
                 let desktop = task.spec.required_capabilities.iter().any(|c| c.starts_with("desktop"));
+                let resources = attempt.resources.clone();
                 let join = tokio::spawn(async move { execute_attempt(config,coordinator,supervisor,task,attempt,command.command_id,receiver).await });
-                running.insert(id, Running { stop, join, desktop });
+                running.insert(id, Running { stop, join, desktop, resources });
             }
             Ok(())
         }.await;

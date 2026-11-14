@@ -319,10 +319,11 @@ impl Supervisor {
         }
         // Always signal the wrapper, even after the leader exited: descendants
         // may still own pipes, desktop access, or compiler reservations.
-        if let Err(error) = entry.child.start_kill() {
-            if error.kind() != std::io::ErrorKind::InvalidInput && error.raw_os_error() != Some(3) {
-                return Err(error.into());
-            }
+        if let Err(error) = entry.child.start_kill()
+            && error.kind() != std::io::ErrorKind::InvalidInput
+            && error.raw_os_error() != Some(3)
+        {
+            return Err(error.into());
         }
         match tokio::time::timeout(grace, entry.child.wait()).await {
             Ok(Ok(status)) => {
@@ -380,10 +381,10 @@ impl Supervisor {
         let mut children = self.children.lock().await;
         let mut active = Vec::new();
         for (id, entry) in children.iter_mut() {
-            if entry.exit.is_none() {
-                if let Ok(Some(status)) = entry.poll_exit() {
-                    entry.exit = Some(status);
-                }
+            if entry.exit.is_none()
+                && let Ok(Some(status)) = entry.poll_exit()
+            {
+                entry.exit = Some(status);
             }
             if !entry.reconciled {
                 active.push(id.clone());
@@ -418,6 +419,54 @@ impl Supervisor {
         attempts.dedup();
         attempts
     }
+
+    /// Live processes per reservation (`None`: unreserved worker overhead such
+    /// as the startup provider probe). Every member of each supervised process
+    /// group is attributed from the kernel, not from descriptors: OMP and the
+    /// tool processes it spawns, build/test commands and compiler daemons all
+    /// count against the attempt that reserved them. On Windows only job
+    /// leaders are enumerated.
+    pub async fn usage(&self) -> BTreeMap<Option<String>, ReservationUsage> {
+        let groups: BTreeMap<u32, Option<String>> = self
+            .children
+            .lock()
+            .await
+            .values()
+            .filter(|entry| !entry.reconciled)
+            .map(|entry| (entry.pid, entry.reservation_id.clone()))
+            .collect();
+        let mut usage = BTreeMap::<Option<String>, ReservationUsage>::new();
+        if groups.is_empty() {
+            return usage;
+        }
+        let mut system = sysinfo::System::new();
+        system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        for (pid, process) in system.processes() {
+            #[cfg(unix)]
+            let group = i32::try_from(pid.as_u32())
+                .ok()
+                .and_then(|pid| nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(pid))).ok())
+                .and_then(|group| u32::try_from(group.as_raw()).ok());
+            #[cfg(not(unix))]
+            let group = Some(pid.as_u32());
+            if let Some(reservation) = group.and_then(|group| groups.get(&group)) {
+                let entry = usage.entry(reservation.clone()).or_default();
+                entry.processes.push(pid.as_u32());
+                entry.memory_bytes = entry.memory_bytes.saturating_add(process.memory());
+            }
+        }
+        for entry in usage.values_mut() {
+            entry.processes.sort_unstable();
+        }
+        usage
+    }
+}
+
+/// Observed live processes attributed to one reservation.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct ReservationUsage {
+    pub processes: Vec<u32>,
+    pub memory_bytes: u64,
 }
 
 /// A leaderless group is presumed to be the original tree only if every live
