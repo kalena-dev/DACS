@@ -157,7 +157,8 @@ pub struct PeerStatus {
     pub host_name: String,
     #[serde(rename = "DNSName", default)]
     pub dns_name: String,
-    #[serde(default)]
+    // `rename_all` would expect `TailscaleIps`; the CLI emits `TailscaleIPs`.
+    #[serde(rename = "TailscaleIPs", default)]
     pub tailscale_ips: Option<Vec<IpAddr>>,
     #[serde(default)]
     pub online: bool,
@@ -315,7 +316,10 @@ mod tests {
         let s = parse_status(STATUS_RUNNING).unwrap();
         assert_eq!(s.backend_state, "Running");
         assert_eq!(s.current_tailnet.unwrap().name, "dacs");
+        let self_ips: Vec<String> = s.self_.unwrap().ips().iter().map(ToString::to_string).collect();
+        assert_eq!(self_ips, ["100.64.0.5", "fd7a:115c:a1e0::5"]);
         let peers = s.peer.unwrap();
+        assert_eq!(peers["nodekey:aa"].ips(), ["100.64.0.6".parse::<IpAddr>().unwrap()]);
         assert_eq!(
             peers["nodekey:aa"].path(),
             PeerPath::Direct {
