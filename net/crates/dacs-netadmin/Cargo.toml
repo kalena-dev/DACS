@@ -27,6 +27,8 @@ subtle.workspace = true
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+tempfile.workspace = true
+rcgen = "0.13"
 
 [lints]
 workspace = true
