@@ -1005,6 +1005,7 @@ dependencies = [
  "base64 0.22.1",
  "dacs-protocol",
  "dacs-release-audit",
+ "find-msvc-tools",
  "fs2",
  "hex",
  "nix 0.30.1",

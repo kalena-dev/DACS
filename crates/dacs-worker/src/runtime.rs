@@ -999,7 +999,7 @@ fn host_tools() -> Value {
         {"name":"dacs_delegate","label":"Delegate DACS task","description":"Request admission of a child TaskSpec. Returns immediately with an admitted task ID or durable pending receipt. Completion arrives in the mailbox; parent reservation remains held.","loadMode":"essential","parameters":{"type":"object","properties":{"spec":{"type":"object"}},"required":["spec"],"additionalProperties":false}},
         {"name":"dacs_workflow","label":"Submit build/test workflow","description":"Admit a workflow child using TaskSpec execution.kind=workflow and effect_class=external. Never execute a distributed build outside admitted capacity.","loadMode":"essential","parameters":{"type":"object","properties":{"spec":{"type":"object"}},"required":["spec"],"additionalProperties":false}},
         {"name":"dacs_message","label":"Send durable message","description":"Send durable project-local message to an admitted task.","loadMode":"essential","parameters":{"type":"object","properties":{"recipient_task_id":{"type":"string"},"message":{"type":"string"}},"required":["recipient_task_id","message"],"additionalProperties":false}},
-        {"name":"dacs_submit","label":"Submit committed candidate","description":"Submit current clean Git HEAD with actual check evidence. Commit your changes first. No terminal success until submission accepted; pending children must finish first.","loadMode":"essential","parameters":{"type":"object","properties":{"evidence":{"type":"array","items":{"type":"object"}},"unresolved":{"type":"array","items":{"type":"string"}}},"required":["evidence"],"additionalProperties":false}},
+        {"name":"dacs_submit","label":"Submit committed candidate","description":"Submit current clean Git HEAD with actual check evidence. Commit your changes first. No terminal success until submission accepted; pending children must finish first.","loadMode":"essential","parameters":{"type":"object","properties":{"evidence":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"command":{"type":"string"},"source_sha":{"type":"string"},"passed":{"type":"boolean"},"artifact_digest":{"type":["string","null"]}},"required":["name","command","source_sha","passed","artifact_digest"],"additionalProperties":false}},"unresolved":{"type":"array","items":{"type":"string"}}},"required":["evidence"],"additionalProperties":false}},
         {"name":"dacs_pending","label":"Read durable obligations","description":"Read current admitted attempt and pending child/job obligations from coordinator.","loadMode":"essential","parameters":{"type":"object","properties":{},"additionalProperties":false}}
     ])
 }
@@ -1463,8 +1463,7 @@ fn relay_compiler_telemetry(
 ) -> Result<()> {
     use std::io::{BufRead, Read, Seek, SeekFrom};
     let path = state_dir
-        .join("workflows")
-        .join(&attempt.id)
+        .join(crate::build_runner::WORKFLOW_DIRECTORY)
         .join("engine.jsonl");
     let mut file = match std::fs::File::open(path) {
         Ok(file) => file,
@@ -1565,6 +1564,35 @@ async fn observe_elevation(supervisor: &Supervisor, directory: &Path) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn submission_schema_preserves_check_evidence_fields() {
+        let tools = host_tools();
+        let submit = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "dacs_submit")
+            .unwrap();
+        let item = &submit["parameters"]["properties"]["evidence"]["items"];
+        let evidence = serde_json::to_value(CheckEvidence {
+            name: "content check".into(),
+            command: "check proof.txt".into(),
+            source_sha: "0123456789abcdef".into(),
+            passed: true,
+            artifact_digest: None,
+        })
+        .unwrap();
+        for field in evidence.as_object().unwrap().keys() {
+            assert!(item["properties"].get(field).is_some(), "{field}");
+            assert!(item["required"].as_array().unwrap().contains(&json!(field)));
+        }
+        assert_eq!(item["properties"]["passed"]["type"], "boolean");
+        assert_eq!(
+            item["properties"]["artifact_digest"]["type"],
+            json!(["string", "null"])
+        );
+    }
 
     #[test]
     fn native_capability_observation_requires_matching_actual_tool_execution() {

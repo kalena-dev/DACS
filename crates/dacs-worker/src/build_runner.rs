@@ -22,6 +22,7 @@ use std::{
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 const LOG_LIMIT: u64 = 16 * 1024 * 1024;
+pub(crate) const WORKFLOW_DIRECTORY: &str = "workflow";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -392,6 +393,7 @@ fn acquire_lock(root: &Path, name: &str) -> Result<File> {
     Ok(lock)
 }
 
+/// `state_dir` is private to this attempt, including its compiler service logs.
 pub async fn execute_admitted(
     supervisor: &Supervisor,
     task: &TaskRecord,
@@ -436,7 +438,7 @@ pub async fn execute_admitted(
         .profile
         .verify_lockfile(&workspace.join("Cargo.lock"))?;
     anyhow::ensure!(label(&attempt.id), "unsafe attempt id");
-    let root = state_dir.join("workflows").join(&attempt.id);
+    let root = state_dir.join(WORKFLOW_DIRECTORY);
     fs::create_dir_all(root.parent().context("workflow parent missing")?)?;
     fs::create_dir(&root)
         .context("workflow already has durable state; reconcile instead of replaying")?;

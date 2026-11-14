@@ -33,5 +33,8 @@ nix = { version = "0.30", features = ["signal", "process"] }
 [dev-dependencies]
 tempfile.workspace = true
 
+[target.'cfg(all(windows, target_env = "msvc"))'.dev-dependencies]
+find-msvc-tools = "0.1.15"
+
 [lints]
 workspace = true

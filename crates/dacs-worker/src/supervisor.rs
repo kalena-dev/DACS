@@ -48,6 +48,22 @@ struct Entry {
     reconciled: bool,
 }
 
+impl Entry {
+    fn poll_exit(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        // JobObject::try_wait consumes completion-port notifications, including
+        // the last one its later wait needs. Poll only the leader on Windows;
+        // terminate still signals and waits on the wrapper to reconcile the job.
+        #[cfg(windows)]
+        {
+            self.child.inner_mut().try_wait()
+        }
+        #[cfg(not(windows))]
+        {
+            self.child.try_wait()
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct ProcessReceipt {
     id: String,
@@ -273,7 +289,7 @@ impl Supervisor {
         let mut children = self.children.lock().await;
         let entry = children.get_mut(id).context("unknown managed process")?;
         if entry.exit.is_none() {
-            entry.exit = entry.child.try_wait()?;
+            entry.exit = entry.poll_exit()?;
         }
         match entry.exit {
             Some(status) => Ok(ProcessState::Exited {
@@ -359,7 +375,7 @@ impl Supervisor {
         let mut active = Vec::new();
         for (id, entry) in children.iter_mut() {
             if entry.exit.is_none() {
-                if let Ok(Some(status)) = entry.child.try_wait() {
+                if let Ok(Some(status)) = entry.poll_exit() {
                     entry.exit = Some(status);
                 }
             }
@@ -470,6 +486,47 @@ mod tests {
         assert!(output.await.unwrap().contains("durable-output"));
         errors.await.unwrap();
         assert!(supervisor.launch("late", &descriptor).await.is_err());
+        assert!(supervisor.active_ids().await.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn leader_polling_preserves_job_completion_and_receipt_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        let receipts = directory.path().join("processes");
+        let supervisor = Supervisor::persistent(&receipts).unwrap();
+        let descriptor = descriptor(directory.path(), "exit /b 0");
+        supervisor.launch("probe", &descriptor).await.unwrap();
+        drop(supervisor.take_io("probe").await.unwrap());
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if matches!(
+                    supervisor.state("probe").await.unwrap(),
+                    ProcessState::Exited { .. }
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // More polls than the finite job notifications: none may consume the
+        // completion queue that the wrapper's final wait owns.
+        {
+            let mut children = supervisor.children.lock().await;
+            let entry = children.get_mut("probe").unwrap();
+            for _ in 0..32 {
+                assert!(entry.poll_exit().unwrap().is_some());
+            }
+        }
+        assert!(
+            supervisor
+                .terminate_attempt("attempt", Duration::from_secs(2))
+                .await
+                .unwrap()
+        );
+        assert!(!receipts.join("probe.json").exists());
         assert!(supervisor.active_ids().await.is_empty());
     }
 
