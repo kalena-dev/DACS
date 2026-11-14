@@ -385,3 +385,17 @@ cargo clippy --workspace --all-targets
 
 Tests use an in-memory Headscale fake and Tailscale CLI output fixtures; they do not
 contact a real Headscale server or modify the local Tailscale client.
+
+## Verification status (2026-11-14)
+
+| Check | Result | Evidence |
+|---|---|---|
+| Unit tests (`cargo test --workspace`, 32 tests) and `cargo clippy --workspace --all-targets` | Passed | Run from `net/` on Windows, Rust 1.100 |
+| `dacs-netadmin` against real Headscale v0.29.7 + Tailscale 1.104.7 client (isolated WSL): enroll, single-use reuse refused, join, rename, membership, compiler endpoints, 401/400/409, revoke, no reconnect, revoke-before-use | Passed | `evidence/local-headscale-integration.md` |
+| `dacs-net status` / `assess` against the real Windows Tailscale 1.104.7 client (logged out) | Passed: `logged_out`, no switch consent needed | Local run |
+| `deploy/infra-setup.sh` | Syntax and ShellCheck only; not executed | — |
+| Public Linux server, DNS, Let's Encrypt TLS, nginx SNI router, public DERP/STUN | Not run: no server, domain or DNS access was available | — |
+| netadmin over TLS on the infra overlay IP | Not run | — |
+| `dacs-net join` end to end, tailnet-switch consent on a host with an existing login | Not run (decision logic unit-tested only) | — |
+| Direct vs DERP paths between fleet PCs, compiler reachability (10600/10501), Linux compile guest as its own node, revocation on real hosts | Not run: needs the fleet and the public infra host | — |
+| Task-board Leptos frontend (four-agent demo) | Not started: must run through completed DACS against Person 2's API | — |
