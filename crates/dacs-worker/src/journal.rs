@@ -1,4 +1,4 @@
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::{path::Path, sync::Mutex};
 use thiserror::Error;
@@ -15,6 +15,8 @@ pub enum JournalError {
     Json(#[from] serde_json::Error),
     #[error("journal mutex was poisoned")]
     Poisoned,
+    #[error("{0}")]
+    Unavailable(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -49,6 +51,46 @@ impl Journal {
 
     pub fn in_memory() -> Result<Self, JournalError> {
         Self::from_connection(Connection::open_in_memory()?)
+    }
+
+    /// Opens an existing journal for reading. Creates no file, directory or
+    /// schema; a missing or uninitialised journal is `Unavailable`.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, JournalError> {
+        let path = path.as_ref();
+        let unavailable = |why: String| Err(JournalError::Unavailable(why));
+        if let Some(dir) = path
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty() && !d.is_dir())
+        {
+            return unavailable(format!("data directory {} does not exist", dir.display()));
+        }
+        if !path.is_file() {
+            return unavailable(format!(
+                "no worker state at {}: the worker has not run with this data directory",
+                path.display()
+            ));
+        }
+        // A WAL already present belongs to a writer: read beside it without
+        // creating anything. Otherwise refuse writes but open read-write, so
+        // SQLite deletes the WAL and shared memory it makes for this read on close.
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        let flags = match Path::new(&wal).exists() {
+            true => OpenFlags::SQLITE_OPEN_READ_ONLY,
+            false => OpenFlags::SQLITE_OPEN_READ_WRITE,
+        };
+        let db = Connection::open_with_flags(path, flags | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+        db.pragma_update(None, "query_only", true)?;
+        db.busy_timeout(std::time::Duration::from_secs(5))?;
+        let schema =
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='values_store')";
+        if !db.query_row(schema, [], |r| r.get::<_, bool>(0))? {
+            return unavailable(format!(
+                "{} is not an initialised worker journal",
+                path.display()
+            ));
+        }
+        Ok(Self { db: Mutex::new(db) })
     }
 
     fn from_connection(db: Connection) -> Result<Self, JournalError> {
