@@ -9,7 +9,7 @@ All three tracks now have connected implementations in this workspace:
 | Track | Delivered implementation | Evidence and remaining limits |
 |---|---|---|
 | Worker/OMP | Connected runtime, durable journal/outbox, isolated source workspaces, host tools, supervision, workflow delivery and local controls | Real provider-backed OMP submission and publication passed. Windows checkout, native workflow and JobObject cleanup regressions passed. The final integrated worker smoke passed provider readiness, native compilation/execution, immutable result acceptance, process stop, reservation release and owner-requested drain. See `assignments/02-worker-runtime.md` for evidence IDs and remaining multi-PC, pending-child recovery and native desktop requirements. |
-| Network/enrollment | Network service/client/deployment files, coordinator bridge, separate TLS listeners, owner consent/onboarding and private task-board frontend | 14 network-client tests passed. The redesigned frontend passed its WebAssembly release build and browser CRUD, combined filters, keyboard, 390px layout and backend-restart persistence checks. Public infrastructure, real fleet join/revocation and compiler routes remain unverified. |
+| Network/enrollment | Network service/client/deployment files, coordinator bridge, separate TLS listeners, owner consent/onboarding and private task-board frontend | 14 network-client tests and the frontend build/browser checks passed. Real WSL clients verified device join, switch consent, revocation/rejoin, compiler-port reachability and ACLs, and direct/DERP paths. See the [single-machine network evidence](../net/evidence/wsl-netns-e2e.md). Public infrastructure, physical-fleet paths, the application bridge against live netadmin and real compiler traffic remain unverified. |
 | Builds/release | Admitted build/test/service runner, compiler pool ownership, authenticated action provenance, release audit and native packaging commands | Four focused packaging tests passed. A clean Windows x64 native release at `13bc70b` produced an unsigned MSI; extraction verified the executable and both required MSVC runtime DLLs. See `person4-build-release-status.md` for its checksum and the unrun installation, multi-host, other-platform and signing requirements. |
 
 The baseline combined command was `cargo test -p dacs-worker -p dacs-ui -p dacs --features dacs/native && cargo build -p dacs --features native`. The HTTP/CLI source-publication smoke also passed, including final stop reconciliation, artifact authorization and request replay.
@@ -66,7 +66,15 @@ The application accepts `--listen`, optional TLS-only `--bootstrap-listen`, and 
 
 Use `dacs-net-contract` revision `dacs-net/2026-11-14.1` and disclosure `host-admin-access/1`. The netadmin API and coordinator-first bootstrap sequence are documented in `net/README.md`. Person 3 can deploy and verify those independently of the complete dashboard/worker. Headscale API keys remain on the infrastructure host. The coordinator receives only its scoped operation token through a private file.
 
-The contributed evidence records successful isolated Headscale/Tailscale checks. Public server/domain/DNS, public TLS/DERP, real fleet paths and the full device-side join are still unverified. Supply endpoint URLs, CA certificate paths, and private credential-file locations through the appropriate private channel; never commit credentials or signing keys.
+The [WSL network-namespace run](../net/evidence/wsl-netns-e2e.md) used real Headscale and Linux Tailscale clients with kernel TUN devices and TLS. It verified coordinator-first bootstrap and device-side `dacs-net join`, refusal of missing or mismatched tailnet-switch consent, approved switching, membership queries, revocation, rejection of stale-state reconnects and fresh re-enrollment.
+
+Compiler endpoint discovery and overlay-port reachability passed on direct and DERP paths. ACL default deny and refusal on the underlay address were also verified. These checks used stand-in TCP listeners on ports 10600/10501, not sccache. All nodes ran on one physical machine; this is not evidence of multi-PC execution or distributed compilation.
+
+Still unverified: public server/DNS/Let's Encrypt/nginx SNI/public DERP, real fleet paths across NATs, the coordinator application's `/api/network/*` bridge against live netadmin, DACS leave/switch-back, and real compiler traffic. The automatic `restun` correction was not exercised against a live stall because that stall did not recur.
+
+Overlay IPs changed on re-enrollment in this run. Reissue address-bound compiler tokens and registrations after re-enrollment, and bind compiler listeners to the current overlay IP.
+
+Supply endpoint URLs, CA certificate paths and private credential-file locations through the appropriate private channel; never commit credentials or signing keys.
 
 ### Coordinator network routes
 
