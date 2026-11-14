@@ -1550,6 +1550,52 @@ fn heartbeat_loss_keeps_work_and_fenced_replacement_stops_before_release() {
     );
 }
 
+#[test]
+fn attempt_fenced_while_worker_down_is_stopped_on_restart_before_release() {
+    let mut f = Fixture::new();
+    let (_task, attempt) = f.assign(
+        "task-fenced-down",
+        "attempt-fenced-down",
+        1,
+        EffectClass::Workspace,
+    );
+    f.start_worker();
+    let launch = f.wait_launch(&attempt);
+    f.wait_for("Started accepted", Duration::from_secs(30), || {
+        f.accepted_event(&attempt.id, "started")
+    });
+    // The worker crashes; its OMP tree keeps running. Meanwhile the lease
+    // lapses and the coordinator fences the workspace-only attempt.
+    f.kill_worker();
+    assert!(alive(launch.pid) && alive(launch.tool_pid));
+    {
+        let mut coord = f.coord();
+        coord.expire_lease(&attempt.id);
+        coord.fence(
+            &attempt.id,
+            "fenced",
+            json!({"reason":"lease expired","reservation_held_until_reconciliation":true}),
+        );
+        coord.watch_pids = vec![launch.pid, launch.tool_pid];
+    }
+    f.start_worker();
+    let release = f.wait_release(&attempt.id);
+    assert!(
+        release.alive.is_empty(),
+        "released before the fenced tree stopped: {release:?}"
+    );
+    f.wait_cycles(3);
+    assert_eq!(
+        f.assignment_prompts(&attempt).len(),
+        1,
+        "fenced attempt was resumed after restart"
+    );
+    assert!(
+        f.events(&attempt.id).iter().all(|r| r.at <= release.at),
+        "fenced attempt reported after release"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 4. Effectful attempts are never replaced automatically.
 // ---------------------------------------------------------------------------
