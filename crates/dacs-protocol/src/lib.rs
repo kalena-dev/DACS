@@ -269,6 +269,23 @@ pub struct MessageDelivery {
     pub acknowledged: bool,
 }
 
+/// One direct exchange between the coordinator administrator and a device's agent,
+/// outside any task. The device receives it as a `chat` control message and answers
+/// with `Command::ReplyChat`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub id: String,
+    pub worker_id: String,
+    pub text: String,
+    /// Coordinator clock (Unix seconds).
+    pub sent_at: i64,
+    /// The agent's answer, or the device's reason when `failed`.
+    pub reply: Option<String>,
+    /// The device produced no agent answer; `reply` says why.
+    pub failed: bool,
+    pub replied_at: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageRecord {
     pub attempt_id: String,
@@ -309,6 +326,9 @@ pub struct Snapshot {
     /// One entry per message in `messages`.
     #[serde(default)]
     pub deliveries: Vec<MessageDelivery>,
+    /// Direct chat exchanges, oldest first.
+    #[serde(default)]
+    pub chats: Vec<ChatMessage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -445,6 +465,17 @@ pub enum Command {
     },
     AcknowledgeMessages {
         through_sequence: i64,
+    },
+    /// Administrator: queue a direct chat message for one device's agent.
+    SendChat {
+        worker_id: String,
+        text: String,
+    },
+    /// The addressed device: its agent's answer to a chat message, or why there is none.
+    ReplyChat {
+        chat_id: String,
+        reply: String,
+        failed: bool,
     },
 }
 

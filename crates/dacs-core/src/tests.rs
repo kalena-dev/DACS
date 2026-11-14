@@ -1123,6 +1123,50 @@ fn application_messages_cannot_forge_worker_control_commands() {
 }
 
 #[test]
+fn chat_reaches_only_the_addressed_device_and_is_answered_once() {
+    let store = Store::open(":memory:", ADMIN).unwrap();
+    let project = create_project(&store);
+    let (w, p) = enroll(&store, &project, "host", 1);
+    let (_, other) = enroll(&store, &project, "other-host", 1);
+    let send = Command::SendChat {
+        worker_id: w.id.clone(),
+        text: "What is your host name?".into(),
+    };
+    // Only the administrator may open a chat with a device's agent.
+    assert_eq!(
+        command(&store, &other, send.clone()).unwrap_err().code,
+        ErrorCode::Forbidden
+    );
+    let chat: ChatMessage =
+        serde_json::from_value(command(&store, &administrator(), send).unwrap()).unwrap();
+    let queued = store.commands(&p, 0).unwrap();
+    let delivered = queued.iter().find(|m| m.id == chat.id).unwrap();
+    assert_eq!(delivered.kind, "chat");
+    assert_eq!(delivered.payload["text"], "What is your host name?");
+    assert!(store.commands(&other, 0).unwrap().iter().all(|m| m.id != chat.id));
+    let reply = |text: &str| Command::ReplyChat {
+        chat_id: chat.id.clone(),
+        reply: text.into(),
+        failed: false,
+    };
+    assert_eq!(
+        command(&store, &other, reply("forged")).unwrap_err().code,
+        ErrorCode::Forbidden
+    );
+    command(&store, &p, reply("host")).unwrap();
+    assert_eq!(
+        command(&store, &p, reply("changed")).unwrap_err().code,
+        ErrorCode::Conflict
+    );
+    let seen = store.snapshot(&administrator()).unwrap().chats;
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].reply.as_deref(), Some("host"));
+    assert!(seen[0].replied_at.is_some() && !seen[0].failed);
+    assert!(store.snapshot(&other).unwrap().chats.is_empty());
+    assert_eq!(store.snapshot(&p).unwrap().chats.len(), 1);
+}
+
+#[test]
 fn pending_invalidation_blocks_new_admission() {
     let store = Store::open(":memory:", ADMIN).unwrap();
     let project = create_project(&store);

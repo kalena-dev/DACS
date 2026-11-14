@@ -126,6 +126,14 @@ dd { min-width: 0; margin: 0; }
 .say.out { border-left-color: var(--accent); }
 .say.in { border-left-color: var(--ok); }
 .say.note .route, .say.note .what { color: var(--muted); }
+.say.failed { border-left-color: var(--bad); }
+.say.failed .route { color: var(--bad); }
+.chat-frame { display: block; width: 100%; height: min(56vh, 640px); min-height: 240px; margin: 16px 0 0; border: 1px solid var(--border); border-radius: 4px; background: var(--surface); }
+.chat-form { grid-template-columns: minmax(0, 1fr) auto; align-items: end; max-width: none; }
+.chat-thread { background: var(--surface); }
+.chat-log { display: flex; flex-direction: column-reverse; height: 100vh; margin: 0; padding: 0 16px; overflow-y: auto; list-style: none; }
+.chat-log .say:last-child { border-top: 0; }
+.chat-log .what { white-space: pre-wrap; }
 .resources { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 8px 0; font-variant-numeric: tabular-nums; }
 .resources strong { min-width: 184px; color: var(--text); }
 .table-scroll { width: 100%; min-width: 0; overflow-x: auto; border: 1px solid var(--border); border-radius: 4px; }
@@ -173,6 +181,7 @@ legend { padding: 0 4px; }
   input, select, textarea { min-height: 44px; font-size: 16px; }
   button, .button { min-height: 44px; }
   form > button { width: 100%; }
+  .chat-form { grid-template-columns: minmax(0, 1fr); }
   summary { min-height: 44px; padding: 12px 0; }
   .check { min-height: 44px; align-items: flex-start; padding: 8px 0; }
   .actions { align-items: stretch; }

@@ -506,6 +506,7 @@ pub async fn run(mut config: WorkerConfig) -> Result<()> {
     }
     journal.set_value("local_status", &status)?;
     let mut running = BTreeMap::<String, Running>::new();
+    let mut chat: Option<tokio::task::JoinHandle<Result<()>>> = None;
     let mut interval = tokio::time::interval(Duration::from_millis(config.poll_interval_ms));
     let signal = tokio::spawn(close_requests(journal.clone()));
     let mut last_snapshot: Option<Snapshot> = None;
@@ -758,7 +759,34 @@ pub async fn run(mut config: WorkerConfig) -> Result<()> {
             ));
             journal.set_value("local_status", &status)?;
         }
-        if controls.draining && running.is_empty() && supervisor.active_ids().await.is_empty() {
+        if let Some(turn) = chat.take_if(|turn| turn.is_finished()) {
+            match turn.await {
+                Ok(Ok(())) => (),
+                Ok(Err(error)) => status.last_error = Some(format!("chat: {error:#}")),
+                Err(error) => status.last_error = Some(format!("chat panicked: {error}")),
+            }
+        }
+        // Direct chat runs one message at a time, outside task reservations. None is
+        // started while draining or stopped; unanswered messages wait in the journal.
+        if chat.is_none() && !controls.draining && !controls.emergency_cancel {
+            for command in journal.pending_commands()? {
+                let message: ControlMessage = serde_json::from_value(command.payload)?;
+                if message.kind == "chat" {
+                    chat = Some(tokio::spawn(answer_chat(
+                        config.clone(),
+                        coordinator.clone(),
+                        supervisor.clone(),
+                        message,
+                    )));
+                    break;
+                }
+            }
+        }
+        if controls.draining
+            && running.is_empty()
+            && chat.is_none()
+            && supervisor.active_ids().await.is_empty()
+        {
             // Results remain durable if the coordinator is unreachable on close.
             let _ = coordinator.flush().await;
             break;
@@ -1001,6 +1029,119 @@ async fn provider_probe(
     );
     tokio::time::timeout(Duration::from_secs(10), stderr).await???;
     probe
+}
+
+/// Longest one chat turn may run before it is stopped and reported as failed.
+const CHAT_TURN_LIMIT: Duration = Duration::from_secs(300);
+
+/// Answers one direct chat message from the coordinator's administrator with this
+/// device's agent. It is a conversation outside any task: no reservation, nothing to
+/// commit or submit. The answer, or the reason there is none, leaves through the
+/// durable outbox.
+async fn answer_chat(
+    config: WorkerConfig,
+    coordinator: Coordinator,
+    supervisor: Arc<Supervisor>,
+    message: ControlMessage,
+) -> Result<()> {
+    let chat_id = message.payload["chat_id"]
+        .as_str()
+        .context("chat message has no chat_id")?
+        .to_owned();
+    let text = message.payload["text"].as_str().unwrap_or_default();
+    let started = format!("chat-started:{chat_id}");
+    let outcome = if coordinator
+        .journal
+        .get_value::<bool>(&started)?
+        .unwrap_or(false)
+    {
+        // The agent may already have acted on this message; it is never run twice.
+        Err(anyhow::anyhow!(
+            "the worker restarted while answering this message; it was not run again"
+        ))
+    } else {
+        coordinator.journal.set_value(&started, &true)?;
+        chat_turn(&config, &coordinator, &supervisor, text).await
+    };
+    let (reply, failed) = match outcome {
+        Ok(reply) if reply.trim().is_empty() => {
+            ("the agent ended its turn without a text answer".to_owned(), true)
+        }
+        Ok(reply) => (reply, false),
+        Err(error) => (format!("{error:#}"), true),
+    };
+    // The coordinator bounds a reply at 64 KiB.
+    let mut end = reply.len().min(60_000);
+    while !reply.is_char_boundary(end) {
+        end -= 1;
+    }
+    coordinator.enqueue(
+        &format!("chat-{chat_id}"),
+        "",
+        "",
+        0,
+        Command::ReplyChat {
+            chat_id,
+            reply: reply[..end].to_owned(),
+            failed,
+        },
+    )?;
+    coordinator.journal.mark_command(&message.id, "done")?;
+    Ok(())
+}
+
+/// One OMP turn on the device's durable chat session, so the conversation keeps its
+/// context across messages and worker restarts. Returns the agent's final text.
+async fn chat_turn(
+    config: &WorkerConfig,
+    coordinator: &Coordinator,
+    supervisor: &Supervisor,
+    text: &str,
+) -> Result<String> {
+    let state = config.data_dir.join("chat");
+    let workspace = config.workspaces_dir.join("chat");
+    std::fs::create_dir_all(&workspace)?;
+    let resumed = std::fs::read_dir(state.join("session"))
+        .is_ok_and(|mut entries| entries.next().is_some());
+    let (process, rpc, mut events, stderr) =
+        launch_omp(config, supervisor, None, &workspace, &state, false, false).await?;
+    let turn: Result<String> = async {
+        if resumed {
+            rpc.request("open_session",json!({"sessionDir":state.join("session")}),Duration::from_secs(60)).await?;
+        }
+        let prompt = format!("Direct chat message from the DACS coordinator's administrator to the agent on device {}. This is a conversation, not a task assignment: there is nothing to commit or submit. Answer briefly; use your tools on this machine when the message asks for something to be done.\n\n{text}", config.registration.name);
+        rpc.request("prompt",json!({"message":prompt}),Duration::from_secs(60)).await?;
+        let deadline = tokio::time::Instant::now() + CHAT_TURN_LIMIT;
+        let mut tick = tokio::time::interval(Duration::from_secs(2));
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    let controls: OwnerControls = coordinator.journal.get_value("owner_controls")?.unwrap_or_default();
+                    let expired = tokio::time::Instant::now() >= deadline;
+                    if controls.emergency_cancel || expired {
+                        let _ = rpc.request("abort",json!({}),Duration::from_secs(5)).await;
+                        bail!("{}", if expired { "no answer within 5 minutes; the turn was stopped" } else { "stopped by this device's owner (emergency cancel)" });
+                    }
+                }
+                event = events.recv() => match event.context("OMP closed before answering")? {
+                    event @ OmpEvent::PromptResult { .. } if event.cost_capped().is_some() => bail!("the device owner's OMP cost cap was reached"),
+                    OmpEvent::PromptResult { status,error,.. } => {
+                        anyhow::ensure!(status == "completed", "the agent's turn ended as {status}: {}", error.unwrap_or(Value::Null));
+                        let last = rpc.request("get_last_assistant_text",json!({}),Duration::from_secs(30)).await?;
+                        return Ok(last["text"].as_str().unwrap_or_default().to_owned());
+                    }
+                    _ => (),
+                },
+            }
+        }
+    }.await;
+    let _ = rpc.close().await;
+    anyhow::ensure!(
+        supervisor.terminate(&process, Duration::from_secs(10)).await?,
+        "chat OMP process remains active"
+    );
+    tokio::time::timeout(Duration::from_secs(10), stderr).await???;
+    turn
 }
 
 async fn execute_attempt(

@@ -81,7 +81,7 @@ fn humanize(kind: &str) -> String {
     }
 }
 
-fn ago(now: i64, at: i64) -> String {
+pub(crate) fn ago(now: i64, at: i64) -> String {
     if at <= 0 {
         return "time unknown".into();
     }
@@ -94,7 +94,7 @@ fn ago(now: i64, at: i64) -> String {
     }
 }
 
-fn clock(at: i64) -> String {
+pub(crate) fn clock(at: i64) -> String {
     if at <= 0 {
         return "Time not recorded".into();
     }
@@ -148,6 +148,7 @@ fn message_text(message: &ControlMessage, names: &Names) -> String {
             clip(p["reason"].as_str().unwrap_or("no reason recorded"))
         ),
         "pause_desktop" => "Pause desktop control".into(),
+        "chat" => format!("Chat: {}", clip(p["text"].as_str().unwrap_or_default())),
         "user_message" => {
             let body = match &p["body"] {
                 Value::String(text) => text.clone(),
@@ -303,6 +304,15 @@ fn describe(
                 status_text(p),
             ))
         }
+        "chat_replied" => Some((
+            Direction::FromAgent,
+            Some(names.worker(field("worker_id"))),
+            if p["failed"] == true {
+                format!("Chat not answered: {}", clip(field("reply")))
+            } else {
+                format!("Chat answer: {}", clip(field("reply")))
+            },
+        )),
         "enrollment_pending" => Some((
             Direction::FromAgent,
             Some(names.worker(field("worker_id"))),
@@ -405,7 +415,7 @@ fn working_on<'a>(worker: &WorkerRecord, snapshot: &'a Snapshot) -> Vec<&'a Task
         .collect()
 }
 
-fn in_contact(worker: &WorkerRecord, now: i64) -> bool {
+pub(crate) fn in_contact(worker: &WorkerRecord, now: i64) -> bool {
     worker.approved && !worker.revoked && now - worker.last_seen <= CONTACT_SECONDS
 }
 

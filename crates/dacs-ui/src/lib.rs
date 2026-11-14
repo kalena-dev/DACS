@@ -6,11 +6,13 @@ use leptos::prelude::*;
 use serde::Serialize;
 use serde_json::{Value, json};
 
+mod chat;
 #[cfg(feature = "native")]
 pub mod native;
 pub mod onboarding;
 mod overview;
 mod setup;
+pub use chat::{THREAD_REFRESH_SECONDS, render_chat, render_chat_thread};
 pub use overview::{REFRESH_SECONDS, render_dashboard};
 pub use setup::render_setup;
 pub const CSS: &str = include_str!("style.css");
@@ -86,6 +88,7 @@ pub(crate) fn page_with(
 ) -> String {
     let active = match title {
         "Dashboard" => "/",
+        "Chat" => "/chat",
         "Manage" | "Candidate source" => "/manage",
         "Compiler pools" => "/builds",
         "Network" => "/network",
@@ -96,6 +99,7 @@ pub(crate) fn page_with(
     };
     let navigation = [
         ("/", "Dashboard"),
+        ("/chat", "Chat"),
         ("/manage", "Manage"),
         ("/builds", "Compiler pools"),
         ("/network", "Network"),

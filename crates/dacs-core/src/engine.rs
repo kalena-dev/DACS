@@ -903,5 +903,57 @@ pub(crate) fn execute(db: &Connection, p: &Principal, command: Command) -> Resul
             db.execute("INSERT INTO acknowledgments(worker,sequence) VALUES(?1,?2) ON CONFLICT(worker) DO UPDATE SET sequence=excluded.sequence",params![w.id,through_sequence]).map_err(sql)?;
             Ok(json!({"acknowledged_through":through_sequence}))
         }
+        Command::SendChat { worker_id, text } => {
+            admin(p)?;
+            bounded(&text, 16384, "chat message")?;
+            let w: WorkerRecord = get(db, "worker", &worker_id)?;
+            if w.revoked || !w.approved {
+                return Err(conflict("device is revoked or awaiting approval"));
+            }
+            let chat = ChatMessage {
+                id: id(),
+                worker_id: w.id.clone(),
+                text,
+                sent_at: now(),
+                reply: None,
+                failed: false,
+                replied_at: None,
+            };
+            put(db, "chat", &chat.id, &w.project_id, &chat)?;
+            message(
+                db,
+                &w.id,
+                None,
+                "chat",
+                json!({"chat_id":chat.id,"text":chat.text}),
+                Some(&chat.id),
+            )?;
+            value(&chat)
+        }
+        Command::ReplyChat {
+            chat_id,
+            reply,
+            failed,
+        } => {
+            let w = worker(db, p, true)?;
+            identifier(&chat_id)?;
+            bounded(&reply, 65536, "chat reply")?;
+            let mut chat: ChatMessage = get(db, "chat", &chat_id)?;
+            if chat.worker_id != w.id {
+                return Err(err(
+                    ErrorCode::Forbidden,
+                    "chat message belongs to another device",
+                ));
+            }
+            if chat.reply.is_some() {
+                return Err(conflict("chat message is already answered"));
+            }
+            chat.reply = Some(reply);
+            chat.failed = failed;
+            chat.replied_at = Some(now());
+            put(db, "chat", &chat.id, &w.project_id, &chat)?;
+            event(db, Some(&w.project_id), "chat_replied", value(&chat)?)?;
+            value(&chat)
+        }
     }
 }

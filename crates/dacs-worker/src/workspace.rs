@@ -35,6 +35,7 @@ pub(crate) fn owner_environment() -> BTreeMap<String, String> {
                     | "APPDATA"
                     | "LOCALAPPDATA"
                     | "SYSTEMROOT"
+                    | "SYSTEMDRIVE"
                     | "WINDIR"
                     | "COMSPEC"
                     | "PATHEXT"

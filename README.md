@@ -68,6 +68,12 @@ The same controls appear in local onboarding. Ctrl-C drains; `emergency-cancel` 
 
 Workflow requests use `TaskSpec.execution` with `kind: "workflow"`. Their result artifact must match the admitted task, attempt, generation, source revision and reported checks. Read [build/release status](docs/person4-build-release-status.md) for pinned engine profiles, compiler telemetry and packaging commands. `dacs build-sysroot-digest --sysroot PATH` computes the sysroot pin used by a distributed-build profile.
 
+## Direct chat with a device's agent
+
+The Chat page (`/chat`) lets the coordinator's administrator message the agent on an approved device directly, outside any task. `SendChat` queues the text as a `chat` control message for that device; its running worker answers each message with one OMP turn on a durable chat session under `data_dir/chat` (working directory `workspaces_dir/chat`) and reports the answer with `ReplyChat`. The conversation keeps its context across messages and worker restarts.
+
+Chat is not admitted work: it reserves no capacity, produces no candidate, and runs with the device owner's tools and login like any managed session. Messages are answered one at a time. None is started while the worker is draining or stopped, and local `emergency-cancel` ends a running turn. A message interrupted by a worker restart is reported as unanswered, never run a second time. Only the administrator can send, and only the addressed device can answer; a device sees no other device's chat. The page uses no script: the message form stays still while the framed conversation reloads every two seconds.
+
 ## Private task-board preview
 
 Build the client-rendered Rust frontend with the WebAssembly target and Trunk:

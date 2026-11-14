@@ -48,6 +48,9 @@ pub(crate) struct Session {
     pub(crate) csrf: String,
     expires: i64,
     flash: Vec<String>,
+    /// Why the last chat message was not sent; shown once on the Chat page. Kept apart
+    /// from `flash` so the Chat page never consumes a notice meant for Manage.
+    chat_notice: Option<String>,
 }
 
 #[derive(Clone)]
@@ -208,9 +211,19 @@ fn set_cookie(app: &App, name: &str, value: &str, age: i64) -> HeaderValue {
 }
 
 async fn security_headers(request: axum::extract::Request, next: Next) -> Response {
+    // The conversation document is framed by the Chat page of the same origin; no
+    // other page may be framed at all.
+    let policy = if request.uri().path() == "/chat/thread" {
+        "default-src 'self'; script-src 'none'; style-src 'self'; img-src 'self' data:; frame-ancestors 'self'; base-uri 'none'; form-action 'self'"
+    } else {
+        "default-src 'self'; script-src 'none'; style-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+    };
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
-    headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'self'; script-src 'none'; style-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"));
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(policy),
+    );
     headers.insert(
         header::REFERRER_POLICY,
         HeaderValue::from_static("strict-origin"),
@@ -282,6 +295,7 @@ async fn login_submit(
         csrf: local::secret(),
         expires: local::now() + 8 * 3600,
         flash: Vec::new(),
+        chat_notice: None,
     };
     {
         let mut sessions = app
@@ -354,6 +368,101 @@ async fn manage(State(app): State<App>, headers: HeaderMap) -> WebResult<Respons
         &session.csrf,
     ))
     .into_response())
+}
+
+#[derive(Deserialize)]
+struct ChatQuery {
+    worker: Option<String>,
+}
+
+async fn chat_page(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Query(query): Query<ChatQuery>,
+) -> WebResult<Response> {
+    let Ok((id, session)) = session(&app, &headers) else {
+        return Ok(Redirect::to("/login").into_response());
+    };
+    let principal = app.store.authenticate(&session.bearer)?;
+    let store = app.store.clone();
+    let snapshot = blocking(move || store.snapshot(&principal)).await?;
+    let notice = app
+        .sessions
+        .lock()
+        .map_err(|_| forbidden("Session service unavailable"))?
+        .get_mut(&id)
+        .and_then(|s| s.chat_notice.take());
+    Ok(Html(dacs_ui::render_chat(
+        &snapshot,
+        query.worker.as_deref(),
+        notice.as_deref(),
+        &session.csrf,
+        local::now(),
+    ))
+    .into_response())
+}
+
+/// The self-reloading conversation framed by the Chat page.
+async fn chat_thread(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Query(query): Query<ChatQuery>,
+) -> WebResult<Html<String>> {
+    let (_, session) = session(&app, &headers)?;
+    let principal = app.store.authenticate(&session.bearer)?;
+    let store = app.store.clone();
+    let snapshot = blocking(move || store.snapshot(&principal)).await?;
+    Ok(Html(dacs_ui::render_chat_thread(
+        &snapshot,
+        query.worker.as_deref(),
+        local::now(),
+    )))
+}
+
+async fn chat_send(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> WebResult<Response> {
+    let (principal, session_id) = form_auth(&app, &headers, &form)?;
+    let worker_id = field(&form, "worker_id")?.to_owned();
+    let command = Command::SendChat {
+        worker_id: worker_id.clone(),
+        text: field(&form, "text")?.trim().to_owned(),
+    };
+    let command_id = field(&form, "command_id")?.to_owned();
+    let store = app.store.clone();
+    let sent = blocking(move || {
+        store.execute(
+            &principal,
+            CommandEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                command_id,
+                command,
+            },
+        )
+    })
+    .await;
+    if let Err(error) = sent {
+        if let Some(session) = app
+            .sessions
+            .lock()
+            .map_err(|_| forbidden("Session service unavailable"))?
+            .get_mut(&session_id)
+        {
+            session.chat_notice = Some(format!("Message not sent: {}", error.0.message));
+        }
+    }
+    // Only a well-formed device id is echoed into the redirect.
+    let target = if worker_id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        format!("/chat?worker={worker_id}")
+    } else {
+        "/chat".to_owned()
+    };
+    Ok(Redirect::to(&target).into_response())
 }
 
 async fn network_page(State(app): State<App>, headers: HeaderMap) -> WebResult<Response> {
@@ -1184,6 +1293,9 @@ pub async fn run(mut config: Config) -> anyhow::Result<Option<Value>> {
         .route("/assets/dacs.css", get(css))
         .route("/", get(dashboard))
         .route("/manage", get(manage))
+        .route("/chat", get(chat_page))
+        .route("/chat/thread", get(chat_thread))
+        .route("/ui/chat", post(chat_send))
         .route("/network", get(network_page))
         .route("/builds", get(compiler_pools_page))
         .route("/login", get(login))

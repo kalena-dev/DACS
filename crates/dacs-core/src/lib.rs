@@ -511,6 +511,17 @@ impl Store {
         }
         messages.reverse();
         deliveries.reverse();
+        // A device sees only its own chat; the administrator sees every device's.
+        let chats = all::<ChatMessage>(&db, "chat")?
+            .into_iter()
+            .filter(|c| {
+                workers.iter().any(|w| w.id == c.worker_id)
+                    && principal
+                        .device_id
+                        .as_deref()
+                        .is_none_or(|device| device == c.worker_id)
+            })
+            .collect();
         Ok(Snapshot {
             projects,
             workers,
@@ -523,6 +534,7 @@ impl Store {
             usage,
             runtime_status,
             deliveries,
+            chats,
         })
     }
     pub fn invitation(&self, token: &str) -> Result<Invitation> {
