@@ -15,7 +15,8 @@ Commits:
 
 - **`56422f5`**: full `cargo test --workspace`, Trunk build and every binary smoke below.
 - **`8787088`** (`origin/main` after a rebase): repeated all three `cargo build` commands, tests for Person 2/3 crates, both Clippy runs and the `dacs-setup` failure check.
-- Between these commits, the only source change in the crates the smoke used is `crates/dacs-worker/src/supervisor.rs`. The coordinator, TLS, task-board and `worker status` paths don't call it. The other changes are manifest lint inheritance, tests and docs.
+- **`23b67b6`** (`origin/main` after a later rebase): repeated tests for Person 2/3 crates and both Clippy runs. It adds `dacs-worker` physical-host capacity accounting and new `dacs-netadmin` and `dacs-netclient` tests.
+- Between `56422f5` and `8787088`, the only source change in the crates the smoke used is `crates/dacs-worker/src/supervisor.rs`. The coordinator, TLS, task-board and `worker status` paths don't call it. The other changes are manifest lint inheritance, tests and docs.
 
 ## Results
 
@@ -25,9 +26,9 @@ Commits:
 | Native-shell build | `cargo build -p dacs --features native` | Passed at both commits. Links system `WebKit.framework` and `AppKit.framework` (`otool -L`); the default build links neither |
 | Network binaries | `cargo build -p dacs-netclient -p dacs-netadmin` | Passed at both commits, no warnings. Produces `dacs-net` and `dacs-netadmin` |
 | Workspace tests (once) | `cargo test --workspace --no-fail-fast` | **Failed** at `56422f5`: 203 passed, 13 failed, 1 ignored (a helper-process test). All 13 failures are in Person 1 code and share one macOS cause (failure 1 below) |
-| Person 2/3 tests | `cargo test -p dacs-worker -p dacs-net-contract -p dacs-netclient -p dacs-netadmin -p dacs-task-board-web --no-fail-fast` | Passed at `8787088`: 96 passed, 0 failed, 2 ignored (helper-process tests run as subprocesses by their parent tests) |
-| Clippy, network crates | `cargo clippy -p dacs-net-contract -p dacs-netclient -p dacs-netadmin --all-targets -- -D warnings` | Passed at both commits, no diagnostics |
-| Clippy, worker | `cargo clippy -p dacs-worker --all-targets -- -D warnings` | **Failed** at both commits: 31 lint errors. Without `-D warnings` it passes with 31 warnings (failure 3) |
+| Person 2/3 tests | `cargo test -p dacs-worker -p dacs-net-contract -p dacs-netclient -p dacs-netadmin -p dacs-task-board-web --no-fail-fast` | Passed at `8787088`: 96 passed, 0 failed, 2 ignored. Passed at `23b67b6`: 120 passed, 0 failed, 2 ignored. The ignored tests are helper processes that their parent tests run as subprocesses |
+| Clippy, network crates | `cargo clippy -p dacs-net-contract -p dacs-netclient -p dacs-netadmin --all-targets -- -D warnings` | Passed at `56422f5`, `8787088` and `23b67b6`, no diagnostics |
+| Clippy, worker | `cargo clippy -p dacs-worker --all-targets -- -D warnings` | **Failed**: 31 lint errors at `56422f5` and `8787088`. At `23b67b6` it passes without `-D warnings` but reports 29 warnings, so it would still fail (failure 3) |
 | Frontend | `cd examples/task-board-web && trunk build --release` | Passed at `56422f5` in 33 s. `dist/`: JS 37,270 B, WASM 498,795 B, CSS 7,070 B |
 | Coordinator smoke | `dacs serve --listen 127.0.0.1:17401 --data-dir <tmp>/data --local-setup` | Passed. Logs an ERROR every 5 s when no network is configured (observation A) |
 | Coordinator under `$TMPDIR` | `dacs serve --listen 127.0.0.1:17403 --data-dir "$(mktemp -d)/data"` | **Failed**: exits 1 with `Error: Symlink/reparse path is not allowed: /var` (failure 1). The same directory given as its `/private/var/...` path served `/health` 200 |
@@ -56,6 +57,14 @@ Test details from the full workspace run at `56422f5`:
 
 At `8787088` the Person 2/3 rerun adds the new `crash_reconnect` tests, which passed (2 passed, 1 helper ignored). `crash_recovery` passed 4 and `fake_tailscale_cli` passed 9.
 
+At `23b67b6` the rerun adds these suites, which all passed on macOS:
+
+- `dacs-worker` `tests/capacity.rs`: 2 passed.
+- `dacs-netadmin` `tests/auth_and_tls.rs`: 12 passed.
+- `dacs-netclient` `tests/measure_cli.rs`: 2 passed.
+
+The `dacs-worker` lib now has 32 tests and the `dacs-netclient` lib 25; both passed.
+
 ## Failures
 
 ### 1. Symlinked macOS system directories rejected (Person 1, `crates/dacs-setup/src/util.rs`)
@@ -80,13 +89,13 @@ Suggested fix: only reject links that an unprivileged user could have planted. O
 
 ### 3. Worker Clippy under `-D warnings` (Person 2, plus Person 4 in `build_runner.rs`)
 
-These are cross-platform style lints from Clippy 1.99, not macOS-specific behavior, so they were recorded rather than changed here. There are 31 errors:
+These are cross-platform style lints from Clippy 1.99, not macOS-specific behavior, so they were recorded rather than changed here. There were 31 errors at `56422f5` and `8787088`. At `23b67b6` there are 29: upstream removed the two in `supervisor.rs`. Line numbers below are at `23b67b6`:
 
 | Lint | Count and location |
 |---|---|
 | `clippy::result_large_err` | 15 in `task_board.rs`. `BoardError` carries redb errors of at least 160 bytes |
-| `clippy::collapsible_if` | 11 in total: `runtime.rs` 778, 779, 953, 1094; `omp.rs` 317, 318; `supervisor.rs` 297, 358; `build_runner.rs` 266, 1014, 1396 (P4) |
-| `clippy::too_many_arguments` | 4 in total: `runtime.rs` 1007, 1184; `build_runner.rs` 492, 1512 (P4) |
+| `clippy::collapsible_if` | 9 in total: `runtime.rs` 792, 793, 967, 1108; `omp.rs` 317, 318; `build_runner.rs` 266, 1014, 1396 (P4) |
+| `clippy::too_many_arguments` | 4 in total: `runtime.rs` 1021, 1198; `build_runner.rs` 492, 1512 (P4) |
 | `clippy::large_enum_variant` | 1 in `build_runner.rs:46` (P4) |
 
 Suggested fixes:
