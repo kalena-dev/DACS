@@ -619,6 +619,14 @@ mod tests {
     }
 
     #[test]
+    fn deploy_example_request_is_valid() {
+        let text = include_str!("../../../deploy/netadmin/enrollment-request.example.json");
+        let req: EnrollmentRequest = serde_json::from_str(text).unwrap();
+        assert_eq!(req.validate(datetime!(2026-11-14 10:05 UTC)), Ok(()));
+        assert_eq!(req.tags(), vec!["tag:dacs-worker", "tag:dacs-coordinator"]);
+    }
+
+    #[test]
     fn host_name_validation() {
         assert!(HostName::parse("ok-1").is_ok());
         for bad in ["", "-a", "a-", "Upper", "a.b", &"x".repeat(64)] {

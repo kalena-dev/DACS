@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Request, State};
+use axum::extract::{FromRequest, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -60,6 +60,20 @@ impl From<ServiceError> for Failure {
                     e.to_string(),
                 )
             }
+        }
+    }
+}
+
+/// JSON body extractor whose rejections use the [`ApiError`] body.
+pub struct ApiJson<T>(pub T);
+
+impl<S: Send + Sync, T: serde::de::DeserializeOwned> FromRequest<S> for ApiJson<T> {
+    type Rejection = Failure;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(Self(value)),
+            Err(rejection) => Err(fail(rejection.status(), "bad_request", rejection.body_text())),
         }
     }
 }
@@ -185,7 +199,7 @@ async fn contract<H: HeadscaleApi>(
 
 async fn enroll<H: HeadscaleApi>(
     State(st): State<Arc<AppState<H>>>,
-    Json(req): Json<EnrollmentRequest>,
+    ApiJson(req): ApiJson<EnrollmentRequest>,
 ) -> Result<Json<EnrollmentGrant>, Failure> {
     Ok(Json(
         st.service.enroll(&req, OffsetDateTime::now_utc()).await?,
@@ -194,7 +208,7 @@ async fn enroll<H: HeadscaleApi>(
 
 async fn membership<H: HeadscaleApi>(
     State(st): State<Arc<AppState<H>>>,
-    Json(q): Json<MembershipQuery>,
+    ApiJson(q): ApiJson<MembershipQuery>,
 ) -> Result<Json<NetworkMembership>, Failure> {
     Ok(Json(
         st.service.membership(&q, OffsetDateTime::now_utc()).await?,
@@ -203,7 +217,7 @@ async fn membership<H: HeadscaleApi>(
 
 async fn revoke<H: HeadscaleApi>(
     State(st): State<Arc<AppState<H>>>,
-    Json(req): Json<RevocationRequest>,
+    ApiJson(req): ApiJson<RevocationRequest>,
 ) -> Result<Json<RevocationOutcome>, Failure> {
     Ok(Json(
         st.service.revoke(&req, OffsetDateTime::now_utc()).await?,
@@ -316,5 +330,19 @@ mod tests {
             .body(Body::from("{}"))
             .unwrap();
         assert_eq!(status(req).await, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn malformed_body_returns_api_error() {
+        let req = Request::post("/v1/enrollments")
+            .header("authorization", "Bearer good-token")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"device_id":"d","host_name":"Not Valid"}"#))
+            .unwrap();
+        let resp = app().oneshot(req).await.unwrap();
+        assert!(resp.status().is_client_error());
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let err: ApiError = serde_json::from_slice(&body).unwrap();
+        assert_eq!(err.code, "bad_request");
     }
 }

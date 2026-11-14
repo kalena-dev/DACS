@@ -1,0 +1,20 @@
+{
+  "device_id": "coordinator-1",
+  "host_name": "coordinator",
+  "host_kind": { "kind": "physical" },
+  "roles": ["coordinator", "worker"],
+  "consent": {
+    "device_id": "coordinator-1",
+    "accepted_host": "coordinator",
+    "accepted_by": "OWNER_OS_ACCOUNT",
+    "accepted_at": "2026-11-14T10:00:00Z",
+    "disclosure_revision": "host-admin-access/1",
+    "tailnet_switch": null
+  },
+  "approval": {
+    "device_id": "coordinator-1",
+    "approved_by": "PROJECT_OWNER",
+    "approved_at": "2026-11-14T10:01:00Z",
+    "authorization_ref": "COORDINATOR_AUTHORIZATION_RECORD"
+  }
+}
