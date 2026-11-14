@@ -4,11 +4,11 @@
 
 The implementation is in `C:/Users/PC/Documents/GitHub/DACS`, shared branch `main`. Build execution and evidence collection are in `crates/dacs-worker/src/build_runner.rs` and `build_execution.rs`; pool ownership and authenticated telemetry are connected through the coordinator. `person-4/builds-release/` contains release validation, pinned sccache instrumentation, the rustc provenance wrapper and native packaging/signature-verification commands.
 
-Verified: the latest combined worker/UI/application check passed 62 tests, the native application build passed, and the task-board WebAssembly release build passed. These results do not establish distributed compilation or installable release acceptance.
+Verified: the baseline combined worker/UI/application check passed 62 tests; the native application and task-board WebAssembly release builds passed. Four focused packaging tests passed. A clean Windows x64 release at `13bc70b0c819b9e2cb6f89a8f7cf752bb9b76c31` produced an unsigned MSI; extraction confirmed the executable and both required MSVC runtime DLLs. Its SHA-256 is `804f7a2167d9765bf512d31fdac0983c712c1c56844ad838bc66933cf91bdaab`. Full paths, tool pins and evidence are in the release status document.
 
 Use repository `docs/person4-build-release-status.md` for the exact supported sccache revision, profile pins, provenance rules and packaging commands. `dacs build-sysroot-digest --sysroot <path>` produces the profile's sysroot digest. Compiler pool ownership is visible at `/builds`.
 
-Still unverified: one Linux build consuming distinct outputs from two other physical hosts, live resource limits and worker-removal/cache comparisons, native package production, platform catalogue coverage and signing/notarization. The available Docker Linux daemon was unreachable; no multi-host fleet or signing identities were used. The original acceptance requirements below remain required.
+Still unverified: one Linux build consuming distinct outputs from two other physical hosts, live resource limits and worker-removal/cache comparisons, Windows ARM64/Linux/macOS package production, installation/repair/update, platform catalogue coverage and signing/notarization. The Windows x64 MSI is an unsigned preview, not a trusted update. The available Docker Linux daemon was unreachable; no multi-host fleet or signing identities were used. The original acceptance requirements below remain required.
 
 Read `00-general-plan.md` first. Own build/test execution, real distributed Rust compilation and platform release production/verification. Person 1 owns installer/update code and the larger software track; Person 2 supervises your processes; Person 3 owns overlay networking.
 
