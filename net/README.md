@@ -261,9 +261,19 @@ token; the single-use auth key is consumed by `join` and is not part of
     and a measured non-unreachable path. Rejects non-overlay addresses before probing.
     Exit 2 if any endpoint fails or the list is empty.
   - `dacs-net peers > before.json`, run the build, `dacs-net peers > after.json`, then
-    `dacs-net traffic --before before.json --after after.json`: per peer
-    `{host_name, path_after, rx_bytes, tx_bytes}` deltas. `PeerSnapshot { host_name, overlay_ips, online, path, rx_bytes, tx_bytes }`.
-    Passive paths can show only the home DERP region for idle peers.
+    `dacs-net traffic --before before.json --after after.json`.
+    `peers` prints `PeersReport { captured_at, backend_state, running, warning, peers: Vec<PeerSnapshot> }`
+    (`PeerSnapshot { host_name, overlay_ips, online, path, rx_bytes, tx_bytes }`) and exits 2
+    when the client is not `Running`: a stopped client (seen on macOS 1.102.4) still lists
+    peers online over their last path, so those values are last-known, not current.
+    `traffic` prints `TrafficReport { before_backend_state, after_backend_state, counters_current, warnings, peers, ok }`
+    with per peer `{host_name, status, rx_bytes, tx_bytes, path_after}`; `status` is
+    `measured` | `counter_reset` (a counter went down; both deltas null, not 0) |
+    `new_peer` | `missing_after` (in the first snapshot only; deltas null). `path_after`
+    is shown only when the second snapshot is known to be `Running`. It is passive (idle
+    peers can show only the home DERP region), so path evidence comes from active probes
+    (`ping`, `compiler-check`, `measure`). Exit 2 on any warning. Older bare-array `peers`
+    files are accepted with a warning (backend state unknown, `path_after` withheld).
   - `dacs-net ping <peer> [--count 5]`: `PathProbe { peer, path, rtt_ms, measured_at }`; exit 2 if unreachable.
   - `dacs-net probe <addr:port>... [--timeout-ms 3000]`: TCP reachability; exit 2 if any fails.
 - `PeerPath` (tag `path`): `direct { endpoint }` | `derp { region }` | `peer_relay { relay }` |
@@ -278,14 +288,14 @@ token; the single-use auth key is consumed by `join` and is not part of
 | `preflight --config <file>` | Read-only DNS, verified TLS, health and bootstrap-to-netadmin bridge checks; no tokens or joins |
 | `join --grant <file> --consent <file> [--unattended] [--no-dns]` | Join with an `EnrollmentGrant` and `HostConsent`; prints `LocalJoinResult` |
 | `leave <LOGIN_SERVER>` | Log out of the DACS profile only |
-| `peers` | `Vec<PeerSnapshot>` |
+| `peers` | `PeersReport` (backend state + `Vec<PeerSnapshot>`); exit 2 if not `Running` |
 | `ping <peer> [--count N]` | `PathProbe` |
 | `probe <ADDR:PORT>... [--timeout-ms N]` | `Vec<TcpProbe>` |
 | `compiler-check --endpoints <file> [--timeout-ms N]` | Compiler endpoint reachability and path |
-| `traffic --before <file> --after <file>` | Per-peer byte deltas and path |
+| `traffic --before <file> --after <file>` | `TrafficReport`: per-peer byte deltas, resets, missing peers, passive path |
 
 Exit codes: 0 success, 2 the command ran but a check failed (`ping`, `probe`,
-`compiler-check`, `preflight`), 1 error. The CLI is found via `DACS_TAILSCALE_BIN`, then `PATH`,
+`compiler-check`, `preflight`, `peers`, `traffic`), 1 error. The CLI is found via `DACS_TAILSCALE_BIN`, then `PATH`,
 then platform default install paths. No command prints the auth key.
 
 ## Coordinator-first bootstrap
