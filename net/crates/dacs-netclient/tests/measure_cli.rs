@@ -164,3 +164,107 @@ fn traffic_flags_reset_and_missing_peer_from_older_array_snapshots() {
     assert_eq!(v["warnings"].as_array().unwrap().len(), 4, "{v}");
     assert!(fake.calls().is_empty(), "traffic is offline");
 }
+
+fn endpoints_file(fake: &Fake, name: &str, ip: &str) -> String {
+    let list = serde_json::json!([
+        {"host_name": "srv", "role": "server", "overlay_ip": ip, "port": 10501},
+        {"host_name": "sched", "role": "scheduler", "overlay_ip": "100.64.0.6", "port": 10600}
+    ]);
+    let p = fake.path(name);
+    std::fs::write(&p, serde_json::to_vec(&list).unwrap()).unwrap();
+    p.to_str().unwrap().to_owned()
+}
+
+/// Exit 1 with `needle` on stderr, nothing on stdout, and no `tailscale`
+/// call at all (so no ping and no local-state read happened).
+fn assert_refused(fake: &Fake, args: &[&str], needle: &str) {
+    let out = fake.run(args);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{args:?}: {stderr}");
+    assert!(stderr.contains(needle), "{args:?}: {stderr}");
+    assert!(out.stdout.is_empty(), "{args:?} printed a result");
+    assert!(fake.calls().is_empty(), "{args:?} ran {:?}", fake.calls());
+}
+
+#[test]
+fn measure_refuses_loopback_and_non_overlay_addresses_before_any_probe() {
+    let fake = Fake::new(STATUS_RUNNING);
+    for to in ["127.0.0.1:10501", "192.168.1.20:10501", "[::1]:10501"] {
+        assert_refused(
+            &fake,
+            &["measure", "send", "--to", to, "--bytes", "1024"],
+            "not a private overlay address; nothing sent",
+        );
+    }
+    for listen in ["0.0.0.0:10501", "127.0.0.1:0", "192.168.1.20:10501"] {
+        assert_refused(
+            &fake,
+            &["measure", "sink", "--listen", listen],
+            "refusing to listen",
+        );
+    }
+    let lan = endpoints_file(&fake, "lan.json", "192.168.1.20");
+    assert_refused(
+        &fake,
+        &[
+            "measure",
+            "availability",
+            "--endpoints",
+            &lan,
+            "--samples",
+            "3",
+        ],
+        "192.168.1.20:10501 is not a private overlay address",
+    );
+    let ok = endpoints_file(&fake, "ok.json", "100.64.0.5");
+    assert_refused(
+        &fake,
+        &[
+            "measure",
+            "evidence",
+            "--endpoints",
+            &ok,
+            "--transfer-to",
+            "127.0.0.1:10501",
+            "--bytes",
+            "1024",
+        ],
+        "transfer target 127.0.0.1:10501",
+    );
+}
+
+#[test]
+fn measure_evidence_needs_a_size_for_transfers_and_a_round() {
+    let fake = Fake::new(STATUS_RUNNING);
+    let ok = endpoints_file(&fake, "ok.json", "100.64.0.5");
+    let out = fake.run(&[
+        "measure",
+        "evidence",
+        "--endpoints",
+        &ok,
+        "--transfer-to",
+        "100.64.0.5:10501",
+    ]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--bytes"));
+    assert!(fake.calls().is_empty());
+
+    // Zero rounds fails after the read-only local-state lookup, before probes.
+    let out = fake.run(&[
+        "measure",
+        "availability",
+        "--endpoints",
+        &ok,
+        "--from",
+        "client",
+        "--samples",
+        "0",
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("at least one sample round"));
+    assert!(
+        fake.calls().iter().all(|c| !c.starts_with("ping")),
+        "{:?}",
+        fake.calls()
+    );
+}

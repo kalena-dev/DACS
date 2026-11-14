@@ -276,6 +276,8 @@ token; the single-use auth key is consumed by `join` and is not part of
     files are accepted with a warning (backend state unknown, `path_after` withheld).
   - `dacs-net ping <peer> [--count 5]`: `PathProbe { peer, path, rtt_ms, measured_at }`; exit 2 if unreachable.
   - `dacs-net probe <addr:port>... [--timeout-ms 3000]`: TCP reachability; exit 2 if any fails.
+  - `dacs-net measure evidence ...`: availability window and overlay transfers as one
+    JSON record per build; see [Measured availability and transfer](#measured-availability-and-transfer-cratesdacs-netclientsrcmeasurers).
 - `PeerPath` (tag `path`): `direct { endpoint }` | `derp { region }` | `peer_relay { relay }` |
   `unreachable { detail }`. `direct` vs `derp` is the direct/relayed distinction to report.
 
@@ -293,10 +295,57 @@ token; the single-use auth key is consumed by `join` and is not part of
 | `probe <ADDR:PORT>... [--timeout-ms N]` | `Vec<TcpProbe>` |
 | `compiler-check --endpoints <file> [--timeout-ms N]` | Compiler endpoint reachability and path |
 | `traffic --before <file> --after <file>` | `TrafficReport`: per-peer byte deltas, resets, missing peers, passive path |
+| `measure availability\|sink\|send\|evidence ...` | Measured compiler-path availability and overlay transfer; see below |
 
 Exit codes: 0 success, 2 the command ran but a check failed (`ping`, `probe`,
-`compiler-check`, `preflight`, `peers`, `traffic`), 1 error. The CLI is found via `DACS_TAILSCALE_BIN`, then `PATH`,
+`compiler-check`, `preflight`, `peers`, `traffic`, `measure`), 1 error. The CLI is found via `DACS_TAILSCALE_BIN`, then `PATH`,
 then platform default install paths. No command prints the auth key.
+
+### Measured availability and transfer (`crates/dacs-netclient/src/measure.rs`)
+
+For item 8: which path a build used, and measured availability/transfer on it.
+Every address must be an overlay address (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`);
+`0.0.0.0`, LAN and loopback addresses are refused before anything is probed, bound
+or sent. A target on this host's own overlay IP is measured but labelled `local`
+and never counts as overlay proof.
+
+```sh
+# Availability window: repeat compiler-check N times (start-to-start interval).
+dacs-net measure availability --endpoints eps.json --from client --samples 30 --interval-ms 2000
+# Transfer: on the receiving node, on a port the ACL grants between the two nodes
+# (e.g. 10501 on a compile server before sccache-dist binds it) ...
+dacs-net measure sink --listen 100.64.0.5:10501 [--count 1] [--max-bytes 1073741824]
+# ... and on the sending node:
+dacs-net measure send --to 100.64.0.5:10501 --bytes 67108864
+# One record to attach to a build: window, then transfers to running sinks.
+dacs-net measure evidence --endpoints eps.json --from client --samples 30 \
+  --transfer-to 100.64.0.5:10501 --bytes 67108864 --build <build-id> > net-evidence.json
+```
+
+- `availability` (`AvailabilityReport`): per endpoint `samples`, `successes`,
+  `success_ratio`, `overlay_successes` (local excluded), `paths` (counts per class),
+  `path_changes` and `direct_relay_flips`, `connect_ms`/`rtt_ms` as
+  `{count, min, median, p95, max}` (nearest rank, observed values), and the raw
+  `series` of `{at, ok, tcp_reachable, connect_ms, path_class, rtt_ms, error}`. With
+  `--from`, `roles` gives the rounds in which each required role was reached over the
+  overlay. `ok` (exit 0) only if every round passed `compiler-check`.
+- `send` (`TransferResult`): `requested_bytes`, `sent_bytes`, `acknowledged_bytes`,
+  `connect_ms`, `duration_ms` (first payload byte until the sink's acknowledgement),
+  `mib_per_s`, `mbit_per_s`, `sink_duration_ms`, `path_before`/`path_after`
+  (`tailscale ping`) with `path_class_before`/`_after`, `complete`, `overlay_proof`
+  (complete and both probes `direct` or `relayed`). Exit 0 only when `overlay_proof`.
+  `sink` prints `SinkReport { listen, results, stopped, ok }`; it refuses transfers over
+  `--max-bytes` before any payload and gives up after `--wait-secs` (600).
+- `evidence` (`MeasureEvidence`, `schema: dacs-net/measure-evidence/1`): `build`,
+  `created_at`, `tools { dacs_net, contract_revision, tailscale }`,
+  `local_overlay_ips`, `from`, `availability`, `transfers`, `paths_observed`,
+  `overlay_proof`, `ok` (every round passed and every transfer is overlay proof) and
+  `notes` (local/relayed/path-change caveats).
+
+One TCP stream and one window per figure: a measurement, not a capacity or
+build-speed claim, and relayed figures say nothing about relay throughput elsewhere.
+Tested only with scripted probers and loopback sockets; no transfer between physical
+hosts has been measured with this tool yet.
 
 ## Coordinator-first bootstrap
 
