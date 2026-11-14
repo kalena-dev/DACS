@@ -136,6 +136,9 @@ pub struct HsState {
     /// (simulates a server that ignores the single-use request).
     pub force_reusable: bool,
     pub force_ephemeral: bool,
+    /// Alter each created key before it is stored and returned (a server that
+    /// ignores requested tags/expiry, or answers with odd values).
+    pub tamper_key: Option<fn(&mut Key)>,
 }
 
 fn ts(t: Option<OffsetDateTime>) -> Value {
@@ -216,6 +219,10 @@ impl HsState {
                         })
                         .unwrap_or_default(),
                 };
+                let mut key = key;
+                if let Some(tamper) = self.tamper_key {
+                    tamper(&mut key);
+                }
                 let v = json!({"preAuthKey": self.key_json(&key, true)});
                 self.keys.push(key);
                 (StatusCode::OK, v)
@@ -364,6 +371,7 @@ impl MockHeadscale {
             requests: Vec::new(),
             force_reusable: false,
             force_ephemeral: false,
+            tamper_key: None,
         }));
         let app = Router::new().fallback(handle).with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -499,7 +507,12 @@ impl MockHeadscale {
     pub fn secrets(&self) -> Vec<String> {
         let s = self.lock();
         let mut out = vec![s.api_key.clone()];
-        out.extend(s.keys.iter().map(|k| k.secret.clone()));
+        out.extend(
+            s.keys
+                .iter()
+                .filter(|k| !k.secret.is_empty())
+                .map(|k| k.secret.clone()),
+        );
         out
     }
 }

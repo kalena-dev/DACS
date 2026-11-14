@@ -65,6 +65,32 @@ fn is_dacs_tagset(tags: &[String]) -> bool {
             .all(|t| NodeRole::from_tag(t).is_some_and(|r| ENROLLABLE_ROLES.contains(&r)))
 }
 
+/// Why a freshly created key must not be handed out, if it must not. The
+/// grant reports the requested tags and expiry, so the key must match them.
+fn unusable_key(key: &PreAuthKey, tags: &[String], expires_at: OffsetDateTime) -> Option<&'static str> {
+    let mut got = key.acl_tags.clone();
+    got.sort();
+    got.dedup();
+    let mut want = tags.to_vec();
+    want.sort();
+    if key.key.is_empty() {
+        Some("pre-auth key returned without secret")
+    } else if key.reusable || key.ephemeral {
+        Some("headscale created a reusable/ephemeral key")
+    } else if key.used {
+        Some("headscale returned an already used key")
+    } else if got != want {
+        Some("headscale created a key with other tags than requested")
+    } else if key
+        .expiration
+        .is_none_or(|e| e > expires_at + time::Duration::minutes(1))
+    {
+        Some("headscale created a key that outlives the requested expiry")
+    } else {
+        None
+    }
+}
+
 fn parse_ips(node: &Node) -> Vec<IpAddr> {
     node.ip_addresses
         .iter()
@@ -123,16 +149,26 @@ impl<H: HeadscaleApi> Service<H> {
 
         let expires_at = now + self.settings.key_ttl;
         let key = self.hs.create_tagged_key(&tags, expires_at).await?;
-        if key.key.is_empty() {
+        if let Some(problem) = unusable_key(&key, &tags, expires_at) {
+            // Never hand out a key that could enroll more than one device, carry
+            // other tags or outlive the grant. Expire it and audit the refusal so
+            // a failed cleanup can still be reconciled by key id.
+            let expired = self.hs.expire_key(key.id).await;
+            if let Err(e) = &expired {
+                tracing::error!(auth_key_id = key.id, error = %e, "could not expire refused pre-auth key");
+            }
+            self.audit.record(
+                "enroll_refused",
+                serde_json::json!({
+                    "device_id": req.device_id,
+                    "host_name": req.host_name,
+                    "auth_key_id": key.id,
+                    "problem": problem,
+                    "key_expired": expired.is_ok(),
+                }),
+            );
             return Err(ServiceError::Upstream(HeadscaleError::Decode(
-                "pre-auth key returned without secret".into(),
-            )));
-        }
-        if key.reusable || key.ephemeral {
-            // Never hand out a key that could enroll more than one device.
-            let _ = self.hs.expire_key(key.id).await;
-            return Err(ServiceError::Upstream(HeadscaleError::Decode(
-                "headscale created a reusable/ephemeral key".into(),
+                problem.into(),
             )));
         }
 
