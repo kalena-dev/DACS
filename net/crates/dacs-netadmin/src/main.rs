@@ -89,8 +89,18 @@ async fn run(cli: Cli) -> anyhow_lite::Result<()> {
             let svc = Service::new(client(&cfg)?, cfg.settings(), audit);
             let req: dacs_net_contract::EnrollmentRequest =
                 serde_json::from_str(&std::fs::read_to_string(&request)?)?;
-            let grant = svc.enroll(&req, time::OffsetDateTime::now_utc()).await?;
-            write_private(&out, &serde_json::to_vec_pretty(&grant)?)?;
+            // Claim the output file before issuing, so an existing file cannot
+            // turn a successful issuance into a discarded key.
+            let file = open_private(&out)?;
+            let grant = match svc.enroll(&req, time::OffsetDateTime::now_utc()).await {
+                Ok(grant) => grant,
+                Err(e) => {
+                    drop(file);
+                    let _ = std::fs::remove_file(&out);
+                    return Err(e.into());
+                }
+            };
+            write_all_synced(file, &serde_json::to_vec_pretty(&grant)?)?;
             println!(
                 "{}",
                 serde_json::json!({
@@ -173,8 +183,7 @@ async fn run(cli: Cli) -> anyhow_lite::Result<()> {
 }
 
 /// Create `path` readable only by the owner (Unix); fail if it already exists.
-fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
+fn open_private(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -182,7 +191,11 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let mut f = opts.open(path)?;
+    opts.open(path)
+}
+
+fn write_all_synced(mut f: std::fs::File, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
     f.write_all(bytes)?;
     f.sync_all()
 }
