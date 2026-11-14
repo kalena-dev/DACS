@@ -674,7 +674,10 @@ pub async fn run(mut config: WorkerConfig) -> Result<()> {
                     a.worker_id != config.worker_id || matches!(a.state.as_str(), "fenced" | "abandoned" | "stopping" | "stopped") || snapshot.tasks.iter().find(|t| t.id == a.task_id).is_none_or(|t| t.generation != a.generation || t.attempt_id.as_deref() != Some(id) || t.cancel_requested || matches!(t.state,TaskState::Accepted|TaskState::Cancelled|TaskState::Failed) || !same_pins(&t.spec, &runtime.pins))
                 });
                 if stale {
-                    let reason = if current.and_then(|a| snapshot.tasks.iter().find(|t| t.id == a.task_id)).is_some_and(|t| t.cancel_requested) { "coordinator_cancel" } else { "coordinator_fenced" };
+                    // The attempt watchdog acts on local controls without waiting
+                    // for this loop, so the snapshot may already show our own stop.
+                    let local: OwnerControls = journal.get_value("owner_controls")?.unwrap_or_default();
+                    let reason = if local.emergency_cancel { "emergency_cancel" } else if runtime.desktop && local.desktop_paused { "desktop_paused" } else if current.and_then(|a| snapshot.tasks.iter().find(|t| t.id == a.task_id)).is_some_and(|t| t.cancel_requested) { "coordinator_cancel" } else { "coordinator_fenced" };
                     local_control::record_stop(&journal, id, reason)?;
                     let _ = runtime.stop.send(true);
                 }
