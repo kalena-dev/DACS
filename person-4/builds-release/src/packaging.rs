@@ -22,9 +22,18 @@ pub struct PackageRequest {
     pub cargo_version: String,
 }
 #[derive(Debug, Serialize)]
+pub struct RuntimeAsset {
+    pub name: String,
+    pub sha256: String,
+    pub bytes: u64,
+}
+#[derive(Debug, Serialize)]
 pub struct PackageReport {
     pub source_commit: String,
     pub cargo_lock_sha256: String,
+    pub rustc_version: String,
+    pub cargo_version: String,
+    pub runtime_assets: Vec<RuntimeAsset>,
     pub target: String,
     pub artifact: PathBuf,
     pub sha256: String,
@@ -98,6 +107,42 @@ fn xml(text: &str) -> String {
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
 }
+// Rust's Windows canonicalization uses verbatim paths. WiX's XML reader
+// interprets those as malformed URIs; external tools need ordinary DOS/UNC paths.
+fn tool_path(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(text) = path.to_str() {
+            if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+                return PathBuf::from(format!(r"\\{unc}"));
+            }
+            if let Some(dos) = text.strip_prefix(r"\\?\") {
+                return PathBuf::from(dos);
+            }
+        }
+    }
+    path
+}
+
+fn windows_runtime_directory(arch: &str) -> Result<PathBuf> {
+    let root = std::env::var_os("VCToolsRedistDir")
+        .ok_or_else(|| invalid("run packaging in the MSVC developer environment: VCToolsRedistDir is required"))?;
+    let mut matches = fs::read_dir(PathBuf::from(root).join(arch))?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<io::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|path| {
+            path.is_dir()
+                && path.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
+                    name.starts_with("Microsoft.VC") && name.ends_with(".CRT")
+                })
+        });
+    let directory = matches.next().ok_or_else(|| invalid("MSVC redistributable CRT directory is missing"))?;
+    if matches.next().is_some() {
+        return Err(invalid("MSVC redistributable CRT directory is ambiguous").into());
+    }
+    Ok(directory)
+}
 fn native_target(target: &str) -> Result<(&'static str, &'static str)> {
     let (os, arch) = match target {
         "x86_64-pc-windows-msvc" => ("windows", "x64"),
@@ -143,7 +188,7 @@ fn validate_version(version: &str) -> Result<()> {
 pub fn produce(request: PackageRequest) -> Result<PackageReport> {
     validate_version(&request.version)?;
     let (os, arch) = native_target(&request.target)?;
-    let workspace = request.workspace.canonicalize()?;
+    let workspace = tool_path(request.workspace.canonicalize()?);
     if query("git", &["rev-parse", "HEAD"], &workspace)? != request.source_commit
         || !query(
             "git",
@@ -164,7 +209,7 @@ pub fn produce(request: PackageRequest) -> Result<PackageReport> {
     }
     // Exclusive directory prevents stale package output from appearing successful.
     fs::create_dir(&request.output)?;
-    let output = request.output.canonicalize()?;
+    let output = tool_path(request.output.canonicalize()?);
     if output.starts_with(&workspace) {
         return Err(invalid("release output must be outside the source checkout").into());
     }
@@ -201,13 +246,30 @@ pub fn produce(request: PackageRequest) -> Result<PackageReport> {
         "dacs-{}-{}-UNSIGNED-PREVIEW",
         request.version, request.target
     );
+    let mut runtime_assets = Vec::new();
     let artifact = match os {
         "windows" => {
+            // These are the VC runtime imports of the MSVC native executable.
+            // Ship the reviewed redistributable copies, never DLLs from System32.
+            let runtime_directory = windows_runtime_directory(arch)?;
+            let mut runtime_components = String::new();
+            let mut runtime_references = String::new();
+            for (index, name) in ["vcruntime140.dll", "vcruntime140_1.dll"].iter().enumerate() {
+                let staged = output.join(name);
+                fs::copy(runtime_directory.join(name), &staged)?;
+                let (sha256, bytes) = digest(&staged)?;
+                runtime_assets.push(RuntimeAsset { name: (*name).into(), sha256, bytes });
+                runtime_components.push_str(&format!(
+                    r#"<Component Id="Runtime{index}" Guid="*"><File Id="RuntimeFile{index}" Source="{}" KeyPath="yes"/></Component>"#,
+                    xml(&staged.to_string_lossy())
+                ));
+                runtime_references.push_str(&format!(r#"<ComponentRef Id="Runtime{index}"/>"#));
+            }
             let source = output.join("dacs.wxs");
             fs::write(
                 &source,
                 format!(
-                    r#"<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"><Package Name="DACS Unsigned Preview" Manufacturer="DACS" Version="{}" UpgradeCode="7EC6F9CC-955B-46CE-B90C-249A64AE5981" Scope="perMachine"><MajorUpgrade DowngradeErrorMessage="A newer DACS version is already installed."/><MediaTemplate EmbedCab="yes"/><StandardDirectory Id="ProgramFiles64Folder"><Directory Id="INSTALLFOLDER" Name="DACS"><Component Id="MainBinary" Guid="*"><File Id="DacsExe" Source="{}" KeyPath="yes"/></Component></Directory></StandardDirectory><Feature Id="Main" Title="DACS" Level="1"><ComponentRef Id="MainBinary"/></Feature></Package></Wix>"#,
+                    r#"<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"><Package Name="DACS Unsigned Preview" Manufacturer="DACS" Version="{}" UpgradeCode="7EC6F9CC-955B-46CE-B90C-249A64AE5981" Scope="perMachine"><MajorUpgrade DowngradeErrorMessage="A newer DACS version is already installed."/><MediaTemplate EmbedCab="yes"/><StandardDirectory Id="ProgramFiles64Folder"><Directory Id="INSTALLFOLDER" Name="DACS"><Component Id="MainBinary" Guid="*"><File Id="DacsExe" Source="{}" KeyPath="yes"/></Component>{runtime_components}</Directory></StandardDirectory><Feature Id="Main" Title="DACS" Level="1"><ComponentRef Id="MainBinary"/>{runtime_references}</Feature></Package></Wix>"#,
                     request.version,
                     xml(&binary.to_string_lossy())
                 ),
@@ -303,6 +365,9 @@ pub fn produce(request: PackageRequest) -> Result<PackageReport> {
     let report = PackageReport {
         source_commit: request.source_commit,
         cargo_lock_sha256: request.cargo_lock_sha256,
+        rustc_version: request.rustc_version,
+        cargo_version: request.cargo_version,
+        runtime_assets,
         target: request.target,
         artifact,
         sha256,
@@ -359,6 +424,12 @@ mod tests {
     #[test]
     fn wix_source_paths_are_xml_escaped() {
         assert_eq!(xml("a&\"<>'"), "a&amp;&quot;&lt;&gt;&apos;");
+    }
+    #[cfg(windows)]
+    #[test]
+    fn wix_paths_do_not_use_verbatim_prefixes() {
+        assert_eq!(tool_path(PathBuf::from(r"\\?\C:\release\dacs.wxs")), PathBuf::from(r"C:\release\dacs.wxs"));
+        assert_eq!(tool_path(PathBuf::from(r"\\?\UNC\server\release\dacs.wxs")), PathBuf::from(r"\\server\release\dacs.wxs"));
     }
     #[test]
     fn unsupported_platform_is_not_simulated() {
