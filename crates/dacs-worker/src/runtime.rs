@@ -345,6 +345,44 @@ struct Running {
     join: tokio::task::JoinHandle<Result<()>>,
     desktop: bool,
     resources: Resources,
+    capabilities: Vec<String>,
+}
+
+/// Ordinary close requests: Ctrl-C, and on Unix also SIGTERM and SIGHUP (the
+/// terminal window closing). Each requests a drain, never a kill.
+async fn close_requests(journal: Arc<Journal>) {
+    let drain = || {
+        let mut controls: OwnerControls = journal
+            .get_value("owner_controls")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        controls.draining = true;
+        let _ = journal.set_value("owner_controls", &controls);
+    };
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let (Ok(mut interrupt), Ok(mut terminate), Ok(mut hangup)) = (
+            signal(SignalKind::interrupt()),
+            signal(SignalKind::terminate()),
+            signal(SignalKind::hangup()),
+        ) else {
+            return;
+        };
+        loop {
+            tokio::select! {
+                Some(()) = interrupt.recv() => drain(),
+                Some(()) = terminate.recv() => drain(),
+                Some(()) = hangup.recv() => drain(),
+                else => return,
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    while tokio::signal::ctrl_c().await.is_ok() {
+        drain();
+    }
 }
 
 /// Manually invoked; neither public installation nor invitation starts this loop.
@@ -456,21 +494,8 @@ pub async fn run(mut config: WorkerConfig) -> Result<()> {
     journal.set_value("local_status", &status)?;
     let mut running = BTreeMap::<String, Running>::new();
     let mut interval = tokio::time::interval(Duration::from_millis(config.poll_interval_ms));
-    let signal_journal = journal.clone();
-    let signal = tokio::spawn(async move {
-        loop {
-            if tokio::signal::ctrl_c().await.is_err() {
-                break;
-            }
-            let mut controls: OwnerControls = signal_journal
-                .get_value("owner_controls")
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-            controls.draining = true;
-            let _ = signal_journal.set_value("owner_controls", &controls);
-        }
-    });
+    let signal = tokio::spawn(close_requests(journal.clone()));
+    let mut last_snapshot: Option<Snapshot> = None;
     let mut was_draining = true; // Manual startup explicitly resumes the device.
     loop {
         interval.tick().await;
@@ -480,12 +505,19 @@ pub async fn run(mut config: WorkerConfig) -> Result<()> {
                 .get_value::<bool>("coordinator_revoked")?
                 .unwrap_or(false)
         {
-            for runtime in running.values() {
+            for (id, runtime) in &running {
+                let reason = if controls.emergency_cancel {
+                    "emergency_cancel"
+                } else {
+                    "worker_revoked"
+                };
+                local_control::record_stop(&journal, id, reason)?;
                 let _ = runtime.stop.send(true);
             }
         }
         if controls.desktop_paused {
-            for runtime in running.values().filter(|r| r.desktop) {
+            for (id, runtime) in running.iter().filter(|(_, r)| r.desktop) {
+                local_control::record_stop(&journal, id, "desktop_paused")?;
                 let _ = runtime.stop.send(true);
             }
         }
@@ -521,13 +553,55 @@ pub async fn run(mut config: WorkerConfig) -> Result<()> {
         status.desktop_active = running.values().any(|r| r.desktop)
             || desktop_owner.is_some_and(|id| live_attempts.contains(&id));
         status.desktop_paused = controls.desktop_paused && !status.desktop_active;
+        // Permission reduction drains: report what is still exercised.
+        let mut registration = config.registration.clone();
+        registration
+            .capabilities
+            .retain(|cap| !local_control::withdrawn(&controls.withdrawn_capabilities, cap));
+        status.effective_capabilities = registration.capabilities.clone();
+        let exercised: Vec<_> = running
+            .iter()
+            .map(|(id, r)| (id.clone(), r.capabilities.clone()))
+            .collect();
+        (
+            status.pending_permission_changes,
+            status.active_broader_permissions,
+        ) = local_control::permission_drain(&controls.withdrawn_capabilities, &exercised);
+        let stop_requests: Vec<(String, String)> =
+            journal.get_value("stop_requests")?.unwrap_or_default();
+        let unreported = journal.pending_results(4096)?;
+        status.stops = stop_requests
+            .into_iter()
+            .map(|(id, reason)| {
+                let attempt = last_snapshot
+                    .as_ref()
+                    .and_then(|s| s.attempts.iter().find(|a| a.id == id));
+                let task = attempt.and_then(|a| {
+                    last_snapshot
+                        .as_ref()
+                        .and_then(|s| s.tasks.iter().find(|t| t.id == a.task_id))
+                });
+                let phase = local_control::stop_phase(
+                    running.contains_key(&id) || live_attempts.contains(&id),
+                    unreported.iter().any(|r| r.attempt_id == id),
+                    attempt,
+                    task,
+                );
+                local_control::StopStatus {
+                    attempt_id: id,
+                    reason,
+                    phase,
+                }
+            })
+            .collect();
         status.active_attempt_ids = running.keys().cloned().chain(live_attempts).collect();
         status.active_attempt_ids.sort();
         status.active_attempt_ids.dedup();
         journal.set_value("local_status", &status)?;
         let cycle: Result<()> = async {
             coordinator.flush().await?;
-            coordinator.command(Command::Heartbeat { registration:config.registration.clone() }).await?;
+            // Narrowed by local withdrawals; a heartbeat never widens consent.
+            coordinator.command(Command::Heartbeat { registration:registration.clone() }).await?;
             coordinator.command(Command::ReportRuntimeStatus { status:WorkerRuntimeStatus {
                 worker_id:config.worker_id.clone(),provider_authenticated:status.provider_authenticated,network_ready:Some(true),
                 desktop_session:status.desktop_supported.then(|| format!("owner:{}",config.registration.physical_host_id)),
@@ -551,10 +625,13 @@ pub async fn run(mut config: WorkerConfig) -> Result<()> {
                 if message.kind == "stop" {
                     if let Some(id) = &message.attempt_id {
                         journal.set_value(&format!("stop:{id}"), &true)?;
+                        local_control::record_stop(&journal, id, "coordinator_stop")?;
                         if let Some(runtime) = running.get(id) { let _ = runtime.stop.send(true); }
                     }
                     journal.mark_command(&message.id, "done")?;
-                } else if message.kind == "desktop_pause" {
+                } else if matches!(message.kind.as_str(), "pause_desktop" | "desktop_pause") {
+                    // The coordinator may only narrow: pause. Nothing it sends
+                    // resumes the desktop, clears a drain, or widens consent.
                     local_control::request(&config.data_dir, local_control::ControlAction::PauseDesktop)?;
                     journal.mark_command(&message.id, "done")?;
                 }
@@ -566,6 +643,7 @@ pub async fn run(mut config: WorkerConfig) -> Result<()> {
             }
             if through > 0 { coordinator.command(Command::AcknowledgeMessages { through_sequence:through }).await?; }
             let snapshot: Snapshot = coordinator.get("/api/state").await?;
+            last_snapshot = Some(snapshot.clone());
             let worker = snapshot.workers.iter().find(|w| w.id == config.worker_id).context("worker missing from coordinator snapshot")?;
             if worker.revoked { for runtime in running.values() { let _ = runtime.stop.send(true); } bail!("worker was revoked"); }
             for (id, runtime) in &running {
@@ -573,7 +651,11 @@ pub async fn run(mut config: WorkerConfig) -> Result<()> {
                 let stale = current.is_none_or(|a| {
                     a.worker_id != config.worker_id || matches!(a.state.as_str(), "fenced" | "abandoned" | "stopping" | "stopped") || snapshot.tasks.iter().find(|t| t.id == a.task_id).is_none_or(|t| t.generation != a.generation || t.attempt_id.as_deref() != Some(id) || t.cancel_requested || matches!(t.state,TaskState::Accepted|TaskState::Cancelled|TaskState::Failed))
                 });
-                if stale { let _ = runtime.stop.send(true); }
+                if stale {
+                    let reason = if current.and_then(|a| snapshot.tasks.iter().find(|t| t.id == a.task_id)).is_some_and(|t| t.cancel_requested) { "coordinator_cancel" } else { "coordinator_fenced" };
+                    local_control::record_stop(&journal, id, reason)?;
+                    let _ = runtime.stop.send(true);
+                }
             }
             for command in journal.pending_commands()? {
                 let message: ControlMessage = serde_json::from_value(command.payload.clone())?;
@@ -585,6 +667,8 @@ pub async fn run(mut config: WorkerConfig) -> Result<()> {
                 let stopped = journal.get_value::<bool>(&format!("stop:{}", attempt.id))?.unwrap_or(false);
                 let valid = attempt.worker_id == config.worker_id && attempt.generation == original.generation && !matches!(attempt.state.as_str(),"fenced"|"abandoned"|"stopped"|"stopping") && latest.is_some_and(|t| t.generation == attempt.generation && t.attempt_id.as_deref() == Some(&attempt.id) && !t.cancel_requested && !matches!(t.state,TaskState::Accepted|TaskState::Failed|TaskState::Cancelled));
                 if !valid || stopped || controls.emergency_cancel {
+                    let reason = if controls.emergency_cancel { "emergency_cancel" } else if latest.is_some_and(|t| t.cancel_requested) { "coordinator_cancel" } else { "coordinator_stop" };
+                    local_control::record_stop(&journal, &attempt.id, reason)?;
                     anyhow::ensure!(supervisor.terminate_attempt(&attempt.id, Duration::from_secs(10)).await?, "attempt process tree could not be stopped");
                     coordinator.command(Command::ReconcileWorker { stopped_attempt_ids:vec![attempt.id.clone()] }).await?;
                     journal.mark_command(&command.command_id,"done")?;
@@ -595,6 +679,16 @@ pub async fn run(mut config: WorkerConfig) -> Result<()> {
                 if phase.is_some() && task.spec.effect_class == EffectClass::External {
                     relay_compiler_telemetry(&coordinator,&task,attempt,&config.data_dir.join("attempts").join(&attempt.id))?;
                     journal.event(&task.id,&attempt.id,attempt.generation,attempt.last_sequence,WorkerEvent::Failed { message:"Worker restarted during external-effect execution; automatic replay is forbidden. Inspect effects and explicitly abandon/reassign.".into() })?;
+                    journal.event(&task.id,&attempt.id,attempt.generation,attempt.last_sequence,WorkerEvent::Stopped)?;
+                    journal.set_value(&format!("phase:{}",attempt.id),&"finished")?;
+                    journal.mark_command(&command.command_id,"done")?;
+                    continue;
+                }
+                if let Some(capability) = task.spec.required_capabilities.iter().find(|cap| local_control::withdrawn(&controls.withdrawn_capabilities, cap)) {
+                    // Permission reduction drains running work but never starts
+                    // new use of the withdrawn grant. Refuse explicitly so the
+                    // coordinator can release the reservation and reschedule.
+                    journal.event(&task.id,&attempt.id,attempt.generation,attempt.last_sequence,WorkerEvent::Failed { message:format!("Owner withdrew local capability {capability} before this attempt started; not executed") })?;
                     journal.event(&task.id,&attempt.id,attempt.generation,attempt.last_sequence,WorkerEvent::Stopped)?;
                     journal.set_value(&format!("phase:{}",attempt.id),&"finished")?;
                     journal.mark_command(&command.command_id,"done")?;
@@ -616,8 +710,9 @@ pub async fn run(mut config: WorkerConfig) -> Result<()> {
                 let id = attempt.id.clone();
                 let desktop = task.spec.required_capabilities.iter().any(|c| c.starts_with("desktop"));
                 let resources = attempt.resources.clone();
+                let capabilities = task.spec.required_capabilities.clone();
                 let join = tokio::spawn(async move { execute_attempt(config,coordinator,supervisor,task,attempt,command.command_id,receiver).await });
-                running.insert(id, Running { stop, join, desktop, resources });
+                running.insert(id, Running { stop, join, desktop, resources, capabilities });
             }
             Ok(())
         }.await;
