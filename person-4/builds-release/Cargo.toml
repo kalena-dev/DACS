@@ -17,3 +17,6 @@ path = "preflight.rs"
 [[bin]]
 name = "dacs-rustc-provenance"
 path = "src/rustc_provenance.rs"
+
+[lints]
+workspace = true

@@ -27,3 +27,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage
 
 [dev-dependencies]
 rand.workspace = true
+
+# Not inherited: the workspace forbids unsafe code, and this crate needs one
+# audited Win32 call (MoveFileExW) for atomic replacement.
+[lints]

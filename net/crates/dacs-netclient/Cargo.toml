@@ -21,3 +21,6 @@ clap.workspace = true
 tempfile.workspace = true
 reqwest.workspace = true
 url.workspace = true
+
+[lints]
+workspace = true

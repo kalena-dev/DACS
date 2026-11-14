@@ -20,3 +20,7 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
+# Not inherited: the workspace forbids unsafe code, and this crate needs
+# audited OS calls for process groups (libc::kill) and Windows job objects.
+[lints]

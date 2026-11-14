@@ -21,3 +21,6 @@ url = { workspace = true, optional = true }
 [target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))'.dependencies]
 tao = { version = "0.37", optional = true }
 wry = { version = "0.55", optional = true }
+
+[lints]
+workspace = true
