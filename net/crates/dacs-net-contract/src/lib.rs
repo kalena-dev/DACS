@@ -20,6 +20,9 @@ use std::net::{IpAddr, SocketAddr};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+mod placement;
+pub use placement::{check_guest_node, published_compiler_server};
+
 /// Revision of this wire contract. Bump on any incompatible change.
 pub const CONTRACT_REVISION: &str = "dacs-net/2026-11-14.1";
 
