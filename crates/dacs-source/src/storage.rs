@@ -102,6 +102,7 @@ pub(crate) fn directory(path: &Path) -> Result<()> {
             }
             Some(_) => {}
             None => {
+                #[cfg_attr(not(unix), allow(unused_mut))]
                 let mut builder = fs::DirBuilder::new();
                 #[cfg(unix)]
                 {
@@ -225,8 +226,20 @@ pub(crate) fn tree_usage(path: &Path, maximum: u64) -> Result<(u64, usize)> {
             ));
         }
         if metadata.is_dir() {
-            for child in fs::read_dir(&path).map_err(io)? {
-                pending.push(child.map_err(io)?.path());
+            // Git removes files and directories while it works; anything that
+            // vanishes between listing and inspection simply no longer counts.
+            let children = match fs::read_dir(&path) {
+                Ok(children) => children,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(io(e)),
+            };
+            for child in children {
+                let child = match child {
+                    Ok(child) => child,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(io(e)),
+                };
+                pending.push(child.path());
                 if pending.len() > 100_000 {
                     return Err(error(
                         ErrorCode::Invalid,

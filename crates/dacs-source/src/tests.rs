@@ -1016,6 +1016,21 @@ fn restart_cleanup_removes_over_budget_abandoned_quarantine() {
 }
 
 #[test]
+fn repository_is_initialised_through_temporary_staging() {
+    let fixture = Fixture::new();
+    let local = fixture.local();
+    assert!(!local.repo.exists());
+    local.ensure().unwrap();
+    local.verify().unwrap();
+    assert!(local.repo.join("HEAD").is_file());
+    // The staging directory is gone and nothing else was left behind.
+    assert_eq!(fs::read_dir(&local.temporary).unwrap().count(), 0);
+    // A second call observes the published repository and does not re-initialise.
+    local.ensure().unwrap();
+    assert_eq!(fs::read_dir(&local.temporary).unwrap().count(), 0);
+}
+
+#[test]
 fn publication_of_live_candidate_waits_for_positive_settlement() {
     let fixture = Fixture::new();
     let base = fixture.seed();

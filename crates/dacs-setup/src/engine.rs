@@ -145,6 +145,51 @@ fn validate_plan(plan: &Plan, consent: &Consent) -> Result<()> {
     Ok(())
 }
 
+fn fresh_journal(plan: &Plan) -> Journal {
+    Journal {
+        schema_version: 1,
+        plan_sha256: plan.sha256.clone(),
+        status: "approved".into(),
+        started_at: util::now(),
+        updated_at: util::now(),
+        steps: plan
+            .steps
+            .iter()
+            .flat_map(|s| {
+                (0..s.commands.len()).map(move |index| JournalStep {
+                    package_id: s.package_id.clone(),
+                    command_index: index,
+                    status: StepStatus::Pending,
+                    started_at: None,
+                    completed_at: None,
+                    exit_code: None,
+                    detail: None,
+                })
+            })
+            .collect(),
+        enrollment: json!({"status":"not_requested","worker_started":false,"network_joined":false}),
+    }
+}
+
+// The plan digest does not cover time: an identical later plan maps to the same journal,
+// so a stored `completed` result is only reusable while every step still probes as installed.
+fn steps_satisfied(
+    plan: &Plan,
+    probe: impl Fn(&catalogue::Package, Option<&str>, &str) -> State,
+) -> bool {
+    plan.steps.iter().all(|step| {
+        catalogue::package(&step.package_id).is_some_and(|p| {
+            probe(p, step.required_version.as_deref(), &step.toolchain) == State::Installed
+        })
+    })
+}
+
+fn mark_replan_required(journal: &mut Journal, journal_path: &Path) -> Result<()> {
+    journal.status = "replan_required".into();
+    journal.updated_at = util::now();
+    util::atomic_json(journal_path, journal)
+}
+
 pub fn apply(value: Value, approval: Value, state_dir: &Path) -> Result<Value> {
     let plan: Plan = util::decode(value)?;
     let consent: Consent = util::decode(approval)?;
@@ -164,29 +209,7 @@ pub fn apply(value: Value, approval: Value, state_dir: &Path) -> Result<Value> {
     let mut journal: Journal = if journal_path.exists() {
         util::read_json(&journal_path)?
     } else {
-        Journal {
-            schema_version: 1,
-            plan_sha256: plan.sha256.clone(),
-            status: "approved".into(),
-            started_at: util::now(),
-            updated_at: util::now(),
-            steps: plan
-                .steps
-                .iter()
-                .flat_map(|s| {
-                    (0..s.commands.len()).map(move |index| JournalStep {
-                        package_id: s.package_id.clone(),
-                        command_index: index,
-                        status: StepStatus::Pending,
-                        started_at: None,
-                        completed_at: None,
-                        exit_code: None,
-                        detail: None,
-                    })
-                })
-                .collect(),
-            enrollment: json!({"status":"not_requested","worker_started":false,"network_joined":false}),
-        }
+        fresh_journal(&plan)
     };
     if journal.plan_sha256 != plan.sha256 || journal.schema_version != 1 {
         return Err(util::conflict(
@@ -207,7 +230,14 @@ pub fn apply(value: Value, approval: Value, state_dir: &Path) -> Result<Value> {
         return Err(util::conflict("Operation journal step mapping is invalid"));
     }
     if journal.status == "completed" {
-        return util::json(&journal);
+        if steps_satisfied(&plan, |p, version, toolchain| {
+            catalogue::probe_toolchain(p, version, toolchain).state
+        }) {
+            return util::json(&journal);
+        }
+        // Installed state drifted since the stored run: replace the stale journal and run again.
+        journal = fresh_journal(&plan);
+        util::atomic_json(&journal_path, &journal)?;
     }
     if journal
         .steps
@@ -243,6 +273,7 @@ pub fn apply(value: Value, approval: Value, state_dir: &Path) -> Result<Value> {
         if catalogue::platform() == "macos" && !p.brew.is_empty() {
             let available = catalogue::brew_available(p)?;
             if step.required_version.as_deref() != Some(available.as_str()) {
+                mark_replan_required(&mut journal, &journal_path)?;
                 return Err(util::conflict(
                     "Homebrew formula changed since approval; new plan and consent required",
                 ));
@@ -250,6 +281,7 @@ pub fn apply(value: Value, approval: Value, state_dir: &Path) -> Result<Value> {
             if step.operation == Operation::Repair
                 && step.observed_version.as_deref() != Some(available.as_str())
             {
+                mark_replan_required(&mut journal, &journal_path)?;
                 return Err(util::conflict(
                     "Repair would upgrade Homebrew package; use explicit update instead",
                 ));
@@ -279,6 +311,7 @@ pub fn apply(value: Value, approval: Value, state_dir: &Path) -> Result<Value> {
         {
             let observed = catalogue::probe_toolchain(p, None, &step.toolchain);
             if observed.version != step.observed_version {
+                mark_replan_required(&mut journal, &journal_path)?;
                 return Err(util::conflict("The Trunk executable changed since review; replan rather than reinstalling/upgrading it implicitly"));
             }
         }
@@ -304,6 +337,7 @@ pub fn apply(value: Value, approval: Value, state_dir: &Path) -> Result<Value> {
                     continue;
                 }
                 if observed.state == State::Unknown {
+                    mark_replan_required(&mut journal, &journal_path)?;
                     return Err(util::conflict("Cannot determine whether Trunk appeared since review; refusing an implicit upgrade"));
                 }
             }
@@ -440,5 +474,45 @@ mod tests {
         let loaded: Journal = util::read_json(&path).unwrap();
         assert!(matches!(loaded.steps[0].status, StepStatus::Running));
         assert_ne!(loaded.status, "completed");
+    }
+    #[test]
+    fn completed_journal_is_reused_only_while_steps_still_probe_installed() {
+        let mut plan = Plan {
+            schema_version: 1,
+            request: catalogue::PlanRequest {
+                operation: Operation::Install,
+                packages: vec![],
+                preset: None,
+                declined: vec![],
+                invitation: None,
+            },
+            platform: catalogue::platform().into(),
+            arch: catalogue::arch().into(),
+            steps: vec![catalogue::Step {
+                package_id: "git".into(),
+                operation: Operation::Install,
+                toolchain: "stable".into(),
+                required_version: Some("2.50.0".into()),
+                state: State::Missing,
+                observed_version: None,
+                commands: vec![],
+                prerequisites: vec![],
+            }],
+            unresolved: vec![],
+            disabled_capabilities: vec![],
+            sha256: String::new(),
+        };
+        plan.sha256 = catalogue::plan_digest(&plan).unwrap();
+        assert!(steps_satisfied(&plan, |p, version, toolchain| {
+            assert_eq!((p.id, version, toolchain), ("git", Some("2.50.0"), "stable"));
+            State::Installed
+        }));
+        for drifted in [State::Missing, State::Incompatible, State::Unknown] {
+            assert!(!steps_satisfied(&plan, |_, _, _| drifted.clone()));
+        }
+        // A stale completed journal is replaced by one with every command pending again.
+        let fresh = fresh_journal(&plan);
+        assert_eq!(fresh.status, "approved");
+        assert!(fresh.steps.iter().all(|s| matches!(s.status, StepStatus::Pending)));
     }
 }

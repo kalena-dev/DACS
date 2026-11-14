@@ -251,28 +251,51 @@ impl NetworkService {
     }
 
     pub async fn maintain(&self) -> Result<()> {
-        self.configured()?;
-        let _operation = self.operations.lock().await;
-        self.contract().await?;
+        if self.transport.is_none() {
+            // Nothing to maintain without a network transport; not an error.
+            return Ok(());
+        }
+        // Issuance and membership refresh require a valid advertised contract;
+        // revocation does not and must proceed regardless.
+        let contract_error = self.contract().await.err();
         let mut first_error = None;
-        for (worker, record) in self.store.network_records()? {
-            let result = if worker.revoked {
-                self.revoke_locked(&worker.id).await
-            } else if record.phase == NetworkPhase::AwaitingApproval {
-                self.issue_locked(&worker.id).await
-            } else if matches!(
-                record.phase,
-                NetworkPhase::GrantIssued | NetworkPhase::ReferencesRecovered
-            ) {
-                self.refresh_locked(&administrator(), &worker.id).await
-            } else {
-                Ok(())
+        for (worker, _) in self.store.network_records()? {
+            // Hold the operations lock for one device at a time so an
+            // administrator's request never waits behind the whole fleet, and
+            // decide from the record as it is once the lock is held.
+            let _operation = self.operations.lock().await;
+            let result = match self.store.network_record(&administrator(), &worker.id) {
+                Err(error) => Err(error),
+                Ok(record) => {
+                    // Worker revocation is permanent, so the listed flag cannot go
+                    // stale; a revocation committed since the listing shows as phase.
+                    if worker.revoked || record.phase == NetworkPhase::RevocationPending {
+                        self.revoke_locked(&worker.id).await
+                    } else if contract_error.is_some() {
+                        Ok(())
+                    } else if record.phase == NetworkPhase::AwaitingApproval {
+                        self.issue_locked(&worker.id).await
+                    } else if matches!(
+                        record.phase,
+                        NetworkPhase::GrantIssued | NetworkPhase::ReferencesRecovered
+                    ) {
+                        self.refresh_locked(&administrator(), &worker.id).await
+                    } else {
+                        Ok(())
+                    }
+                }
             };
             if let Err(error) = result {
+                // With the contract check already failing, a transport failure means
+                // netadmin is unreachable: do not spend a timeout on every device.
+                let unreachable = contract_error.is_some() && error.code == ErrorCode::Io;
                 first_error.get_or_insert(error);
+                if unreachable {
+                    break;
+                }
             }
         }
-        match first_error {
+        match contract_error.or(first_error) {
             Some(error) => Err(error),
             None => Ok(()),
         }
@@ -505,11 +528,6 @@ pub fn router(service: NetworkService) -> Router {
 pub fn bootstrap_router(service: NetworkService) -> Router {
     routes(service, true)
 }
-
-// Reconciliation body: {\"auth_key_id\": <audit-verified issuance key ID>,
-// \"node_id\": <optional audit-verified node ID>}. It never reconstructs a lost
-// secret or reissues a key. Recovered material can be queried and revoked; a
-// device whose grant was lost must be revoked and enrolled again.
 
 #[cfg(test)]
 mod tests {
@@ -837,6 +855,113 @@ mod tests {
             NetworkPhase::AwaitingApproval
         );
         assert!(store.network_records().unwrap().is_empty());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn maintenance_is_idle_without_a_configured_transport() {
+        let store = Store::open(":memory:", ADMIN).unwrap();
+        enrollment(&store);
+        let service = NetworkService::new(store, None).unwrap();
+        service.maintain().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn maintenance_revokes_despite_an_invalid_contract_but_does_not_issue() {
+        use dacs_net_contract::{DeviceId, HostName, RevocationRequest};
+        let store = Store::open(":memory:", ADMIN).unwrap();
+        let consented = |host: &str| {
+            let (device, token) = enrollment(&store);
+            command(
+                &store,
+                Command::ApproveWorker {
+                    worker_id: device.clone(),
+                },
+            );
+            let principal = store.authenticate(&token).unwrap();
+            store
+                .network_consent(
+                    &principal,
+                    HostConsent {
+                        device_id: DeviceId(device.clone()),
+                        accepted_host: HostName::try_from(host.to_owned()).unwrap(),
+                        accepted_by: "local-owner".into(),
+                        accepted_at: time::OffsetDateTime::now_utc(),
+                        disclosure_revision: ADMIN_ACCESS_DISCLOSURE_REVISION.into(),
+                        tailnet_switch: None,
+                    },
+                )
+                .unwrap();
+            device
+        };
+        let revoked = consented("revoked-pc");
+        store.network_begin_issue(&revoked).unwrap().unwrap();
+        store
+            .network_reconcile(&administrator(), &revoked, Some(42), None)
+            .unwrap();
+        assert_eq!(
+            store
+                .network_revoke(&administrator(), &revoked)
+                .unwrap()
+                .phase,
+            NetworkPhase::RevocationPending
+        );
+        let waiting = consented("waiting-pc");
+
+        // Netadmin advertises a contract revision this bridge rejects.
+        let netadmin = Router::new()
+            .route(
+                "/v1/contract",
+                get(|| async {
+                    Json(NetworkContract {
+                        contract_revision: format!("{CONTRACT_REVISION}-skewed"),
+                        admin_disclosure_revision: ADMIN_ACCESS_DISCLOSURE_REVISION.into(),
+                        admin_disclosure: ADMIN_ACCESS_DISCLOSURE.into(),
+                        tailnet_switch_disclosure: TAILNET_SWITCH_DISCLOSURE.into(),
+                        login_server: "https://login.example.test".into(),
+                        coordinator: CoordinatorEndpoints {
+                            bootstrap_url: "https://bootstrap.example.test".into(),
+                            overlay_url: "https://overlay.example.test".into(),
+                        },
+                        key_ttl_minutes: 10,
+                    })
+                }),
+            )
+            .route(
+                "/v1/revocations",
+                post(|Json(request): Json<RevocationRequest>| async move {
+                    Json(RevocationOutcome {
+                        device_id: request.device_id,
+                        key_expired: true,
+                        node_deleted: None,
+                        verified_absent: true,
+                        at: time::OffsetDateTime::now_utc(),
+                    })
+                }),
+            );
+        let (base, task) = serve(netadmin).await;
+        let directory = tempfile::tempdir().unwrap();
+        let token_file = directory.path().join("netadmin-token");
+        std::fs::write(&token_file, "isolated-test-operation-token-32-bytes").unwrap();
+        let service = NetworkService::new(
+            store.clone(),
+            Some(NetworkConfig {
+                netadmin_url: base,
+                operation_token_file: token_file,
+                ca_file: None,
+            }),
+        )
+        .unwrap();
+        // The contract failure is still reported after the revocation is processed.
+        assert_eq!(service.maintain().await.unwrap_err().code, ErrorCode::Io);
+        let phase = |device: &str| {
+            store
+                .network_record(&administrator(), device)
+                .unwrap()
+                .phase
+        };
+        assert_eq!(phase(&revoked), NetworkPhase::Revoked);
+        assert_eq!(phase(&waiting), NetworkPhase::AwaitingApproval);
         task.abort();
     }
 }

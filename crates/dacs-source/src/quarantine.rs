@@ -59,8 +59,8 @@ pub(crate) fn import(
             }
             continue;
         }
-        // The bounded Git fetch already fsynced object contents and pack
-        // metadata through core.fsync=committed before making these refs.
+        // The bounded Git fetch already fsynced object contents, pack metadata
+        // and references (core.fsync=committed,reference,pack-metadata).
         // Same-filesystem hard links publish completed immutable files without
         // exposing a partial copy or overwriting existing object content.
         match fs::hard_link(&source, &destination) {

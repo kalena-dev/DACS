@@ -257,10 +257,6 @@ pub fn stage_update(
             );
         }
     }
-    util::atomic_json(
-        &directory.join("download-journal.json"),
-        &json!({"schema_version":1,"phase":"downloading","metadata":manifest.metadata,"started_at":util::now()}),
-    )?;
     let client = reqwest::blocking::Client::builder()
         .https_only(true)
         .redirect(reqwest::redirect::Policy::none())
@@ -322,10 +318,6 @@ pub fn stage_update(
         staged_at: util::now(),
     };
     util::atomic_json(&stage_path, &staged)?;
-    util::atomic_json(
-        &directory.join("download-journal.json"),
-        &json!({"schema_version":1,"phase":"staged","sha256":staged.manifest.metadata.sha256,"completed_at":util::now()}),
-    )?;
     Ok(
         json!({"status":"staged","metadata":staged.manifest.metadata,"sha256":staged.manifest.metadata.sha256,"apply_requires_local_action":true,"worker_started":false,"network_joined":false}),
     )
@@ -511,6 +503,16 @@ fn helper_contract(directory: &Path, state_dir: &Path, target: &Path) -> Result<
         json!({"status":"helper_required","helper_executable":helper,"arguments":["update","apply","--state-dir",state.to_string_lossy(),"--target",target.to_string_lossy()],"exit_required":true,"reason":"Launch this separate local executable with the command array, then exit the running target. The helper verifies staged signatures/digests again and waits up to 60 seconds for Windows executable locks. Do not mark the update complete until its durable journal says completed."}),
     ))
 }
+// A failed restore leaves no executable at the target path; the caller must hear about both failures.
+fn with_rollback_outcome(mut error: ApiError, rollback: Result<Value>) -> ApiError {
+    if let Err(rollback) = rollback {
+        error.message = format!(
+            "{}; automatic rollback also failed and the target may be missing: {}",
+            error.message, rollback.message
+        );
+    }
+    error
+}
 fn recover_rollback(directory: &Path, journal: &mut UpdateJournal) -> Result<Value> {
     if !digest_matches(&journal.backup, &journal.previous_sha256)?
         && !digest_matches(&journal.target, &journal.previous_sha256)?
@@ -565,12 +567,9 @@ pub fn apply_staged_update(state_dir: &Path, target: &Path) -> Result<Value> {
         if previous.next_sha256 == staged.manifest.metadata.sha256 {
             check_journal(&previous, &target, &staged)?;
             previous
-        } else if matches!(previous.phase.as_str(), "completed" | "rolled_back") {
-            new_journal(&directory, &target, &staged)?
         } else {
-            return Err(util::conflict(
-                "Existing update requires recovery before another release",
-            ));
+            // A non-terminal journal already returned above, so the previous release is settled.
+            new_journal(&directory, &target, &staged)?
         }
     } else {
         new_journal(&directory, &target, &staged)?
@@ -623,7 +622,8 @@ fn apply_journal(directory: &Path, state_dir: &Path, target: &Path, staged: &Sta
         }
         save_journal(&directory, &mut journal, "installed")?;
     } else {
-        if target.exists() {
+        let target_present = target.exists();
+        if target_present {
             if !digest_matches(&target, &journal.previous_sha256)? {
                 return Err(util::conflict(
                     "Target changed since update preparation; refusing overwrite",
@@ -634,24 +634,28 @@ fn apply_journal(directory: &Path, state_dir: &Path, target: &Path, staged: &Sta
                     "Both original target and backup exist; manual reconciliation required",
                 ));
             }
-            rename_wait(&target, &journal.backup)?;
         } else if !digest_matches(&journal.backup, &journal.previous_sha256)? {
             return Err(util::conflict(
                 "Original executable and valid rollback backup are both unavailable",
             ));
         }
-        save_journal(&directory, &mut journal, "backed_up")?;
+        // Verify the candidate while the original executable is still at the target path.
         if !digest_matches(&journal.candidate, &journal.next_sha256)? {
             save_journal(&directory, &mut journal, "rollback_pending")?;
-            let _ = recover_rollback(&directory, &mut journal);
-            return Err(util::conflict(
-                "Prepared update candidate changed; rollback recovery initiated",
+            let rollback = recover_rollback(&directory, &mut journal);
+            return Err(with_rollback_outcome(
+                util::conflict("Prepared update candidate changed; rollback recovery initiated"),
+                rollback,
             ));
         }
+        if target_present {
+            rename_wait(&target, &journal.backup)?;
+        }
+        save_journal(&directory, &mut journal, "backed_up")?;
         if let Err(error) = rename_wait(&journal.candidate, &target) {
             save_journal(&directory, &mut journal, "rollback_pending")?;
-            let _ = recover_rollback(&directory, &mut journal);
-            return Err(error);
+            let rollback = recover_rollback(&directory, &mut journal);
+            return Err(with_rollback_outcome(error, rollback));
         }
         validate_file(&target, &staged.manifest.metadata)?;
         save_journal(&directory, &mut journal, "installed")?;
@@ -913,5 +917,36 @@ mod tests {
         let result = rollback_update(&state, &target).unwrap();
         assert_eq!(result["status"], "rolled_back");
         assert_eq!(fs::read(&target).unwrap(), b"previous");
+    }
+    #[test]
+    fn corrupted_candidate_is_detected_before_the_target_is_moved() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        let directory = update_directory(&state).unwrap();
+        let target = absolute_target(&root.path().join("dacs-bin")).unwrap();
+        let key = SigningKey::from_bytes(&rand::random::<[u8;32]>());
+        fs::write(&target, b"original").unwrap();
+        let release = stage_fixture(&directory, &key, b"release-a", "2.0.0", "1.0.0");
+        let journal = new_journal(&directory, &target, &release).unwrap();
+        fs::write(&journal.candidate, b"corrupted").unwrap();
+        let error = apply_staged_update(&state, &target).unwrap_err();
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert!(!error.message.contains("rollback also failed"));
+        assert_eq!(fs::read(&target).unwrap(), b"original");
+        assert!(!journal.backup.exists());
+        let stored: UpdateJournal = util::read_json(&directory.join("apply-journal.json")).unwrap();
+        assert_eq!(stored.phase, "rolled_back");
+    }
+
+    #[test]
+    fn failed_rollback_is_reported_with_the_original_failure() {
+        let combined = with_rollback_outcome(
+            util::conflict("swap failed"),
+            Err(util::conflict("Rollback backup missing or changed; manual recovery required")),
+        );
+        assert_eq!(combined.code, ErrorCode::Conflict);
+        assert!(combined.message.starts_with("swap failed"));
+        assert!(combined.message.contains("Rollback backup missing or changed"));
+        assert_eq!(with_rollback_outcome(util::conflict("swap failed"), Ok(Value::Null)).message, "swap failed");
     }
 }

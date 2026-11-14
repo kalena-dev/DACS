@@ -19,8 +19,6 @@ use std::{
 };
 use storage::{MAX_ARTIFACT, MAX_BUNDLE, ProjectLock, error, io};
 
-pub const MAX_BUNDLE_BYTES: u64 = MAX_BUNDLE;
-pub const MAX_ARTIFACT_BYTES: u64 = MAX_ARTIFACT;
 const MAX_BUNDLE_REFS: usize = 128;
 
 #[derive(Clone)]
@@ -81,14 +79,6 @@ impl SourceService {
     fn authorized(&self, principal: &Principal, project_id: &str) -> Result<Project> {
         storage::validate_id(project_id)?;
         self.store.authorize_project(principal, project_id)
-    }
-
-    pub fn ensure_project(&self, principal: &Principal, project_id: &str) -> Result<()> {
-        let project = self.authorized(principal, project_id)?;
-        let (_lock, git) = self.lock(project_id)?;
-        git.ensure()?;
-        git.branch(&project.target_branch)?;
-        Ok(())
     }
 
     pub fn import_bundle(
@@ -408,7 +398,7 @@ impl SourceService {
         Ok(finished)
     }
 
-    pub fn reconcile(&self) -> Result<()> {
+    fn reconcile(&self) -> Result<()> {
         let mut first_error = None;
         for publication in self.store.pending_publications()? {
             let outcome = (|| {

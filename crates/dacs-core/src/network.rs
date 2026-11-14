@@ -284,21 +284,17 @@ impl Store {
             || w.revoked
             || !w.registration.owner_consented
             || record.phase != NetworkPhase::AwaitingApproval
-            || record.consent.is_none()
         {
             return Ok(None);
         }
+        let Some(consent) = record.consent.clone() else {
+            return Ok(None);
+        };
         let project: Project = get(&tx, "project", &w.project_id)?;
         if w.registration.policy_revision != project.policy_revision {
             return Ok(None);
         }
-        let req = request(
-            &w,
-            record
-                .consent
-                .clone()
-                .ok_or_else(|| conflict("missing consent"))?,
-        );
+        let req = request(&w, consent);
         req.validate(OffsetDateTime::now_utc())
             .map_err(|_| invalid("invalid network enrollment consent"))?;
         let operation = id();

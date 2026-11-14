@@ -23,6 +23,11 @@ use std::{
 };
 use tokio::sync::Notify;
 
+/// Notices kept per session until the dashboard renders them; oldest are dropped first.
+const MAX_PENDING_NOTICES: usize = 32;
+/// Slightly above the 20 s netadmin request timeout, so an in-flight call can finish.
+const MAINTENANCE_STOP_TIMEOUT: Duration = Duration::from_secs(25);
+
 #[derive(Clone)]
 pub struct Config {
     pub listen: SocketAddr,
@@ -42,7 +47,7 @@ pub(crate) struct Session {
     pub(crate) bearer: String,
     pub(crate) csrf: String,
     expires: i64,
-    flash: Option<String>,
+    flash: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -275,7 +280,7 @@ async fn login_submit(
         bearer: token.clone(),
         csrf: local::secret(),
         expires: local::now() + 8 * 3600,
-        flash: None,
+        flash: Vec::new(),
     };
     {
         let mut sessions = app
@@ -307,12 +312,14 @@ async fn dashboard(State(app): State<App>, headers: HeaderMap) -> WebResult<Resp
     let principal = app.store.authenticate(&session.bearer)?;
     let store = app.store.clone();
     let snapshot = blocking(move || store.snapshot(&principal)).await?;
-    let notice = app
+    let notices = app
         .sessions
         .lock()
         .map_err(|_| forbidden("Session service unavailable"))?
         .get_mut(&id)
-        .and_then(|s| s.flash.take());
+        .map(|s| std::mem::take(&mut s.flash))
+        .unwrap_or_default();
+    let notice = (!notices.is_empty()).then(|| notices.join("\n\n"));
     Ok(Html(dacs_ui::render_dashboard(
         &snapshot,
         notice.as_deref(),
@@ -683,7 +690,12 @@ async fn ui_action(
         .map_err(|_| forbidden("Session service unavailable"))?
         .get_mut(&session_id)
     {
-        session.flash = Some(notice);
+        // Appended, not replaced: an action from another tab must not discard a
+        // notice (such as an invitation URL) that has not been rendered yet.
+        if session.flash.len() >= MAX_PENDING_NOTICES {
+            session.flash.remove(0);
+        }
+        session.flash.push(notice);
     }
     Ok(Redirect::to("/").into_response())
 }
@@ -746,9 +758,11 @@ async fn ui_action_result(
         _ => return Err(invalid("Unknown UI action")),
     };
     let command_id = field(form, "command_id")?.to_owned();
-    let store = app.store.clone();
+    let state = app.clone();
     let response = blocking(move || {
-        store.execute(
+        // Same gate as the API route: a browser session must not bypass artifact checks.
+        validate_workflow_artifact(&state, &principal, &command)?;
+        state.store.execute(
             &principal,
             CommandEnvelope {
                 protocol_version: PROTOCOL_VERSION,
@@ -1043,6 +1057,28 @@ async fn serve_listener(
     }
 }
 
+/// Resolves on Ctrl-C and, on Unix, on SIGTERM, so a service-manager stop is graceful.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {},
+                    _ = terminate.recv() => {},
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 pub async fn run(mut config: Config) -> anyhow::Result<Option<Value>> {
     let tls = config.tls_cert.is_some() && config.tls_key.is_some();
     anyhow::ensure!(
@@ -1075,6 +1111,19 @@ pub async fn run(mut config: Config) -> anyhow::Result<Option<Value>> {
         "public-url must be an origin matching the listener TLS mode"
     );
     config.public_url = url.origin().ascii_serialization();
+    // Bind every socket before opening any state, spawning any server or announcing
+    // readiness. A second instance on the same data directory therefore fails here,
+    // before it can rewrite the live instance's job journal. An error drops
+    // already-bound sockets, so partial startup cannot survive.
+    let control_listener = std::net::TcpListener::bind(config.listen)?;
+    control_listener.set_nonblocking(true)?;
+    let bootstrap_listener = config
+        .bootstrap_listen
+        .map(std::net::TcpListener::bind)
+        .transpose()?;
+    if let Some(listener) = &bootstrap_listener {
+        listener.set_nonblocking(true)?;
+    }
     local::private_directory(&config.data_dir)?;
     config.data_dir = std::fs::canonicalize(&config.data_dir)?;
     let token = local::admin_token(&config.data_dir)?;
@@ -1173,34 +1222,46 @@ pub async fn run(mut config: Config) -> anyhow::Result<Option<Value>> {
     } else {
         None
     };
-    // Bind every socket before spawning any server or announcing readiness.
-    // An error drops already-bound sockets, so partial startup cannot survive.
-    let control_listener = std::net::TcpListener::bind(config.listen)?;
-    control_listener.set_nonblocking(true)?;
-    let bootstrap_listener = config
-        .bootstrap_listen
-        .map(std::net::TcpListener::bind)
-        .transpose()?;
-    if let Some(listener) = &bootstrap_listener {
-        listener.set_nonblocking(true)?;
-    }
-    let maintenance = tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(5));
-        loop {
-            tick.tick().await;
-            let store = store.clone();
-            if let Err(error) = blocking(move || store.maintain()).await {
-                tracing::error!("Coordinator maintenance failed: {}", error.0.message);
+    // Store and network maintenance run independently, so slow netadmin calls never
+    // delay lease expiry or cancellation handling. Both stop cooperatively: the
+    // signal is observed only between iterations, so an enrollment call in flight
+    // always records its outcome.
+    let (stop_maintenance, stopping) = tokio::sync::watch::channel(false);
+    let store_maintenance = tokio::spawn({
+        let mut stopping = stopping.clone();
+        async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    _ = stopping.changed() => break,
+                }
+                let store = store.clone();
+                if let Err(error) = blocking(move || store.maintain()).await {
+                    tracing::error!("Coordinator maintenance failed: {}", error.0.message);
+                }
             }
-            if let Err(error) = network.maintain().await {
-                tracing::error!("Network maintenance failed: {}", error.message);
+        }
+    });
+    let network_maintenance = tokio::spawn({
+        let mut stopping = stopping;
+        async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    _ = stopping.changed() => break,
+                }
+                if let Err(error) = network.maintain().await {
+                    tracing::error!("Network maintenance failed: {}", error.message);
+                }
             }
         }
     });
     let handles = [axum_server::Handle::new(), axum_server::Handle::new()];
     let stop_handles = handles.clone();
     let stop = tokio::spawn(async move {
-        tokio::select! { _ = shutdown.notified() => {}, _ = tokio::signal::ctrl_c() => {} };
+        tokio::select! { _ = shutdown.notified() => {}, _ = shutdown_signal() => {} };
         for handle in &stop_handles {
             handle.graceful_shutdown(Some(Duration::from_secs(30)));
         }
@@ -1240,8 +1301,18 @@ pub async fn run(mut config: Config) -> anyhow::Result<Option<Value>> {
     }
     stop.abort();
     let _ = stop.await;
-    maintenance.abort();
-    let _ = maintenance.await;
+    let _ = stop_maintenance.send(true);
+    let deadline = tokio::time::Instant::now() + MAINTENANCE_STOP_TIMEOUT;
+    for (name, mut task) in [
+        ("Store", store_maintenance),
+        ("Network", network_maintenance),
+    ] {
+        if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
+            tracing::warn!("{name} maintenance did not stop in time; aborting it");
+            task.abort();
+            let _ = task.await;
+        }
+    }
     jobs.drain().await;
     result?;
     let update = pending_update

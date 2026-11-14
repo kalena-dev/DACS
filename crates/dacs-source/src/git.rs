@@ -99,14 +99,29 @@ impl Git {
     pub(crate) fn ensure(&self) -> Result<()> {
         match storage::inspect(&self.repo)? {
             None => {
-                self.run([
-                    OsStr::new("init"),
-                    OsStr::new("--bare"),
-                    OsStr::new("--template="),
-                    OsStr::new("--object-format=sha1"),
-                    self.repo.as_os_str(),
-                ])?
-                .checked()?;
+                // Initialise out of sight and publish with one rename, so an
+                // interrupted init can only leave a removable temporary tree,
+                // never a half-made directory at the final repository path.
+                let staging = tempfile::Builder::new()
+                    .prefix("init-")
+                    .tempdir_in(&self.temporary)
+                    .map_err(io)?;
+                let scratch = Self {
+                    repo: staging.path().join("repository.git"),
+                    temporary: self.temporary.clone(),
+                    project: self.project.clone(),
+                    repository_limit: self.repository_limit,
+                };
+                scratch
+                    .run([
+                        OsStr::new("init"),
+                        OsStr::new("--bare"),
+                        OsStr::new("--template="),
+                        OsStr::new("--object-format=sha1"),
+                        scratch.repo.as_os_str(),
+                    ])?
+                    .checked()?;
+                std::fs::rename(&scratch.repo, &self.repo).map_err(io)?;
                 storage::sync_directory(&self.project)?;
             }
             Some(metadata) if !metadata.is_dir() => {
@@ -238,7 +253,9 @@ impl Git {
             "transfer.fsckObjects=true",
             "fetch.recurseSubmodules=false",
             "core.commitGraph=false",
-            "core.fsync=committed",
+            // "committed" alone covers objects only. A publication is recorded
+            // as durable right after update-ref, so refs must be synced too.
+            "core.fsync=committed,reference,pack-metadata",
             "core.fsyncMethod=fsync",
             "pack.threads=1",
             "pack.windowMemory=32m",
@@ -312,8 +329,16 @@ impl Git {
                 Err(e) => break Err(io(e)),
             }
         };
-        tree.stop(&mut child);
-        let _ = child.wait();
+        // A normally completed child has been reaped: its process group id may
+        // already be reused, so signal the tree only while the child is unreaped.
+        if result.is_err() {
+            tree.stop(&mut child);
+            let _ = child.wait();
+        }
+        // Closing the job ends any leftover descendants (kill-on-close) before
+        // the collectors wait for the pipes to reach end of file.
+        #[cfg(windows)]
+        drop(tree);
         let stdout = stdout
             .join()
             .map_err(|_| error(ErrorCode::Internal, "Git stdout collector panicked"))?

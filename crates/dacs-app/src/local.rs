@@ -113,7 +113,10 @@ pub fn admin_token(data: &Path) -> Result<String> {
             Ok(value)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Written to a private temporary file and renamed into place, so a crash
+            // can never leave an empty or partial token file behind.
             let value = secret();
+            let temp = data.join(format!("admin.token.{}.tmp", uuid::Uuid::new_v4()));
             let mut options = fs::OpenOptions::new();
             options.write(true).create_new(true);
             #[cfg(unix)]
@@ -121,9 +124,19 @@ pub fn admin_token(data: &Path) -> Result<String> {
                 use std::os::unix::fs::OpenOptionsExt;
                 options.mode(0o600);
             }
-            let mut file = options.open(path).map_err(io_error)?;
-            file.write_all(value.as_bytes()).map_err(io_error)?;
-            file.sync_all().map_err(io_error)?;
+            let mut file = options.open(&temp).map_err(io_error)?;
+            let written = file
+                .write_all(value.as_bytes())
+                .and_then(|()| file.sync_all());
+            drop(file);
+            if let Err(error) = written.and_then(|()| fs::rename(&temp, &path)) {
+                let _ = fs::remove_file(&temp);
+                return Err(io_error(error));
+            }
+            #[cfg(unix)]
+            fs::File::open(data)
+                .and_then(|f| f.sync_all())
+                .map_err(io_error)?;
             Ok(value)
         }
         Err(error) => Err(io_error(error)),
@@ -148,12 +161,7 @@ fn save_json(path: &Path, value: &impl Serialize) -> Result<()> {
     serde_json::to_writer(&mut file, value).map_err(io_error)?;
     file.sync_all().map_err(io_error)?;
     drop(file);
-    #[cfg(windows)]
-    {
-        // MoveFileExW is used by the standard library to replace the existing destination.
-        fs::rename(&temp, path).map_err(io_error)?;
-    }
-    #[cfg(not(windows))]
+    // On Windows the standard library renames with MoveFileExW, replacing the destination.
     fs::rename(&temp, path).map_err(io_error)?;
     #[cfg(unix)]
     fs::File::open(path.parent().unwrap_or(Path::new(".")))
@@ -342,6 +350,29 @@ pub fn launch_update_helper(
 mod tests {
     use super::*;
     use std::{future::Future, task::Poll};
+
+    #[test]
+    fn admin_token_is_created_once_without_leaving_temporary_files() {
+        let root = tempfile::tempdir().unwrap();
+        let token = admin_token(root.path()).unwrap();
+        assert_eq!(token.len(), 64);
+        assert_eq!(fs::read_to_string(root.path().join("admin.token")).unwrap(), token);
+        assert_eq!(admin_token(root.path()).unwrap(), token);
+        let names: Vec<_> = fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["admin.token"]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(root.path().join("admin.token"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
 
     #[tokio::test]
     async fn shutdown_drains_active_and_queued_operations_before_returning() {

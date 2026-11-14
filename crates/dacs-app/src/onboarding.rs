@@ -114,7 +114,6 @@ fn save(root: &FilePath, state: &LocalState) -> Result<()> {
     let outcome = (|| {
         let mut file = options.open(&temporary).map_err(storage_error)?;
         serde_json::to_writer(&mut file, state).map_err(storage_error)?;
-        file.flush().map_err(storage_error)?;
         file.sync_all().map_err(storage_error)?;
         drop(file);
         fs::rename(&temporary, &path).map_err(storage_error)?;
@@ -729,10 +728,14 @@ async fn operate(
                 None
             }
         };
+        // A failed fetch never replaces a previously reviewed contract.
+        let fetched = contract.is_some();
         if state.registration_started {
             state.invitation = inspected.invitation;
             state.ca_file = inspected.ca_file;
-            state.contract = contract;
+            if contract.is_some() {
+                state.contract = contract;
+            }
             state.assessment = None;
             state.assessment_id = None;
             state.plan = None;
@@ -744,6 +747,11 @@ async fn operate(
         if state.contract.is_none() {
             return Err(conflict(
                 "Invitation inspected, but network infrastructure/disclosure is unavailable. Configure the coordinator bridge and inspect again before registration",
+            ));
+        }
+        if !fetched {
+            return Err(conflict(
+                "Invitation inspected, but the network disclosure could not be fetched; the previously reviewed contract is kept. Inspect again once the coordinator bridge is reachable",
             ));
         }
         return Ok(());
@@ -856,7 +864,11 @@ async fn operate(
         let mut consent = network_consent(state, request, String::new())?;
         let payload = json!({"invitation_token":reviewed.token,"registration":registration});
         state.registration_started = true;
-        save(root, state)?;
+        if let Err(error) = save(root, state) {
+            // Nothing was sent: do not let the error path persist an intent.
+            state.registration_started = false;
+            return Err(error);
+        }
         let enrollment: Enrollment = match remote(
             &http,
             state,
@@ -988,20 +1000,49 @@ async fn operate(
             ));
         }
         let switch = switch_consent(&assessed, request)?;
-        let consent = state
-            .consent
-            .as_mut()
-            .ok_or_else(|| conflict("Record host network consent first"))?;
-        consent.tailnet_switch = switch;
-        dacs_netclient::check_join(&grant, consent, &assessed, OffsetDateTime::now_utc()).map_err(|_| conflict("Join prerequisites or consent no longer match; inspect the assessment, Tailscale service and grant expiry"))?;
-        save(root, state)?;
         // The coordinator's original HostConsent is immutable after grant issuance.
         // Switch consent is a separate local owner decision bound to this fresh
-        // assessment; do not mutate the coordinator's issued authorization record.
+        // assessment: it is checked on a copy and persisted only together with the
+        // join intent, so an attempt that never starts leaves the saved consent as sent.
+        let original = state
+            .consent
+            .clone()
+            .ok_or_else(|| conflict("Record host network consent first"))?;
+        let mut consent = original.clone();
+        consent.tailnet_switch = switch;
+        dacs_netclient::check_join(&grant, &consent, &assessed, OffsetDateTime::now_utc()).map_err(|_| conflict("Join prerequisites or consent no longer match; inspect the assessment, Tailscale service and grant expiry"))?;
         state.join_started = true;
-        save(root, state)?;
-        let result = dacs_netclient::join(&grant, state.consent.as_ref().expect("validated consent"), &dacs_netclient::JoinOptions { accept_dns: approved(request,"accept_dns"), ..Default::default() }).await
-            .map_err(|_| conflict("Network join did not confirm success. Refresh membership and inspect the local Tailscale profile; do not blindly repeat a possibly consumed grant"))?;
+        state.consent = Some(consent.clone());
+        if let Err(error) = save(root, state) {
+            // Nothing was started: do not let the error path persist an intent.
+            state.join_started = false;
+            state.consent = Some(original);
+            return Err(error);
+        }
+        let result = match dacs_netclient::join(
+            &grant,
+            &consent,
+            &dacs_netclient::JoinOptions {
+                accept_dns: approved(request, "accept_dns"),
+                ..Default::default()
+            },
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(not_started) = join_not_started(&error) {
+                    // Rejected before `tailscale login`: the key is unused.
+                    state.join_started = false;
+                    state.consent = Some(original);
+                    save(root, state)?;
+                    return Err(not_started);
+                }
+                return Err(conflict(
+                    "Network join did not confirm success. Refresh membership and inspect the local Tailscale profile; do not blindly repeat a possibly consumed grant",
+                ));
+            }
+        };
         state.join_result = Some(result);
         state.grant_ready = false;
         save(root, state)?;
@@ -1009,6 +1050,25 @@ async fn operate(
         return Ok(());
     }
     Err(invalid("Unknown onboarding operation"))
+}
+
+/// Join errors raised before `tailscale login` is started, so the enrollment key
+/// is certainly unused. Every other error may follow a consumed key.
+fn join_not_started(error: &dacs_netclient::NetError) -> Option<ApiError> {
+    use dacs_netclient::NetError;
+    match error {
+        NetError::Prerequisite(_)
+        | NetError::Consent(_)
+        | NetError::SwitchConsentRequired { .. }
+        | NetError::Grant(_)
+        | NetError::AlreadyJoined => Some(conflict(&format!(
+            "Network join was not started and the grant is unused: {error}. Resolve this, assess again and retry the join"
+        ))),
+        NetError::Cli(_)
+        | NetError::NotDacs { .. }
+        | NetError::JoinTimeout { .. }
+        | NetError::Io(_) => None,
+    }
 }
 
 fn previous_tailnet(assessment: &TailnetAssessment) -> Option<&str> {
@@ -1134,5 +1194,104 @@ mod tests {
         };
         assert!(current_review(&state, &json!({"review":"old"})).is_err());
         assert!(current_review(&state, &json!({"review":"current"})).is_ok());
+    }
+
+    #[test]
+    fn only_join_errors_before_tailscale_login_release_the_join_latch() {
+        use dacs_netclient::NetError;
+        for unused in [
+            NetError::Prerequisite("Tailscale service is not running".into()),
+            NetError::Consent("consent belongs to another device".into()),
+            NetError::SwitchConsentRequired {
+                previous: "https://old.example.test".into(),
+            },
+            NetError::Grant("enrollment key expired; request a new grant".into()),
+            NetError::AlreadyJoined,
+        ] {
+            let error = join_not_started(&unused).expect("pre-effect join error");
+            assert_eq!(error.code, ErrorCode::Conflict);
+            assert!(error.message.contains(&unused.to_string()));
+        }
+        for uncertain in [
+            NetError::JoinTimeout {
+                login_server: "https://login.example.test".into(),
+                secs: 30,
+                state: String::new(),
+            },
+            NetError::Io(std::io::Error::other("interrupted")),
+            NetError::NotDacs {
+                active: "https://old.example.test".into(),
+                dacs: "https://login.example.test".into(),
+            },
+        ] {
+            assert!(join_not_started(&uncertain).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn reinspection_keeps_the_reviewed_contract_when_the_fetch_fails() {
+        const TOKEN: &str = "private-invite-token";
+        fn invitation() -> Invitation {
+            Invitation {
+                token: TOKEN.into(),
+                project_id: "p".into(),
+                host_name: "coordinator".into(),
+                expires_at: i64::MAX,
+                requirements: json!({}),
+                revoked: false,
+            }
+        }
+        // The coordinator still serves the invitation; its network bridge is down.
+        let coordinator = Router::new()
+            .route(
+                "/api/invitations/{token}",
+                get(|| async { Json(invitation()) }),
+            )
+            .route(
+                "/api/network/contract",
+                get(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, coordinator).await.unwrap();
+        });
+        let reviewed = NetworkContract {
+            contract_revision: CONTRACT_REVISION.into(),
+            admin_disclosure_revision: ADMIN_ACCESS_DISCLOSURE_REVISION.into(),
+            admin_disclosure: ADMIN_ACCESS_DISCLOSURE.into(),
+            tailnet_switch_disclosure: TAILNET_SWITCH_DISCLOSURE.into(),
+            login_server: "https://login.example.test".into(),
+            coordinator: dacs_net_contract::CoordinatorEndpoints {
+                bootstrap_url: "https://bootstrap.example.test".into(),
+                overlay_url: "https://overlay.example.test".into(),
+            },
+            key_ttl_minutes: 10,
+        };
+        let expected = serde_json::to_value(&reviewed).unwrap();
+        let mut state = LocalState {
+            review: "previous".into(),
+            endpoint: base.clone(),
+            invitation: Some(invitation()),
+            contract: Some(reviewed),
+            registration_started: true,
+            ..Default::default()
+        };
+        let error = operate(
+            FilePath::new("unused"),
+            &mut state,
+            "inspect",
+            &json!({"endpoint":base,"invitation_token":TOKEN}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert_eq!(
+            serde_json::to_value(&state.contract).unwrap(),
+            expected,
+            "an unreachable bridge must not erase the reviewed contract"
+        );
+        assert_ne!(state.review, "previous");
+        server.abort();
     }
 }

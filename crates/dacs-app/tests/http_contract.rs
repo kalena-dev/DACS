@@ -5,8 +5,18 @@ use std::{
     net::{SocketAddr, TcpListener},
     path::Path,
     process::{Child, Command, Stdio},
+    sync::{Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
 };
+
+/// A reserved port is released before the child binds it, so another test in this
+/// process could be handed the same port in between. Hold this from reservation
+/// until the child is ready or has exited.
+static STARTUP: Mutex<()> = Mutex::new(());
+
+fn startup_lock() -> MutexGuard<'static, ()> {
+    STARTUP.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 struct Server {
     process: Child,
@@ -25,6 +35,7 @@ impl Drop for Server {
 
 impl Server {
     fn start() -> Self {
+        let _startup = startup_lock();
         let port = TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
@@ -63,6 +74,7 @@ impl Server {
     }
 
     fn start_tls() -> (Self, String) {
+        let _startup = startup_lock();
         let control = TcpListener::bind("127.0.0.1:0").unwrap();
         let bootstrap = TcpListener::bind("127.0.0.1:0").unwrap();
         let listen = control.local_addr().unwrap();
@@ -267,6 +279,39 @@ fn browser_commands_require_origin_and_csrf_and_deduplicate_delivery() {
     let projects = server.projects();
     assert_eq!(projects.len(), 1);
     assert_eq!(projects[0]["name"], "Browser delivery");
+    // Notices from separate actions queue until rendered, then show once, in order.
+    let rejected = |action: &str| {
+        server
+            .client
+            .post(format!("{}/ui/{action}", server.url))
+            .header(header::ORIGIN, &server.url)
+            .header(header::COOKIE, session_cookie)
+            .form(&[("csrf", csrf)])
+            .send()
+            .unwrap()
+            .status()
+    };
+    assert_eq!(rejected("create-project"), StatusCode::SEE_OTHER);
+    assert_eq!(rejected("invitation"), StatusCode::SEE_OTHER);
+    let render = || {
+        server
+            .client
+            .get(&server.url)
+            .header(header::COOKIE, session_cookie)
+            .send()
+            .unwrap()
+            .text()
+            .unwrap()
+    };
+    let rendered = render();
+    let first = rendered
+        .find("Operation rejected: Missing name")
+        .expect("First pending notice");
+    let second = rendered
+        .find("Operation rejected: Missing project_id")
+        .expect("Second pending notice");
+    assert!(first < second);
+    assert!(!render().contains("Operation rejected"));
     assert_eq!(
         server
             .client
@@ -505,6 +550,7 @@ fn network_routes_reject_browser_cookies_even_with_valid_control_session() {
 
 #[test]
 fn occupied_bootstrap_socket_aborts_before_control_readiness() {
+    let _startup = startup_lock();
     let reserved_control = TcpListener::bind("127.0.0.1:0").unwrap();
     let control = reserved_control.local_addr().unwrap();
     let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -538,8 +584,43 @@ fn occupied_bootstrap_socket_aborts_before_control_readiness() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    // Failed all-or-nothing startup must release the already-bound control port.
-    let _released = TcpListener::bind(control).unwrap();
+    // The exit observed above is the release of the already-bound control port: the
+    // operating system closes a terminated process's sockets. Rebinding the port here
+    // would race with unrelated processes taking it.
+}
+
+#[test]
+fn second_instance_on_the_same_data_directory_fails_before_touching_state() {
+    let server = Server::start();
+    let job = server
+        ._data
+        .path()
+        .join("jobs")
+        .join(format!("{}.json", uuid::Uuid::new_v4()));
+    fs::write(
+        &job,
+        r#"{"id":"fixture","operation":"fixture","state":"running","created_at":0,"updated_at":0,"result":null,"error":null}"#,
+    )
+    .unwrap();
+    let status = Command::new(env!("CARGO_BIN_EXE_dacs"))
+        .args([
+            "serve",
+            "--listen",
+            server.url.strip_prefix("http://").unwrap(),
+            "--public-url",
+            &server.url,
+            "--data-dir",
+        ])
+        .arg(server._data.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(!status.success());
+    // Opening the job journal marks running jobs interrupted; the losing instance
+    // must fail to bind before it gets that far.
+    let journal: Value = serde_json::from_str(&fs::read_to_string(&job).unwrap()).unwrap();
+    assert_eq!(journal["state"], "running");
 }
 
 #[test]

@@ -2,7 +2,7 @@
 use anyhow::{Context, bail};
 use axum::{
     Router,
-    body::Body,
+    body::{Body, Bytes},
     extract::{DefaultBodyLimit, Request, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
@@ -105,6 +105,11 @@ async fn asset_root(assets: &Path) -> anyhow::Result<PathBuf> {
     Ok(root)
 }
 
+struct Assets {
+    root: PathBuf,
+    index: Bytes,
+}
+
 #[derive(Clone)]
 struct Confinement {
     address: SocketAddr,
@@ -117,9 +122,14 @@ async fn app(board: TaskBoard, assets: PathBuf, address: SocketAddr) -> anyhow::
         address,
         csp: script_policy(&index)?.parse()?,
     };
+    // The policy hashes this exact document, so the same bytes are served for the
+    // lifetime of the process; a frontend rebuild takes effect on restart.
     let files = Router::new()
         .fallback(static_file)
-        .with_state(Arc::new(assets));
+        .with_state(Arc::new(Assets {
+            root: assets,
+            index: Bytes::from(index),
+        }));
     Ok(router(board)
         .fallback_service(files)
         .layer(DefaultBodyLimit::max(64 * 1024))
@@ -214,36 +224,42 @@ fn relative_asset(path: &str) -> Option<&str> {
     Some(path)
 }
 
-async fn static_file(State(root): State<Arc<PathBuf>>, request: Request) -> Response {
+async fn static_file(State(assets): State<Arc<Assets>>, request: Request) -> Response {
     if !matches!(*request.method(), Method::GET | Method::HEAD) {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
     let Some(relative) = relative_asset(request.uri().path()) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Ok(path) = tokio::fs::canonicalize(root.join(relative)).await else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    // Canonical containment also rejects symlinks and Windows junctions escaping root.
-    if !path.starts_with(root.as_ref())
-        || !tokio::fs::metadata(&path).await.is_ok_and(|m| m.is_file())
-    {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    let mime = match path.extension().and_then(|e| e.to_str()) {
-        Some("html") => "text/html; charset=utf-8",
-        Some("js") => "text/javascript; charset=utf-8",
-        Some("wasm") => "application/wasm",
-        Some("css") => "text/css; charset=utf-8",
-        Some("svg") => "image/svg+xml",
-        Some("png") => "image/png",
-        Some("ico") => "image/x-icon",
-        Some("json") => "application/json",
-        Some("woff2") => "font/woff2",
-        _ => "application/octet-stream",
-    };
-    let Ok(bytes) = tokio::fs::read(&path).await else {
-        return StatusCode::NOT_FOUND.into_response();
+    let (mime, bytes) = if relative == "index.html" {
+        ("text/html; charset=utf-8", assets.index.clone())
+    } else {
+        let root = &assets.root;
+        let Ok(path) = tokio::fs::canonicalize(root.join(relative)).await else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        // Canonical containment also rejects symlinks and Windows junctions escaping root.
+        if !path.starts_with(root)
+            || !tokio::fs::metadata(&path).await.is_ok_and(|m| m.is_file())
+        {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        let mime = match path.extension().and_then(|e| e.to_str()) {
+            Some("html") => "text/html; charset=utf-8",
+            Some("js") => "text/javascript; charset=utf-8",
+            Some("wasm") => "application/wasm",
+            Some("css") => "text/css; charset=utf-8",
+            Some("svg") => "image/svg+xml",
+            Some("png") => "image/png",
+            Some("ico") => "image/x-icon",
+            Some("json") => "application/json",
+            Some("woff2") => "font/woff2",
+            _ => "application/octet-stream",
+        };
+        let Ok(bytes) = tokio::fs::read(&path).await else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        (mime, Bytes::from(bytes))
     };
     let length = bytes.len();
     let body = if request.method() == Method::HEAD {
@@ -448,6 +464,26 @@ mod tests {
                 .status(),
             StatusCode::OK
         );
+        // A rebuild while running must not serve a document the startup policy
+        // does not cover: the index and its policy both come from startup.
+        tokio::fs::write(
+            assets_dir.join("index.html"),
+            "<!doctype html><title>Rebuilt</title><script>rebuilt()</script>",
+        )
+        .await
+        .unwrap();
+        for path in ["/", "/index.html"] {
+            let response = client.get(format!("{base}{path}")).send().await.unwrap();
+            let policy = response.headers()["content-security-policy"]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            assert!(!policy.contains("'sha256-"), "{policy}");
+            assert_eq!(
+                response.text().await.unwrap(),
+                "<!doctype html><title>Board</title>"
+            );
+        }
         stop.send(()).unwrap();
         server.await.unwrap();
         let reopened = TaskBoard::open(dir.path().join("board.redb")).unwrap();
