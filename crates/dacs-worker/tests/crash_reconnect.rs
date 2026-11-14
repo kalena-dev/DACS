@@ -246,7 +246,10 @@ if [ "$mode" = attempt ]; then
 fi
 echo "$$ $mode" >> "$LOG/launches"
 printf '%s\n' '{"type":"ready","protocolVersion":1}'
-awk -v logf="$LOG/frames-$$" -v mode="$mode" '
+# mawk (Debian/Ubuntu's default awk) block-buffers piped input unless run
+# interactive, so it would never answer the worker's first RPC frame.
+case "$(awk -W version 2>&1 </dev/null)" in *mawk*) line_input='-W interactive' ;; *) line_input= ;; esac
+awk $line_input -v logf="$LOG/frames-$$" -v mode="$mode" '
 function out(s) { print s; fflush() }
 {
   print $0 >> logf; fflush(logf)
