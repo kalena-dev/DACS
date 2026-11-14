@@ -1,6 +1,6 @@
 # Team integration checkpoint
 
-Shared branch: `person-1-expanded-track`. This is an integration branch, not a release. It incorporates the worker/runtime foundation, build-pool contribution, release-evidence tools and `person3/network-enrollment` history. Use the root Cargo workspace and lockfile.
+Shared implementation: `main`. The integration branch `person-1-expanded-track` is retained. This is an integration checkpoint, not a certified release. It incorporates the worker/runtime foundation, build-pool contribution, release-evidence tools and `person3/network-enrollment` history. Use the root Cargo workspace and lockfile. The assignment handoffs and shared requirements are in [`assignments/`](assignments/).
 
 ## Current implementation handoff
 
@@ -8,11 +8,11 @@ All three tracks now have connected implementations in this workspace:
 
 | Track | Delivered implementation | Evidence and remaining limits |
 |---|---|---|
-| Worker/OMP | Connected runtime, durable journal/outbox, isolated source workspaces, host tools, supervision, workflow delivery and local controls | Combined worker/UI/application check passed 62 tests and the native build passed. Real OMP RPC startup/state query passed. Provider-backed assignments, fleet recovery and native desktop certification remain unverified. |
+| Worker/OMP | Connected runtime, durable journal/outbox, isolated source workspaces, host tools, supervision, workflow delivery and local controls | Combined worker/UI/application check passed 62 tests and the native build passed. Real OMP RPC startup/state query passed. Live Windows workflow found Git rejecting a canonical checkout path; correction and rerun are pending. Fleet recovery and native desktop certification remain unverified. |
 | Network/enrollment | Network service/client/deployment files, coordinator bridge, separate TLS listeners, owner consent/onboarding and private task-board frontend | 14 network-client tests and the WebAssembly release build passed. Public infrastructure, real fleet join/revocation and compiler routes remain unverified. |
 | Builds/release | Admitted build/test/service runner, compiler pool ownership, authenticated action provenance, release audit and native packaging commands | Native application compilation passed. See `person4-build-release-status.md` for the supported engine and unrun multi-host, package and signing requirements. |
 
-The latest combined command was `cargo test -p dacs-worker -p dacs-ui -p dacs --features dacs/native && cargo build -p dacs --features native`. Local live worker and task-board browser checks continue after this handoff; they are not included in the passed results above.
+The latest combined command was `cargo test -p dacs-worker -p dacs-ui -p dacs --features dacs/native && cargo build -p dacs --features native`. The HTTP/CLI source-publication smoke also passed, including final stop reconciliation, artifact authorization and request replay. Live worker and task-board browser checks continue after this handoff; their incomplete results are not counted as passed.
 
 ## Parallel ownership
 
