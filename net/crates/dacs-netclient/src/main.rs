@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use dacs_net_contract::{CompilerEndpoint, EnrollmentGrant, HostConsent, PeerSnapshot};
+use dacs_netclient::compiler::{self, CompilerSide};
 use dacs_netclient::{JoinOptions, assess, detect, join, leave, peers, ping, probe_tcp};
 use serde::Serialize;
 
@@ -69,6 +70,10 @@ enum Command {
         endpoints: PathBuf,
         #[arg(long, default_value_t = 3000)]
         timeout_ms: u64,
+        /// This host's sccache role (client, scheduler or server): probe only
+        /// the roles it must reach and require each over the overlay.
+        #[arg(long)]
+        from: Option<CompilerSide>,
     },
     /// Per-peer transfer between two `peers` snapshots (e.g. around a build).
     Traffic {
@@ -89,14 +94,6 @@ fn print<T: Serialize>(value: &T) {
         "{}",
         serde_json::to_string_pretty(value).expect("serializable")
     );
-}
-
-#[derive(Serialize)]
-struct CompilerCheck {
-    endpoint: CompilerEndpoint,
-    tcp: dacs_net_contract::TcpProbe,
-    path: Option<dacs_net_contract::PathProbe>,
-    ok: bool,
 }
 
 #[derive(Serialize)]
@@ -178,34 +175,24 @@ async fn run(cli: Cli) -> Result<bool, String> {
         Command::CompilerCheck {
             endpoints,
             timeout_ms,
+            from,
         } => {
             let endpoints: Vec<CompilerEndpoint> = read_json(&endpoints)?;
-            let mut all = !endpoints.is_empty();
-            let mut out = Vec::new();
-            for ep in endpoints {
-                if !dacs_net_contract::is_overlay_ip(ep.overlay_ip) {
-                    return Err(
-                        "compiler endpoints must use private overlay addresses; no probe sent"
-                            .into(),
-                    );
-                }
-                let tcp = probe_tcp(ep.socket_addr(), Duration::from_millis(timeout_ms)).await;
-                let path = ping(&ep.overlay_ip.to_string(), 3).await.ok();
-                let ok = tcp.overlay_private
-                    && tcp.reachable
-                    && path.as_ref().is_some_and(|p| {
-                        !matches!(p.path, dacs_net_contract::PeerPath::Unreachable { .. })
-                    });
-                all &= ok;
-                out.push(CompilerCheck {
-                    endpoint: ep,
-                    tcp,
-                    path,
-                    ok,
-                });
+            let local_ips = match detect().await {
+                dacs_net_contract::TailnetClientState::LoggedIn { overlay_ips, .. } => overlay_ips,
+                _ => Vec::new(),
+            };
+            let timeout = Duration::from_millis(timeout_ms);
+            let probe = &compiler::Live;
+            if let Some(side) = from {
+                let report =
+                    compiler::check_side(side, &endpoints, &local_ips, probe, timeout).await?;
+                print(&report);
+                return Ok(report.ok);
             }
-            print(&out);
-            return Ok(all);
+            let checks = compiler::check_endpoints(&endpoints, &local_ips, probe, timeout).await?;
+            print(&checks);
+            return Ok(!checks.is_empty() && checks.iter().all(|c| c.ok));
         }
         Command::Traffic { before, after } => {
             let before: Vec<PeerSnapshot> = read_json(&before)?;
