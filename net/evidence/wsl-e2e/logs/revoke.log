@@ -1,0 +1,39 @@
+
+### revoke the guest (coordinator -> netadmin)
+{"device_id":"guest-e2e","auth_key_id":null,"node_id":7,"requested_by":"e2e-project-owner","reason":"e2e revocation"}
+{"device_id":"guest-e2e","key_expired":false,"node_deleted":7,"verified_absent":true,"at":"2026-11-14T20:10:49.386007693Z"}
+HTTP 200
+{"device_id":"guest-e2e","host_name":"compile-guest","state":{"state":"revoked","node_id":null},"overlay_ips":[],"tags":[],"last_seen":null}
+HTTP 200
+
+### guest after revocation
+{"state":"logged_in","control_url":"https://hs.dacs.test:8443","backend_state":"NeedsLogin"}
+[{"endpoint":{"host_name":"compile-guest","role":"scheduler","overlay_ip":"100.64.0.5","port":10600},"tcp":{"target":"100.64.0.5:10600","overlay_private":true,"reachable":false,"connect_ms":null,"error":"Network is unreachable (os error 101)"},"path":{"peer":"100.64.0.5","path":{"path":"unreachable","detail":"no pong received"},"rtt_ms":null,"measured_at":"2026-11-14T20:10:59.208386664Z"},"ok":false},{"endpoint":{"host_name":"compile-guest","role":"server","overlay_ip":"100.64.0.5","port":10501},"tcp":{"target":"100.64.0.5:10501","overlay_private":true,"reachable":false,"connect_ms":null,"error":"Network is unreachable (os error 101)"},"path":{"peer":"100.64.0.5","path":{"path":"unreachable","detail":"no pong received"},"rtt_ms":null,"measured_at":"2026-11-14T20:11:00.347339311Z"},"ok":false}]
+exit 2
+
+### reconnect attempt: restart guest tailscaled with its old state
+{"state":"logged_out","control_url":null,"backend_state":null}
+ID    Tailnet           Account
+e7cb  hs.personal.test  owner
+788e  hs.dacs.test      tagged-devices*
+{"already_dacs":false,"requires_switch_consent":false,"previous_control_url":null,"client":"logged_out"}
+
+### fresh approved enrollment after revocation, then rejoin
+{"contract_revision":"dacs-net/2026-11-14.1","device_id":"guest-e2e","host_name":"compile-guest","login_server":"https://hs.dacs.test:8443","auth_key":"<redacted>","auth_key_id":9,"tags":["tag:dacs-sccache-scheduler","tag:dacs-sccache-server"],"expires_at":"2026-11-14T20:26:16.633971642Z","coordinator":{"bootstrap_url":"https://bootstrap.dacs.test","overlay_url":"https://coordinator.dacs.internal:7443"}}
+HTTP 200
+{
+  "device_id": "guest-e2e",
+  "host_name": "compile-guest",
+  "overlay_ips": [
+    "100.64.0.6",
+    "fd7a:115c:a1e0::6"
+  ],
+  "coordinator": {
+    "bootstrap_url": "https://bootstrap.dacs.test",
+    "overlay_url": "https://coordinator.dacs.internal:7443"
+  },
+  "displaced_control_url": null
+}
+exit 0
+[{"endpoint":{"host_name":"compile-guest","role":"scheduler","overlay_ip":"100.64.0.6","port":10600},"tcp":{"target":"100.64.0.6:10600","overlay_private":true,"reachable":false,"connect_ms":null,"error":"Connection refused (os error 111)"},"path":{"peer":"100.64.0.6","path":{"path":"direct","endpoint":"10.99.0.12:41641"},"rtt_ms":1.0,"measured_at":"2026-11-14T20:11:35.712439932Z"},"ok":false},{"endpoint":{"host_name":"compile-guest","role":"server","overlay_ip":"100.64.0.6","port":10501},"tcp":{"target":"100.64.0.6:10501","overlay_private":true,"reachable":false,"connect_ms":null,"error":"Connection refused (os error 111)"},"path":{"peer":"100.64.0.6","path":{"path":"direct","endpoint":"10.99.0.12:41641"},"rtt_ms":0.0,"measured_at":"2026-11-14T20:11:39.897877129Z"},"ok":false}]
+REVOKE-DONE
