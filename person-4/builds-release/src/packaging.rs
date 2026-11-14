@@ -32,6 +32,7 @@ pub struct PackageReport {
     pub classification: &'static str,
     pub signature_verification: &'static str,
     pub installation_verification: &'static str,
+    pub executable_smoke_verification: &'static str,
     pub update_verification: &'static str,
     pub other_platforms: &'static str,
 }
@@ -74,7 +75,15 @@ fn query(program: &str, args: &[&str], cwd: &Path) -> Result<String> {
 }
 fn execute(program: &str, args: &[String], cwd: &Path, log: &Path) -> Result<()> {
     let file = OpenOptions::new().write(true).create_new(true).open(log)?;
-    let status = Command::new(program)
+    let mut command = Command::new(program);
+    if program == "cargo" {
+        // Release packaging is local work. Explicit empty values override both
+        // inherited wrappers and Cargo configuration pointing at an owner's daemon.
+        command
+            .env("RUSTC_WRAPPER", "")
+            .env("RUSTC_WORKSPACE_WRAPPER", "");
+    }
+    let status = command
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
@@ -140,6 +149,41 @@ fn validate_version(version: &str) -> Result<()> {
     Ok(())
 }
 
+fn verify_source(workspace: &Path, request: &PackageRequest) -> Result<()> {
+    if query("git", &["rev-parse", "HEAD"], workspace)? != request.source_commit
+        || !query(
+            "git",
+            &["status", "--porcelain", "--untracked-files=all"],
+            workspace,
+        )?
+        .is_empty()
+        || digest(&workspace.join("Cargo.lock"))?.0 != request.cargo_lock_sha256
+    {
+        return Err(
+            invalid("release source must remain clean at the pinned commit and lockfile").into(),
+        );
+    }
+    Ok(())
+}
+
+fn create_output(workspace: &Path, requested: &Path) -> Result<PathBuf> {
+    let absolute = std::path::absolute(requested)?;
+    let parent = absolute
+        .parent()
+        .ok_or_else(|| invalid("output has no parent"))?
+        .canonicalize()?;
+    let name = absolute
+        .file_name()
+        .ok_or_else(|| invalid("output has no directory name"))?;
+    let output = parent.join(name);
+    if output.starts_with(workspace) {
+        return Err(invalid("release output must be outside the source checkout").into());
+    }
+    // Check containment before creating anything in a potentially pinned checkout.
+    fs::create_dir(&output)?;
+    Ok(output.canonicalize()?)
+}
+
 pub fn produce(request: PackageRequest) -> Result<PackageReport> {
     validate_version(&request.version)?;
     let (os, arch) = native_target(&request.target)?;
@@ -162,12 +206,7 @@ pub fn produce(request: PackageRequest) -> Result<PackageReport> {
     {
         return Err(invalid("release toolchain pin mismatch").into());
     }
-    // Exclusive directory prevents stale package output from appearing successful.
-    fs::create_dir(&request.output)?;
-    let output = request.output.canonicalize()?;
-    if output.starts_with(&workspace) {
-        return Err(invalid("release output must be outside the source checkout").into());
-    }
+    let output = create_output(&workspace, &request.output)?;
     let target_dir = output.join("cargo-target");
     execute(
         "cargo",
@@ -187,9 +226,7 @@ pub fn produce(request: PackageRequest) -> Result<PackageReport> {
         &workspace,
         &output.join("cargo-build.log"),
     )?;
-    if digest(&workspace.join("Cargo.lock"))?.0 != request.cargo_lock_sha256 {
-        return Err(invalid("build changed pinned lockfile").into());
-    }
+    verify_source(&workspace, &request)?;
     let binary = target_dir
         .join(&request.target)
         .join("release")
@@ -197,6 +234,22 @@ pub fn produce(request: PackageRequest) -> Result<PackageReport> {
     if !binary.is_file() {
         return Err(invalid("Cargo did not produce the requested native executable").into());
     }
+    // A foreign architecture may package successfully but cannot be exercised
+    // on this host. Record that distinction instead of claiming a runtime check.
+    let host_arch = std::env::consts::ARCH;
+    let executable_smoke_verification = if request.target.starts_with(&format!("{host_arch}-")) {
+        execute(
+            binary
+                .to_str()
+                .ok_or_else(|| invalid("binary path is not UTF-8"))?,
+            &["--help".into()],
+            &output,
+            &output.join("executable-smoke.log"),
+        )?;
+        "passed_help_command"
+    } else {
+        "not_run_requires_target_architecture"
+    };
     let stem = format!(
         "dacs-{}-{}-UNSIGNED-PREVIEW",
         request.version, request.target
@@ -299,6 +352,7 @@ pub fn produce(request: PackageRequest) -> Result<PackageReport> {
         }
         _ => unreachable!(),
     };
+    verify_source(&workspace, &request)?;
     let (sha256, bytes) = digest(&artifact)?;
     let report = PackageReport {
         source_commit: request.source_commit,
@@ -310,6 +364,7 @@ pub fn produce(request: PackageRequest) -> Result<PackageReport> {
         classification: "unsigned_preview_not_trusted_update",
         signature_verification: "failed_required_identity_not_used",
         installation_verification: "not_run",
+        executable_smoke_verification,
         update_verification: "not_run",
         other_platforms: "not_run_requires_native_host",
     };
@@ -327,6 +382,7 @@ pub fn produce(request: PackageRequest) -> Result<PackageReport> {
 /// This command never signs and never asks for/imports signing keys.
 pub fn verify_signed(path: &Path, log_directory: &Path) -> Result<()> {
     let path = path.canonicalize()?;
+    let (sha256, bytes) = digest(&path)?;
     fs::create_dir(log_directory)?;
     let logs = log_directory.canonicalize()?;
     match std::env::consts::OS {
@@ -337,12 +393,49 @@ pub fn verify_signed(path: &Path, log_directory: &Path) -> Result<()> {
             execute("xcrun", &["stapler".into(), "validate".into(), path.to_string_lossy().into_owned()], &logs, &logs.join("notarization.log"))
         }
         _ => Err(invalid("no platform signing verifier configured; authenticated DACS update manifest verification is a separate required gate").into()),
+    }?;
+    if digest(&path)? != (sha256.clone(), bytes) {
+        return Err(invalid("package changed during signature verification").into());
     }
+    let mut report = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(logs.join("signature-evidence.json"))?;
+    serde_json::to_writer_pretty(
+        &mut report,
+        &serde_json::json!({
+            "artifact": path, "sha256": sha256, "bytes": bytes,
+            "platform": std::env::consts::OS,
+            "signature_verification": "passed",
+            "installation_verification": "not_run",
+            "update_verification": "not_run"
+        }),
+    )?;
+    report.write_all(b"\n")?;
+    report.sync_all()?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn output_validation_does_not_modify_checkout_or_reuse_existing_directory() {
+        let root = std::env::temp_dir().join(format!("dacs-package-output-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let workspace = root.join("source");
+        fs::create_dir(&workspace).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let forbidden = workspace.join("release");
+        assert!(create_output(&workspace, &forbidden).is_err());
+        assert!(!forbidden.exists());
+        let destination = root.join("release");
+        assert!(create_output(&workspace, &destination).is_ok());
+        assert!(create_output(&workspace, &destination).is_err());
+        fs::remove_dir(destination).unwrap();
+        fs::remove_dir(workspace).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
     #[test]
     fn version_rejects_command_and_metadata_injection() {
         for version in [
