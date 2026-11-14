@@ -19,6 +19,7 @@ pub fn render_onboarding(status: &Value, notice: Option<&str>, csrf: &str) -> St
     let invitation = status.get("invitation").filter(|v| !v.is_null());
     let contract = status.get("contract").filter(|v| !v.is_null());
     let registered = yes(status, "credential_saved");
+    let local_only = yes(status, "local_only");
     let registration_started = yes(status, "registration_started");
     let blocker = status.get("blocker").and_then(Value::as_str).map(|message| view! {
         <aside class="warning" role="alert"><h2>"Current blocker"</h2><p>{message.to_owned()}</p></aside>
@@ -62,7 +63,7 @@ pub fn render_onboarding(status: &Value, notice: Option<&str>, csrf: &str) -> St
             {json_details("Current network contract, endpoints and disclosure revision",contract)}
         </section>
     });
-    let registration = if !registration_started && contract.is_some() {
+    let registration = if !registration_started && (contract.is_some() || local_only) {
         invitation.map(|invitation| {
             let registration = json!({
                 "name":"","physical_host_id":uuid::Uuid::new_v4().to_string(),
@@ -76,15 +77,20 @@ pub fn render_onboarding(status: &Value, notice: Option<&str>, csrf: &str) -> St
                 {form("/ui/onboarding/register",csrf,view! {
                     {hidden("review",review.clone())}
                     {textarea("Typed WorkerRegistration JSON (review every field)","registration",pretty(&registration),true)}
-                    {input("This PC's network host label (lowercase single DNS label)","network_host","text","",true)}
+                    {(!local_only).then(||input("This PC's network host label (lowercase single DNS label)","network_host","text","",true))}
                     {checkbox(&format!("I own this PC and explicitly accept administrator-level execution from the inviting coordinator {}. Elevated restrictions are not a sandbox.",text(invitation,"host_name")),"owner_approved",true)}
-                    {checkbox("I accept the current network administrator-access disclosure above for this PC's named network host. Joining and switching networks still require separate approval.","network_approved",true)}
-                },"Consent and register; do not join or start worker")}
+                    {(!local_only).then(||checkbox("I accept the current network administrator-access disclosure above for this PC's named network host. Joining and switching networks still require separate approval.","network_approved",true))}
+                },if local_only { "Register local-only; do not start worker" } else { "Consent and register; do not join or start worker" })}
             </section> }
         })
     } else {
         None
     };
+    let local_notice = local_only.then(|| view! {
+        <aside class="warning" role="status"><h2>"Local-only development enrollment"</h2>
+            <p>"This loopback coordinator advertises no private-network infrastructure, so this PC registers without network membership. Network consent, assessment and join do not apply. Use a coordinator with the network bridge configured for real fleet enrollment."</p>
+        </aside>
+    });
     let pending = registration_started.then(|| view! {
         <section><h2>"5. Individual coordinator approval"</h2>
             <p>{if registered {
@@ -145,6 +151,7 @@ pub fn render_onboarding(status: &Value, notice: Option<&str>, csrf: &str) -> St
         {hidden("review", &review)}
         {input("Absolute path to the installed OMP executable", "omp_executable", "text", "", true)}
         {input("Owner's OMP profile (optional)", "omp_profile", "text", "", false)}
+        {local_only.then(|| input("Loopback coordinator control origin (local-only; defaults to the inspected origin)", "coordinator_url", "url", text(status, "endpoint"), false))}
         {checkbox("Store the enrolled credential and worker configuration privately on this PC", "worker_config_approved", true)}
     }, "Prepare manual worker launch"));
     let worker_controls = status.get("worker_config_file").and_then(Value::as_str).map(|path| view! {
@@ -184,7 +191,7 @@ pub fn render_onboarding(status: &Value, notice: Option<&str>, csrf: &str) -> St
                     {input("Trusted CA PEM file on this PC (optional)","ca_file","text","",false)}
                 },"Inspect invitation and current network disclosure")}
             </details></section>
-            {review_card}{plan}{setup_result}{disclosure}{registration}{pending}{retry_consent}{assess}{assessment}{joined}
+            {review_card}{local_notice}{plan}{setup_result}{disclosure}{registration}{pending}{retry_consent}{assess}{assessment}{joined}
             <section><h2>"Manual readiness and worker launch"</h2>
                 <p>"Complete provider login manually through the installed pinned OMP on this PC. Never paste provider credentials here. Review and launch the worker manually only after project approval, required tool compatibility and confirmed network membership. Onboarding never starts OMP login or the worker."</p>
                 <p>"The device credential remains in the owner's private DACS state directory under onboarding/owner.json. Do not publish or attach this file to job reports. The LocalJoinResult above contains only non-secret network handoff information."</p>
@@ -198,6 +205,18 @@ pub fn render_onboarding(status: &Value, notice: Option<&str>, csrf: &str) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn local_only_registration_omits_network_consent() {
+        let status = json!({"review":"review","local_only":true,"endpoint":"http://127.0.0.1:7447",
+            "invitation":{"host_name":"coordinator","project_id":"p","requirements":{}}});
+        let html = render_onboarding(&status, None, "csrf-value");
+        assert!(html.contains("Local-only development enrollment"));
+        assert!(html.contains("action=\"/ui/onboarding/register\""));
+        assert!(html.contains("name=\"owner_approved\""));
+        assert!(!html.contains("name=\"network_approved\""));
+        assert!(!html.contains("name=\"network_host\""));
+    }
+
     #[test]
     fn joining_uses_separate_switch_consent_and_only_post_forms() {
         let status = json!({"review":"review","credential_saved":true,"registration_started":true,

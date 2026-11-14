@@ -383,6 +383,20 @@ fn write_download(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Like [`write_download`], but readable only by the owner (private keys).
+fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options
+        .open(path)
+        .context("Choose an output path that does not exist")?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
 fn restart_coordinator_after_update(value: &Value) -> Result<bool> {
     if value.get("exit_required").and_then(Value::as_bool) != Some(true) {
         return Ok(false);
@@ -747,7 +761,7 @@ async fn main() -> Result<()> {
                 &output_dir.join("server.pem"),
                 certified.cert.pem().as_bytes(),
             )?;
-            write_download(
+            write_private(
                 &output_dir.join("server.key"),
                 certified.key_pair.serialize_pem().as_bytes(),
             )?;

@@ -253,7 +253,8 @@ pub(crate) fn record_stop(journal: &Journal, attempt: &str, reason: &str) -> Res
 }
 
 pub fn status(data_dir: &Path) -> Result<LocalStatus> {
-    let journal = Journal::open(data_dir.join("worker.sqlite"))?;
+    // Reading status must never create or migrate worker state.
+    let journal = Journal::open_read_only(data_dir.join("worker.sqlite"))?;
     let mut status: LocalStatus = journal
         .get_value("local_status")?
         .context("worker has not reported status")?;

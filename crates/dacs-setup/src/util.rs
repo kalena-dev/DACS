@@ -58,12 +58,13 @@ pub(crate) fn reject_links(path: &Path) -> Result<()> {
         }
         match fs::symlink_metadata(&walked) {
             Ok(meta) => {
-                let mut link = meta.file_type().is_symlink();
                 #[cfg(windows)]
-                {
+                let link = {
                     use std::os::windows::fs::MetadataExt;
-                    link |= meta.file_attributes() & 0x400 != 0;
-                }
+                    meta.file_type().is_symlink() || meta.file_attributes() & 0x400 != 0
+                };
+                #[cfg(not(windows))]
+                let link = meta.file_type().is_symlink() && !root_controlled_link(&walked, &meta);
                 if link {
                     return Err(invalid(format!(
                         "Symlink/reparse path is not allowed: {}",
@@ -76,6 +77,25 @@ pub(crate) fn reject_links(path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A symlink that only root can change: the link and its parent directory are
+/// root-owned and the parent is not group/world writable. This admits OS
+/// layout links such as macOS `/var -> private/var` and `/tmp -> private/tmp`
+/// while still refusing links an unprivileged user could create or swap.
+#[cfg(not(windows))]
+fn root_controlled_link(link: &Path, meta: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Some(parent) = link.parent() else {
+        return false;
+    };
+    let Ok(parent_meta) = fs::symlink_metadata(parent) else {
+        return false;
+    };
+    meta.uid() == 0
+        && parent_meta.is_dir()
+        && parent_meta.uid() == 0
+        && parent_meta.mode() & 0o022 == 0
 }
 
 pub(crate) fn state_directory(path: &Path) -> Result<PathBuf> {
@@ -326,5 +346,28 @@ mod tests {
         atomic_json(&path, &serde_json::json!({"phase":"completed"})).unwrap();
         let observed: serde_json::Value = read_json(&path).unwrap();
         assert_eq!(observed["phase"], "completed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_created_symlinks_are_refused_even_inside_temp_dirs() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // The temp dir itself may sit under a root-controlled OS link
+        // (macOS /var -> private/var); only the user-created link is refused.
+        reject_links(root.path()).unwrap();
+        let err = reject_links(&link.join("state")).unwrap_err().to_string();
+        assert!(err.contains("Symlink/reparse path is not allowed"), "{err}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_root_owned_layout_links_are_accepted() {
+        // /tmp and /var are root-owned symlinks in the root-owned, non-writable `/`.
+        reject_links(Path::new("/tmp/dacs-state")).unwrap();
+        reject_links(Path::new("/var/folders")).unwrap();
     }
 }

@@ -57,6 +57,10 @@ struct LocalState {
     registration: Option<WorkerRegistration>,
     #[serde(default)]
     worker_config_file: Option<PathBuf>,
+    /// Development-only enrollment with a loopback coordinator that advertises no
+    /// network infrastructure: the device registers without network membership.
+    #[serde(default)]
+    local_only: bool,
 }
 
 pub(crate) fn router() -> Router<App> {
@@ -193,10 +197,32 @@ fn configure_worker(root: &FilePath, state: &mut LocalState, request: &Value) ->
         .device_token
         .as_ref()
         .ok_or_else(|| conflict("Device credential is unavailable"))?;
-    let contract = state
-        .contract
-        .as_ref()
-        .ok_or_else(|| conflict("Network contract is unavailable"))?;
+    let coordinator_url = if state.local_only {
+        // The inspected origin may be a bootstrap-only listener; the owner may name
+        // the loopback control origin instead. Never a non-loopback address here.
+        match request
+            .get("coordinator_url")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            Some(url) if is_loopback(url) => url.trim_end_matches('/').to_owned(),
+            Some(_) => {
+                return Err(invalid(
+                    "A local-only worker must use a loopback coordinator control origin",
+                ));
+            }
+            None => state.endpoint.clone(),
+        }
+    } else {
+        state
+            .contract
+            .as_ref()
+            .ok_or_else(|| conflict("Network contract is unavailable"))?
+            .coordinator
+            .overlay_url
+            .clone()
+    };
     let data_dir = fs::canonicalize(root)
         .map_err(storage_error)?
         .join("worker");
@@ -209,7 +235,7 @@ fn configure_worker(root: &FilePath, state: &mut LocalState, request: &Value) ->
         ));
     }
     let config = dacs_worker::runtime::WorkerConfig {
-        coordinator_url: contract.coordinator.overlay_url.clone(),
+        coordinator_url,
         credential_file: credential_file.clone(),
         worker_id: state
             .device_id
@@ -251,7 +277,8 @@ fn status(state: &LocalState) -> Value {
         "consent":state.consent,"consent_sent":state.consent_sent,"plan":state.plan,
         "setup_result":state.setup_result,"assessment":state.assessment,"assessment_id":state.assessment_id,
         "join_result":state.join_result,"join_started":state.join_started,
-        "network_state":state.network_state,"grant_ready":state.grant_ready,"blocker":state.blocker})
+        "network_state":state.network_state,"grant_ready":state.grant_ready,"blocker":state.blocker,
+        "local_only":state.local_only})
 }
 
 async fn page(State(app): State<App>, headers: HeaderMap) -> WebResult<Response> {
@@ -397,6 +424,18 @@ fn endpoint(value: &str) -> Result<url::Url> {
         ));
     }
     Ok(url)
+}
+
+fn is_loopback(endpoint_url: &str) -> bool {
+    endpoint(endpoint_url).is_ok_and(|url| {
+        url.host_str().is_some_and(|host| {
+            host == "localhost"
+                || host
+                    .trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        })
+    })
 }
 
 fn client(state: &LocalState) -> Result<reqwest::Client> {
@@ -744,6 +783,14 @@ async fn operate(
             *state = inspected;
         }
         state.review = uuid::Uuid::new_v4().to_string();
+        if state.contract.is_none() && is_loopback(&state.endpoint) {
+            if !state.registration_started {
+                state.local_only = true;
+            }
+            if state.local_only {
+                return Ok(());
+            }
+        }
         if state.contract.is_none() {
             return Err(conflict(
                 "Invitation inspected, but network infrastructure/disclosure is unavailable. Configure the coordinator bridge and inspect again before registration",
@@ -836,6 +883,19 @@ async fn operate(
         return Ok(());
     }
     let http = client(state)?;
+    if state.local_only && matches!(operation, "consent" | "assess" | "join") {
+        return Err(conflict(
+            "This PC is enrolled local-only with a loopback development coordinator; network consent, assessment and join do not apply",
+        ));
+    }
+    if state.local_only && operation == "refresh" {
+        // Approval is observable as access to the device's coordinator state.
+        let approved = remote::<Value>(&http, state, reqwest::Method::GET, "/api/state", None, true)
+            .await
+            .is_ok();
+        state.network_state = Some(json!({"local_only":true,"approved":approved}));
+        return Ok(());
+    }
     if operation == "register" {
         if state.registration_started {
             return Err(conflict(
@@ -855,13 +915,19 @@ async fn operate(
                 "Invitation or requirements changed; inspect and review again",
             ));
         }
-        current_contract(&http, state).await?;
+        if !state.local_only {
+            current_contract(&http, state).await?;
+        }
         let registration: WorkerRegistration =
             serde_json::from_value(json_input(request, "registration")?)
                 .map_err(|_| invalid("Invalid typed worker registration"))?;
         validate_registration(&registration, reviewed)?;
         // Validate all network consent fields before an irreversible enrollment.
-        let mut consent = network_consent(state, request, String::new())?;
+        let consent = if state.local_only {
+            None
+        } else {
+            Some(network_consent(state, request, String::new())?)
+        };
         let payload = json!({"invitation_token":reviewed.token,"registration":registration});
         state.registration_started = true;
         if let Err(error) = save(root, state) {
@@ -899,6 +965,10 @@ async fn operate(
         state.device_token = Some(enrollment.device_token);
         state.device_id = Some(enrollment.worker.id.clone());
         state.registration = Some(enrollment.worker.registration);
+        let Some(mut consent) = consent else {
+            save(root, state)?;
+            return Ok(());
+        };
         consent.device_id = DeviceId(enrollment.worker.id);
         state.consent = Some(consent);
         save(root, state)?;
@@ -1141,6 +1211,56 @@ mod tests {
         assert!(!rendered.contains("private-device-token"));
         assert!(!rendered.contains("private-invite-token"));
         assert!(rendered.contains("credential_saved"));
+    }
+
+    #[test]
+    fn local_only_worker_config_targets_a_loopback_coordinator_only() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = LocalState {
+            endpoint: "http://127.0.0.1:7447".into(),
+            local_only: true,
+            device_token: Some("device-token".into()),
+            device_id: Some("worker-1".into()),
+            registration: Some(WorkerRegistration {
+                name: "w".into(),
+                physical_host_id: "h".into(),
+                os: "macos".into(),
+                architecture: "arm64".into(),
+                capabilities: vec![],
+                capacity: Default::default(),
+                omp_version: "18.16.0".into(),
+                policy_revision: 1,
+                owner_consented: true,
+                consent_host: "c".into(),
+            }),
+            ..Default::default()
+        };
+        let request = |url: Option<&str>| {
+            let mut value = json!({"omp_executable":"/bin/sh","worker_config_approved":"on"});
+            if let Some(url) = url {
+                value["coordinator_url"] = json!(url);
+            }
+            value
+        };
+        let url = |state: &LocalState| {
+            let config: Value =
+                serde_json::from_slice(&fs::read(state.worker_config_file.as_ref().unwrap()).unwrap())
+                    .unwrap();
+            config["coordinator_url"].as_str().unwrap().to_owned()
+        };
+        configure_worker(root.path(), &mut state, &request(None)).unwrap();
+        assert_eq!(url(&state), "http://127.0.0.1:7447");
+        fs::remove_file(state.worker_config_file.take().unwrap()).unwrap();
+        fs::remove_file(root.path().join("worker").join("device.token")).ok();
+        configure_worker(root.path(), &mut state, &request(Some("https://localhost:7443/"))).unwrap();
+        assert_eq!(url(&state), "https://localhost:7443");
+        let err = configure_worker(root.path(), &mut state, &request(Some("https://coordinator.example.test")))
+            .unwrap_err();
+        assert!(err.message.contains("loopback"), "{}", err.message);
+        // Without local-only mode a worker still needs the reviewed network contract.
+        state.local_only = false;
+        assert!(configure_worker(root.path(), &mut state, &request(None)).is_err());
+        assert!(is_loopback("http://[::1]:7447") && !is_loopback("https://192.0.2.1"));
     }
 
     #[test]
