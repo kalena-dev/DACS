@@ -42,7 +42,7 @@ client verifies Headscale and DERP certificates. `curl --cacert` verifies netadm
 | 7 | Enrollment requesting role `infra` | PASS: `403 forbidden` |
 | 8 | `join` with consent lacking `tailnet_switch` | PASS: refused (exit 1); still `Running` on the personal server; key unused |
 | 9 | `join` with `tailnet_switch.previous_control_url` for a different server | PASS: refused; still on the personal server |
-| 10 | `join` with explicit switch consent | **First run FAILED**: stuck in `Starting`, `login` timed out (bug B). PASS after the fix: joined in seconds, `displaced_control_url: https://hs.personal.test:8444`, `tailscale switch --list` keeps the personal profile |
+| 10 | `join` with explicit switch consent | **First run FAILED**: stuck in `Starting`, `login` timed out (bug B). PASS on the rerun: joined in seconds, `displaced_control_url: https://hs.personal.test:8444`, `tailscale switch --list` keeps the personal profile. The stall did **not** recur on the rerun (tailscaled log, 15:07:14 local: home DERP `derp-0` → `derp-999`, then `Running`), so the new nudge was not exercised against a live stall |
 | 11 | Membership query by `auth_key_id` | PASS: `joined`, node 7, online, DACS tags |
 | 12 | `GET /v1/compiler-endpoints` | PASS: scheduler `100.64.0.5:10600`, server `100.64.0.5:10501` (overlay only) |
 | 13 | `dacs-net compiler-check` from the coordinator (stand-in listeners bound to the guest overlay IP) | PASS: both reachable, `overlay_private: true`, path `direct 10.99.0.12:41641` |
@@ -51,8 +51,8 @@ client verifies Headscale and DERP certificates. `curl --cacert` verifies netadm
 | 16 | Direct path transfer: `ping` + 64 MiB to `:10501` + `peers`/`traffic` | PASS: `direct`, 0.4 ms, 64 MiB in 0.17 s, peer tx delta 72,137,832 B |
 | 17 | Relayed path: direct UDP between the two namespaces dropped (STUN/DERP to infra allowed) | PASS: `ping` path `derp` region `dacs`, 1.2 ms. 64 MiB in 25.7 s (≈2.5 MiB/s through a single-process socat TLS front), tx delta 72,492,496 B. `compiler-check` ok on `derp` |
 | 18 | UDP unblocked | PASS: path back to `direct` (0.1 ms) |
-| 19 | Revocation by node id (coordinator → netadmin) | PASS: `node_deleted: 7`, `verified_absent: true`; membership `revoked`; guest `NeedsLogin`; compiler endpoints unreachable from the coordinator |
-| 20 | Reconnect attempt: guest tailscaled restarted with its old state | PASS (stays out): `logged_out`; not on the DACS network |
+| 19 | Revocation by node id (coordinator → netadmin) | PASS: `node_deleted: 7`, `verified_absent: true`; membership `revoked`. The guest still reported `logged_in` / `NeedsLogin` on the DACS control URL; compiler endpoints were unreachable from the coordinator |
+| 20 | Reconnect attempt: guest tailscaled restarted with its old state | PASS (stays out): after the restart the client reads `logged_out`; not on the DACS network |
 | 21 | Fresh approved enrollment and rejoin | PASS: new key id 9, joined as a **new node with a new overlay IP `100.64.0.6`**. `compiler-check` on the new endpoints passes (`direct`) |
 | 22 | Secrets in logs | PASS: no `hskey-auth-` string and no operation token in the netadmin audit log or any harness log. The audit log has 6 entries (enroll/revoke) |
 
@@ -68,11 +68,13 @@ the parsed self and peer IPs.
 **B. Join stalled after switching from another control server** (`dacs-netclient/src/lib.rs`).
 Tailscale 1.104.7 kept the previous network's home DERP region (998), which is absent from the DACS DERP
 map. The log showed `[unexpected] magicsock: derpMap.Regions[998] is nil` and `no-derp-connection`, and the
-client stayed in `Starting` until `login --timeout` expired. A real personal tailnet uses Tailscale's
-public DERP regions, so the same mismatch is expected there. A manual `tailscale debug restun` switched the
-home region to 999 and reached `Running` within a second. `join` now nudges a client stuck in `Starting` on
-the DACS control URL with a best-effort `debug restun` every 5 s while `login` runs. Success is still judged
-by the existing `Running` + overlay-IP check.
+client stayed in `Starting` until `login --timeout` expired. Inference, not verified: a real personal
+tailnet uses Tailscale's public DERP regions, which are also absent from the DACS map, so the same stall
+could occur there. A manual `tailscale debug restun` switched the home region to 999 and reached `Running`
+within a second. `join` now nudges a client stuck in `Starting` on the DACS control URL with a best-effort
+`debug restun` every 5 s while `login` runs. Success is still judged by the existing `Running` + overlay-IP
+check. The nudge itself is **unverified**: the stall did not reproduce on the rerun (row 10), and only the
+manual `restun` was observed to clear it.
 
 ## Constraints for other owners
 
@@ -85,7 +87,8 @@ by the existing `Running` + overlay-IP check.
   build (`dacs-net ping` / `compiler-check` / `peers` + `traffic`). Do not promise relay throughput.
 - **Person 1:** `dacs-net join` accepts MagicDNS by default. Before the switch, `assess` returns the exact
   switch disclosure and `previous_control_url` for the setup UI's consent. A consent naming a different
-  previous server is refused. Revocation returns the device to `logged_out`. Rejoining needs a new approved
+  previous server is refused. Right after revocation the client still shows `logged_in` / `NeedsLogin` on
+  the DACS URL; after a tailscaled restart it reads `logged_out`. Rejoining needs a new approved
   grant, and when the active profile is the revoked DACS one it requires no switch consent.
 - **Harness note:** in network namespaces, give each namespace its own `/etc/netns/<ns>/resolv.conf`.
   Otherwise a tailscaled with accept-dns rewrites the distro-wide `/etc/resolv.conf` (seen in this run;
