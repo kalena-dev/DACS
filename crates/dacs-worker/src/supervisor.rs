@@ -186,7 +186,7 @@ impl Supervisor {
             #[cfg(unix)]
             {
                 if leader.is_none() {
-                    verify_leaderless_group(pid, &receipt)?;
+                    verify_leaderless_group(pid, &receipt).await?;
                 }
                 terminate_group(pid).await?;
             }
@@ -329,19 +329,8 @@ impl Supervisor {
                     entry.exit = Some(status);
                 }
                 #[cfg(unix)]
-                {
-                    use nix::{sys::signal::killpg, unistd::Pid};
-                    let deadline = tokio::time::Instant::now() + grace;
-                    loop {
-                        match killpg(Pid::from_raw(entry.pid as i32), None) {
-                            Err(nix::errno::Errno::ESRCH) => break,
-                            Err(error) => return Err(error.into()),
-                            Ok(()) if tokio::time::Instant::now() < deadline => {
-                                tokio::time::sleep(Duration::from_millis(25)).await
-                            }
-                            Ok(()) => return Ok(false),
-                        }
-                    }
+                if !group_gone(entry.pid, grace).await? {
+                    return Ok(false);
                 }
                 entry.reconciled = true;
                 self.clear_receipt(id)?;
@@ -492,7 +481,7 @@ fn launch_time_bound() -> Option<u64> {
 /// leader. Anything else stays unreconciled (receipt kept) instead of being
 /// killed: DACS never signals processes it cannot attribute to its own launch.
 #[cfg(unix)]
-fn verify_leaderless_group(group: u32, receipt: &ProcessReceipt) -> Result<()> {
+async fn verify_leaderless_group(group: u32, receipt: &ProcessReceipt) -> Result<()> {
     use nix::{
         errno::Errno,
         sys::signal::killpg,
@@ -502,6 +491,12 @@ fn verify_leaderless_group(group: u32, receipt: &ProcessReceipt) -> Result<()> {
     match killpg(Pid::from_raw(raw), None) {
         Err(Errno::ESRCH) => return Ok(()),
         Ok(()) => (),
+        // Only exiting members remain (see group_gone); give them a moment.
+        Err(Errno::EPERM) => {
+            if group_gone(group, Duration::from_secs(1)).await? {
+                return Ok(());
+            }
+        }
         Err(error) => bail!("prior process group {group} cannot be inspected: {error}"),
     }
     let unreconciled = |why: String| {
@@ -524,9 +519,14 @@ fn verify_leaderless_group(group: u32, receipt: &ProcessReceipt) -> Result<()> {
         if getpgid(Some(Pid::from_raw(member))).ok() != Some(Pid::from_raw(raw)) {
             continue;
         }
+        let member_session = match getsid(Some(Pid::from_raw(member))) {
+            Ok(session) => session,
+            Err(Errno::ESRCH) => continue, // exited since enumeration
+            Err(error) => {
+                return Err(unreconciled(format!("session of member {member}: {error}")));
+            }
+        };
         members += 1;
-        let member_session = getsid(Some(Pid::from_raw(member)))
-            .map_err(|error| unreconciled(format!("session of member {member}: {error}")))?;
         if u32::try_from(member_session.as_raw()).ok() != Some(session) {
             return Err(unreconciled(format!(
                 "member {member} is in session {member_session}, not recorded session {session}"
@@ -556,18 +556,35 @@ async fn terminate_group(leader: u32) -> Result<()> {
     };
     let group = Pid::from_raw(i32::try_from(leader).context("invalid process group")?);
     match killpg(group, Signal::SIGKILL) {
-        Ok(()) | Err(Errno::ESRCH) => (),
+        // EPERM: only exiting members remain (or one we may not signal);
+        // either way absence is decided by group_gone below.
+        Ok(()) | Err(Errno::ESRCH) | Err(Errno::EPERM) => (),
         Err(error) => bail!("prior process group cannot be signalled: {error}"),
     }
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    anyhow::ensure!(
+        group_gone(leader, Duration::from_secs(10)).await?,
+        "prior process group has not terminated"
+    );
+    Ok(())
+}
+
+/// Wait until no member of the process group remains. Only ESRCH proves
+/// absence. macOS answers EPERM while the remaining members are exiting
+/// (zombies awaiting reaping), and also for a member the worker may not
+/// signal, so EPERM is polled like a live member. False at the deadline.
+#[cfg(unix)]
+async fn group_gone(group: u32, grace: Duration) -> Result<bool> {
+    use nix::{errno::Errno, sys::signal::killpg, unistd::Pid};
+    let group = Pid::from_raw(i32::try_from(group).context("invalid process group")?);
+    let deadline = tokio::time::Instant::now() + grace;
     loop {
         match killpg(group, None) {
-            Err(Errno::ESRCH) => return Ok(()),
-            Ok(()) if tokio::time::Instant::now() < deadline => {
+            Err(Errno::ESRCH) => return Ok(true),
+            Ok(()) | Err(Errno::EPERM) if tokio::time::Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(25)).await
             }
-            Ok(()) => bail!("prior process group has not terminated"),
-            Err(error) => bail!("prior process group cannot be inspected: {error}"),
+            Ok(()) | Err(Errno::EPERM) => return Ok(false),
+            Err(error) => return Err(error.into()),
         }
     }
 }
@@ -575,6 +592,30 @@ async fn terminate_group(leader: u32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A group whose only member is an unreaped zombie answers EPERM on macOS
+    /// (ESRCH elsewhere once reaped). Termination must keep polling until the
+    /// kernel reports absence instead of failing the stop.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exiting_group_members_are_polled_until_absent() {
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let group = child.id();
+        tokio::time::sleep(Duration::from_millis(200)).await; // now a zombie
+        assert!(!group_gone(group, Duration::from_millis(100)).await.unwrap());
+        let reaper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            child.wait().unwrap()
+        });
+        terminate_group(group).await.unwrap();
+        assert!(reaper.join().unwrap().success());
+        assert!(group_gone(group, Duration::ZERO).await.unwrap());
+    }
     use tokio::io::AsyncReadExt;
 
     fn descriptor(directory: &Path, script: &str) -> ManagedChild {
