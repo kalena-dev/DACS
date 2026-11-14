@@ -51,7 +51,10 @@ async fn lost_create_reply_is_502_and_a_retry_issues_a_fresh_key() {
     assert_eq!(s, StatusCode::BAD_GATEWAY, "{body}");
     assert_eq!(api_error(&body).code, "headscale_unavailable");
     assert!(!body.contains("auth_key"), "no grant in an unknown outcome");
-    assert!(!audit_ops(&h).contains(&"enroll".to_owned()), "unknown issuance audited as issued");
+    assert!(
+        !audit_ops(&h).contains(&"enroll".to_owned()),
+        "unknown issuance audited as issued"
+    );
 
     // The key was created upstream; nobody received its secret. It is single
     // use, tagged and dies at the requested TTL.
@@ -68,10 +71,17 @@ async fn lost_create_reply_is_502_and_a_retry_issues_a_fresh_key() {
     assert_ne!(g.auth_key.expose(), orphan.secret);
     assert_eq!(audit_ops(&h), vec!["enroll"]);
     let (_, body) = h
-        .membership(&membership_query("dev-alice-pc", "alice-pc", Some(g.auth_key_id), None))
+        .membership(&membership_query(
+            "dev-alice-pc",
+            "alice-pc",
+            Some(g.auth_key_id),
+            None,
+        ))
         .await;
     let m: NetworkMembership = serde_json::from_str(&body).unwrap();
-    assert!(matches!(m.state, MembershipState::KeyIssued { auth_key_id, .. } if auth_key_id == g.auth_key_id));
+    assert!(
+        matches!(m.state, MembershipState::KeyIssued { auth_key_id, .. } if auth_key_id == g.auth_key_id)
+    );
 }
 
 #[tokio::test]
@@ -85,7 +95,10 @@ async fn create_and_list_failures_before_applying_issue_nothing() {
     assert_eq!(s, StatusCode::BAD_GATEWAY);
     assert!(h.hs.lock().keys.is_empty());
     assert_eq!(
-        h.hs.requests().iter().filter(|r| r.op == Some(Op::CreateKey)).count(),
+        h.hs.requests()
+            .iter()
+            .filter(|r| r.op == Some(Op::CreateKey))
+            .count(),
         1,
         "a failed host-name check must stop before creating a key"
     );
@@ -103,18 +116,31 @@ async fn lost_expire_reply_is_not_success_and_retry_reports_the_expired_key() {
     h.hs.fault(Op::ExpireKey, Fault::ApplyThenDrop);
     let (s, body) = h.revoke(&req).await;
     assert_eq!(s, StatusCode::BAD_GATEWAY, "{body}");
-    assert!(!key_usable(&h, g.auth_key_id), "the expiry did apply upstream");
-    assert!(!audit_ops(&h).contains(&"revoke".to_owned()), "unknown revocation audited");
+    assert!(
+        !key_usable(&h, g.auth_key_id),
+        "the expiry did apply upstream"
+    );
+    assert!(
+        !audit_ops(&h).contains(&"revoke".to_owned()),
+        "unknown revocation audited"
+    );
 
     h.hs.clear_requests();
     let out = {
         let (s, body) = h.revoke(&req).await;
         outcome(s, &body)
     };
-    assert!(out.key_expired, "retry must report the key as expired: {out:?}");
+    assert!(
+        out.key_expired,
+        "retry must report the key as expired: {out:?}"
+    );
     assert_eq!(out.node_deleted, None);
     assert!(out.verified_absent, "{out:?}");
-    assert!(h.hs.mutations().is_empty(), "retry re-applied: {:?}", h.hs.mutations());
+    assert!(
+        h.hs.mutations().is_empty(),
+        "retry re-applied: {:?}",
+        h.hs.mutations()
+    );
 }
 
 #[tokio::test]
@@ -127,8 +153,14 @@ async fn expire_that_did_not_apply_is_never_verified() {
     h.hs.fault(Op::ExpireKey, Fault::NoopOk);
     let (s, body) = h.revoke(&req).await;
     let out = outcome(s, &body);
-    assert!(key_usable(&h, g.auth_key_id), "the mock really kept the key live");
-    assert!(!out.verified_absent, "a still-usable key was reported revoked: {out:?}");
+    assert!(
+        key_usable(&h, g.auth_key_id),
+        "the mock really kept the key live"
+    );
+    assert!(
+        !out.verified_absent,
+        "a still-usable key was reported revoked: {out:?}"
+    );
     assert!(!out.key_expired, "{out:?}");
 
     // A retry against a working Headscale completes it.
@@ -152,11 +184,19 @@ async fn lost_delete_reply_is_not_success_and_retry_verifies_absence() {
 
     let (s, body) = h.revoke(&req).await;
     let out = outcome(s, &body);
-    assert_eq!(out.node_deleted, None, "already gone, not deleted by this call");
+    assert_eq!(
+        out.node_deleted, None,
+        "already gone, not deleted by this call"
+    );
     assert!(!out.key_expired, "a used key needs no expiry");
     assert!(out.verified_absent, "{out:?}");
     let (_, body) = h
-        .membership(&membership_query("dev-alice-pc", "alice-pc", Some(g.auth_key_id), Some(node)))
+        .membership(&membership_query(
+            "dev-alice-pc",
+            "alice-pc",
+            Some(g.auth_key_id),
+            Some(node),
+        ))
         .await;
     let m: NetworkMembership = serde_json::from_str(&body).unwrap();
     assert!(matches!(m.state, MembershipState::Revoked { .. }), "{m:?}");
@@ -167,7 +207,10 @@ async fn failed_delete_is_not_success_and_retry_deletes() {
     let h = Harness::start().await;
     let (g, node) = joined(&h, "alice-pc", "100.64.0.5").await;
     let req = revocation("dev-alice-pc", Some(g.auth_key_id), Some(node));
-    h.hs.fault(Op::DeleteNode, Fault::Status(500, "database is locked".into()));
+    h.hs.fault(
+        Op::DeleteNode,
+        Fault::Status(500, "database is locked".into()),
+    );
     let (s, _) = h.revoke(&req).await;
     assert_eq!(s, StatusCode::BAD_GATEWAY);
     assert!(h.hs.node(node).is_some());
@@ -186,7 +229,10 @@ async fn delete_that_did_not_apply_is_never_verified() {
     let (s, body) = h.revoke(&req).await;
     let out = outcome(s, &body);
     assert!(h.hs.node(node).is_some());
-    assert!(!out.verified_absent, "a remaining node was reported absent: {out:?}");
+    assert!(
+        !out.verified_absent,
+        "a remaining node was reported absent: {out:?}"
+    );
     let (s, body) = h.revoke(&req).await;
     assert!(outcome(s, &body).verified_absent);
     assert!(h.hs.node(node).is_none());
@@ -223,7 +269,10 @@ async fn device_joining_during_revocation_is_not_verified_absent() {
     );
     let (s, body) = h.revoke(&req).await;
     let out = outcome(s, &body);
-    assert!(!out.verified_absent, "a node that joined mid-revocation was missed: {out:?}");
+    assert!(
+        !out.verified_absent,
+        "a node that joined mid-revocation was missed: {out:?}"
+    );
     assert_eq!(h.hs.lock().nodes.len(), 1);
 
     let (s, body) = h.revoke(&req).await;
@@ -264,11 +313,19 @@ async fn revocation_is_idempotent() {
         let out = outcome(s, &body);
         assert_eq!(
             (out.key_expired, out.node_deleted, out.verified_absent),
-            (first_unused.key_expired, first_unused.node_deleted, first_unused.verified_absent),
+            (
+                first_unused.key_expired,
+                first_unused.node_deleted,
+                first_unused.verified_absent
+            ),
             "repeat differs from first outcome"
         );
     }
-    assert!(h.hs.mutations().is_empty(), "repeats mutated Headscale: {:?}", h.hs.mutations());
+    assert!(
+        h.hs.mutations().is_empty(),
+        "repeats mutated Headscale: {:?}",
+        h.hs.mutations()
+    );
 }
 
 // ---- mismatched node/key pairs ------------------------------------------------
@@ -282,11 +339,23 @@ async fn mismatched_node_and_key_pairs_are_refused_before_any_mutation() {
     h.hs.clear_requests();
 
     let pairs = [
-        ("alice node + bob key", Some(bob.auth_key_id), Some(alice_node)),
-        ("alice node + carol unused key", Some(carol.auth_key_id), Some(alice_node)),
+        (
+            "alice node + bob key",
+            Some(bob.auth_key_id),
+            Some(alice_node),
+        ),
+        (
+            "alice node + carol unused key",
+            Some(carol.auth_key_id),
+            Some(alice_node),
+        ),
         ("unknown node + bob key", Some(bob.auth_key_id), Some(9999)),
         ("alice node + unknown key", Some(9999), Some(alice_node)),
-        ("bob node + alice key", Some(alice.auth_key_id), Some(bob_node)),
+        (
+            "bob node + alice key",
+            Some(alice.auth_key_id),
+            Some(bob_node),
+        ),
     ];
     for (what, key, node) in pairs {
         let (s, body) = h.revoke(&revocation("dev-x", key, node)).await;
@@ -299,7 +368,11 @@ async fn mismatched_node_and_key_pairs_are_refused_before_any_mutation() {
     }
     assert!(h.hs.mutations().is_empty(), "{:?}", h.hs.mutations());
     assert!(h.hs.node(alice_node).is_some() && h.hs.node(bob_node).is_some());
-    assert_eq!(h.hs.node(alice_node).unwrap().given_name, "alice-pc", "renamed");
+    assert_eq!(
+        h.hs.node(alice_node).unwrap().given_name,
+        "alice-pc",
+        "renamed"
+    );
     assert!(key_usable(&h, carol.auth_key_id), "carol's key was expired");
     assert!(!audit_ops(&h).contains(&"revoke".to_owned()));
 }

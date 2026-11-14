@@ -67,7 +67,11 @@ fn is_dacs_tagset(tags: &[String]) -> bool {
 
 /// Why a freshly created key must not be handed out, if it must not. The
 /// grant reports the requested tags and expiry, so the key must match them.
-fn unusable_key(key: &PreAuthKey, tags: &[String], expires_at: OffsetDateTime) -> Option<&'static str> {
+fn unusable_key(
+    key: &PreAuthKey,
+    tags: &[String],
+    expires_at: OffsetDateTime,
+) -> Option<&'static str> {
     let mut got = key.acl_tags.clone();
     got.sort();
     got.dedup();

@@ -21,7 +21,9 @@ const PROTECTED: &[(&str, &str)] = &[
 fn valid_body(path: &str) -> Option<Value> {
     match path {
         "/v1/enrollments" => Some(enrollment_request("alice-pc", &["worker"])),
-        "/v1/memberships/query" => Some(membership_query("dev-alice-pc", "alice-pc", Some(1), None)),
+        "/v1/memberships/query" => {
+            Some(membership_query("dev-alice-pc", "alice-pc", Some(1), None))
+        }
         "/v1/revocations" => Some(revocation("dev-alice-pc", Some(1), None)),
         _ => None,
     }
@@ -37,19 +39,21 @@ async fn every_operation_route_rejects_missing_or_wrong_tokens_without_touching_
         Some("Bearer".into()),
         Some("Bearer ".into()),
         Some("Bearer    ".into()),
-        Some(TOKEN.into()),                           // no scheme
-        Some(format!("Basic {TOKEN}")),               // wrong scheme
-        Some(format!("Token {TOKEN}")),               // wrong scheme
+        Some(TOKEN.into()),             // no scheme
+        Some(format!("Basic {TOKEN}")), // wrong scheme
+        Some(format!("Token {TOKEN}")), // wrong scheme
         Some("Bearer wrong-token".into()),
-        Some(format!("Bearer {TOKEN}x")),             // suffix
+        Some(format!("Bearer {TOKEN}x")), // suffix
         Some(format!("Bearer {}", &TOKEN[..TOKEN.len() - 1])), // prefix
-        Some(format!("Bearer {token_hash_hex}")),     // the stored hash is not a token
-        Some(format!("Bearer {}", h.hs.api_key)),     // Headscale's key is not an operation token
+        Some(format!("Bearer {token_hash_hex}")), // the stored hash is not a token
+        Some(format!("Bearer {}", h.hs.api_key)), // Headscale's key is not an operation token
         Some(format!("Bearer {TOKEN},Bearer {TOKEN}")),
     ];
     for (method, path) in PROTECTED {
         for auth in &bad_headers {
-            let (status, body) = h.call(method, path, auth.as_deref(), valid_body(path)).await;
+            let (status, body) = h
+                .call(method, path, auth.as_deref(), valid_body(path))
+                .await;
             assert_eq!(
                 status,
                 StatusCode::UNAUTHORIZED,
@@ -65,7 +69,10 @@ async fn every_operation_route_rejects_missing_or_wrong_tokens_without_touching_
         "rejected callers reached Headscale: {:?}",
         h.hs.requests()
     );
-    assert!(h.audit().is_empty(), "rejected callers produced audit records");
+    assert!(
+        h.audit().is_empty(),
+        "rejected callers produced audit records"
+    );
 }
 
 #[tokio::test]
@@ -82,7 +89,11 @@ async fn missing_and_invalid_tokens_have_distinct_documented_messages() {
 #[tokio::test]
 async fn token_is_checked_before_the_body_is_parsed() {
     let h = Harness::start().await;
-    for path in ["/v1/enrollments", "/v1/memberships/query", "/v1/revocations"] {
+    for path in [
+        "/v1/enrollments",
+        "/v1/memberships/query",
+        "/v1/revocations",
+    ] {
         // Malformed JSON, wrong schema and a missing content type: an
         // unauthenticated caller must get 401, not a schema-revealing 4xx.
         for (ct, body) in [
@@ -96,8 +107,14 @@ async fn token_is_checked_before_the_body_is_parsed() {
                 b = b.header("content-type", ct);
             }
             let req = b.body(axum::body::Body::from(body)).unwrap();
-            let resp = tower::ServiceExt::oneshot(h.app.clone(), req).await.unwrap();
-            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{path} {ct:?} {body}");
+            let resp = tower::ServiceExt::oneshot(h.app.clone(), req)
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} {ct:?} {body}"
+            );
         }
     }
     assert!(h.hs.requests().is_empty());
@@ -109,7 +126,10 @@ async fn valid_token_is_accepted_on_every_route() {
     let (s, body) = h.op("GET", "/v1/contract", None).await;
     assert_eq!(s, StatusCode::OK, "{body}");
     let contract: Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(contract["contract_revision"], dacs_net_contract::CONTRACT_REVISION);
+    assert_eq!(
+        contract["contract_revision"],
+        dacs_net_contract::CONTRACT_REVISION
+    );
     assert_eq!(contract["key_ttl_minutes"], 15);
     // The contract projection never carries Headscale credentials.
     assert_no_secrets(&body, &h.hs.secrets(), "contract");
@@ -143,7 +163,11 @@ async fn health_is_public_but_reveals_no_upstream_detail() {
 #[tokio::test]
 async fn infra_role_is_refused_with_403_even_with_a_valid_token() {
     let h = Harness::start().await;
-    for roles in [vec!["infra"], vec!["worker", "infra"], vec!["infra", "coordinator"]] {
+    for roles in [
+        vec!["infra"],
+        vec!["worker", "infra"],
+        vec!["infra", "coordinator"],
+    ] {
         let (s, body) = h.enroll(&enrollment_request("edge-1", &roles)).await;
         assert_eq!(s, StatusCode::FORBIDDEN, "{roles:?}: {body}");
         assert_eq!(api_error(&body).code, "forbidden");
@@ -159,7 +183,11 @@ async fn infra_role_is_refused_with_403_even_with_a_valid_token() {
 #[tokio::test]
 async fn infra_and_personal_nodes_and_keys_cannot_be_queried_or_revoked() {
     let h = Harness::start().await;
-    let infra = h.hs.add_foreign_node("headscale-infra", &["tag:dacs-infra"], Some(&["tag:dacs-infra"]));
+    let infra = h.hs.add_foreign_node(
+        "headscale-infra",
+        &["tag:dacs-infra"],
+        Some(&["tag:dacs-infra"]),
+    );
     let mixed = h.hs.add_foreign_node(
         "mixed",
         &["tag:dacs-worker", "tag:dacs-infra"],
@@ -193,7 +221,10 @@ async fn infra_and_personal_nodes_and_keys_cannot_be_queried_or_revoked() {
     assert_eq!(h.hs.lock().nodes.len(), before_nodes);
     for key in [infra_key, untagged_key] {
         let k = h.hs.key(key).unwrap();
-        assert!(k.expiration > Some(time::OffsetDateTime::now_utc()), "key {key} was expired");
+        assert!(
+            k.expiration > Some(time::OffsetDateTime::now_utc()),
+            "key {key} was expired"
+        );
     }
     // Status listings only show DACS-enrollable nodes.
     let (_, body) = h.op("GET", "/v1/nodes", None).await;
@@ -230,23 +261,41 @@ fn load(v: &Value) -> Result<Config, String> {
 #[test]
 fn plaintext_listener_is_refused_unless_loopback_and_explicitly_allowed() {
     // TLS configured: any address is fine.
-    for listen in ["100.64.0.1:9443", "0.0.0.0:9443", "127.0.0.1:9443", "[::1]:9443"] {
+    for listen in [
+        "100.64.0.1:9443",
+        "0.0.0.0:9443",
+        "127.0.0.1:9443",
+        "[::1]:9443",
+    ] {
         assert!(load(&config_json(listen, true, None)).is_ok(), "{listen}");
     }
     // No TLS, no explicit opt-in: refused everywhere, loopback included.
-    for listen in ["100.64.0.1:9443", "0.0.0.0:9443", "127.0.0.1:9443", "[::1]:9443"] {
+    for listen in [
+        "100.64.0.1:9443",
+        "0.0.0.0:9443",
+        "127.0.0.1:9443",
+        "[::1]:9443",
+    ] {
         for allow in [None, Some(false)] {
             let err = load(&config_json(listen, false, allow)).unwrap_err();
             assert!(err.contains("tls is required"), "{listen} {allow:?}: {err}");
         }
     }
     // Opt-in only works on a loopback address, never a routable or wildcard one.
-    for listen in ["100.64.0.1:9443", "0.0.0.0:9443", "[::]:9443", "192.168.1.5:9443"] {
+    for listen in [
+        "100.64.0.1:9443",
+        "0.0.0.0:9443",
+        "[::]:9443",
+        "192.168.1.5:9443",
+    ] {
         let err = load(&config_json(listen, false, Some(true))).unwrap_err();
         assert!(err.contains("tls is required"), "{listen}: {err}");
     }
     for listen in ["127.0.0.1:9443", "[::1]:9443"] {
-        assert!(load(&config_json(listen, false, Some(true))).is_ok(), "{listen}");
+        assert!(
+            load(&config_json(listen, false, Some(true))).is_ok(),
+            "{listen}"
+        );
     }
 }
 
@@ -301,9 +350,18 @@ fn login_server_and_coordinator_urls_must_be_https() {
 fn secret_files_must_be_private_and_nonempty() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
-    let cfg_path = write_config(dir.path(), "127.0.0.1:9443", "http://127.0.0.1:8080", "hskey-api-secret", json!({"allow_plaintext_loopback": true}));
+    let cfg_path = write_config(
+        dir.path(),
+        "127.0.0.1:9443",
+        "http://127.0.0.1:8080",
+        "hskey-api-secret",
+        json!({"allow_plaintext_loopback": true}),
+    );
     let cfg = Config::load(&cfg_path).unwrap();
-    assert_eq!(cfg.headscale_api_key().unwrap().expose(), "hskey-api-secret");
+    assert_eq!(
+        cfg.headscale_api_key().unwrap().expose(),
+        "hskey-api-secret"
+    );
     assert_eq!(cfg.token_hashes().unwrap(), vec![hash_token(TOKEN)]);
 
     for (file, mode) in [
@@ -331,8 +389,14 @@ fn secret_files_must_be_private_and_nonempty() {
     write_private(&dir.path().join("operation-tokens.sha256"), "not-hex\n");
     assert!(cfg.token_hashes().is_err(), "malformed token hash accepted");
     // A plaintext token in the hash file is refused (it is not a 64-hex hash).
-    write_private(&dir.path().join("operation-tokens.sha256"), &format!("{TOKEN}\n"));
-    assert!(cfg.token_hashes().is_err(), "plaintext token accepted as a hash");
+    write_private(
+        &dir.path().join("operation-tokens.sha256"),
+        &format!("{TOKEN}\n"),
+    );
+    assert!(
+        cfg.token_hashes().is_err(),
+        "plaintext token accepted as a hash"
+    );
 }
 
 #[tokio::test]
@@ -344,7 +408,11 @@ async fn any_configured_token_hash_is_accepted_for_rotation() {
     use std::sync::Arc;
 
     let hs = MockHeadscale::start().await;
-    let client = HeadscaleClient::new(&hs.url(), dacs_net_contract::Secret::new(hs.api_key.clone())).unwrap();
+    let client = HeadscaleClient::new(
+        &hs.url(),
+        dacs_net_contract::Secret::new(hs.api_key.clone()),
+    )
+    .unwrap();
     let app = router(Arc::new(AppState {
         service: Service::new(client, settings(), Audit::disabled()),
         token_hashes: vec![hash_token("old-token"), hash_token("new-token")],

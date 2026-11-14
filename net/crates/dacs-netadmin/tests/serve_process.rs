@@ -82,7 +82,10 @@ fn tls_files(dir: &std::path::Path) -> (String, Value) {
     let key_path = dir.join("key.pem");
     std::fs::write(&cert_path, &cert_pem).unwrap();
     write_private(&key_path, &key_pair.serialize_pem());
-    (cert_pem, json!({"cert_path": cert_path, "key_path": key_path}))
+    (
+        cert_pem,
+        json!({"cert_path": cert_path, "key_path": key_path}),
+    )
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -133,7 +136,11 @@ async fn serves_only_tls_checks_tokens_and_logs_no_secrets() {
         .get(format!("http://127.0.0.1:{port}/v1/health"))
         .send()
         .await;
-    assert!(r.is_err(), "plaintext request was answered: {:?}", r.map(|r| r.status()));
+    assert!(
+        r.is_err(),
+        "plaintext request was answered: {:?}",
+        r.map(|r| r.status())
+    );
     // A client that does not trust the certificate refuses the connection.
     let r = plain.get(format!("{base}/v1/health")).send().await;
     assert!(r.is_err(), "untrusted certificate accepted");
@@ -147,7 +154,10 @@ async fn serves_only_tls_checks_tokens_and_logs_no_secrets() {
         b.send()
     };
     assert_eq!(get(None).await.unwrap().status(), 401);
-    assert_eq!(get(Some("Bearer wrong".into())).await.unwrap().status(), 401);
+    assert_eq!(
+        get(Some("Bearer wrong".into())).await.unwrap().status(),
+        401
+    );
     let ok = get(Some(format!("Bearer {TOKEN}"))).await.unwrap();
     assert_eq!(ok.status(), 200);
     assert_eq!(ok.text().await.unwrap(), "[]");
@@ -180,7 +190,10 @@ async fn serves_only_tls_checks_tokens_and_logs_no_secrets() {
     let logs = format!("{out}\n{err}");
     assert!(logs.contains("dacs-netadmin serving"), "{logs}");
     assert!(logs.contains("tls=true"), "{logs}");
-    assert!(logs.contains("headscale operation failed"), "upstream failure was logged");
+    assert!(
+        logs.contains("headscale operation failed"),
+        "upstream failure was logged"
+    );
     let mut secrets = hs.secrets();
     secrets.push(TOKEN.into());
     assert!(secrets.contains(&grant.auth_key.expose().to_owned()));
@@ -196,8 +209,14 @@ async fn refuses_to_start_without_tls_on_a_routable_address() {
     let dir = tempfile::tempdir().unwrap();
     let port = free_port();
     for (listen, extra) in [
-        (format!("0.0.0.0:{port}"), json!({"allow_plaintext_loopback": true})),
-        (format!("100.64.0.1:{port}"), json!({"allow_plaintext_loopback": true})),
+        (
+            format!("0.0.0.0:{port}"),
+            json!({"allow_plaintext_loopback": true}),
+        ),
+        (
+            format!("100.64.0.1:{port}"),
+            json!({"allow_plaintext_loopback": true}),
+        ),
         (format!("127.0.0.1:{port}"), json!({})),
     ] {
         let cfg = write_config(dir.path(), &listen, &hs.url(), &hs.api_key, extra);
@@ -213,7 +232,10 @@ async fn refuses_to_start_without_tls_on_a_routable_address() {
         std::net::TcpStream::connect(("127.0.0.1", port)).is_err(),
         "something is listening on the refused port"
     );
-    assert!(hs.requests().is_empty(), "a refused config reached Headscale");
+    assert!(
+        hs.requests().is_empty(),
+        "a refused config reached Headscale"
+    );
 }
 
 #[cfg(unix)]
@@ -258,7 +280,11 @@ async fn issue_writes_a_private_grant_and_prints_no_secret() {
         json!({"allow_plaintext_loopback": true}),
     );
     let req = dir.path().join("request.json");
-    std::fs::write(&req, enrollment_request("coordinator", &["coordinator", "worker"]).to_string()).unwrap();
+    std::fs::write(
+        &req,
+        enrollment_request("coordinator", &["coordinator", "worker"]).to_string(),
+    )
+    .unwrap();
     let out_path = dir.path().join("grant.json");
     let args = |out: &std::path::Path| {
         vec![
@@ -279,13 +305,20 @@ async fn issue_writes_a_private_grant_and_prints_no_secret() {
     // Logs share stdout; the summary is the one JSON line.
     let printed: Value = out
         .lines()
-        .find_map(|l| serde_json::from_str::<Value>(l).ok().filter(|v| v.get("auth_key_id").is_some()))
+        .find_map(|l| {
+            serde_json::from_str::<Value>(l)
+                .ok()
+                .filter(|v| v.get("auth_key_id").is_some())
+        })
         .unwrap_or_else(|| panic!("no summary line in:\n{out}"));
     assert!(printed.get("auth_key").is_none(), "summary prints the key");
     let grant: EnrollmentGrant =
         serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
     assert_eq!(printed["auth_key_id"], grant.auth_key_id);
-    assert_eq!(hs.key(grant.auth_key_id).unwrap().secret, grant.auth_key.expose());
+    assert_eq!(
+        hs.key(grant.auth_key_id).unwrap().secret,
+        grant.auth_key.expose()
+    );
     let mode = std::fs::metadata(&out_path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "grant file mode {mode:o}");
     let mut secrets = hs.secrets();
@@ -298,7 +331,11 @@ async fn issue_writes_a_private_grant_and_prints_no_secret() {
         .finish(false)
         .await;
     assert!(!ok, "overwrote an existing grant file");
-    assert_no_secrets(&format!("{out}\n{err}"), &hs.secrets(), "issue failure output");
+    assert_no_secrets(
+        &format!("{out}\n{err}"),
+        &hs.secrets(),
+        "issue failure output",
+    );
     assert_eq!(
         hs.lock().keys.len(),
         keys_before,
