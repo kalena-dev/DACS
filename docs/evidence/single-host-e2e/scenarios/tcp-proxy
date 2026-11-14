@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""Loopback TCP forwarder used by the DACS failure scenarios to cut one worker
+off from the coordinator (network partition fault injection).
+
+    tcp-proxy <listen port> <target port>
+
+Both ends are 127.0.0.1 and both ports must be within 27500-27599. Bytes are
+relayed unchanged (TLS passes through end to end; the proxy holds no keys).
+Killing the process drops every relayed connection, which is the partition;
+starting it again heals it.
+"""
+
+import socket
+import sys
+import threading
+
+
+def pump(src, dst):
+    try:
+        while True:
+            data = src.recv(65536)
+            if not data:
+                break
+            dst.sendall(data)
+    except OSError:
+        pass
+    finally:
+        for s in (src, dst):
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+
+def main():
+    listen, target = int(sys.argv[1]), int(sys.argv[2])
+    for port in (listen, target):
+        if not 27500 <= port <= 27599:
+            sys.exit("ports must be within 27500-27599")
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", listen))
+    server.listen(64)
+    print("tcp-proxy 127.0.0.1:%d -> 127.0.0.1:%d" % (listen, target), flush=True)
+    while True:
+        client, _ = server.accept()
+        try:
+            upstream = socket.create_connection(("127.0.0.1", target), timeout=5)
+            upstream.settimeout(None)
+        except OSError:
+            client.close()
+            continue
+        threading.Thread(target=pump, args=(client, upstream), daemon=True).start()
+        threading.Thread(target=pump, args=(upstream, client), daemon=True).start()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,18 @@
+#!/bin/sh
+# FAULT INJECTION by docs/evidence/single-host-e2e/scenarios (not part of DACS).
+# Installed into the coordinator's <project>/disabled-hooks/ by the harness so
+# the real publication `git update-ref` pauses, or fails, on request.
+G="@GATES@"
+state="$1"
+cat >"$G/hook-refs-$state-$$"
+if { [ "$state" = prepared ] && [ -f "$G/hook-armed" ]; } ||
+   { [ "$state" = committed ] && [ -f "$G/hook-armed-committed" ]; }; then
+  echo "$$" >"$G/hook-entered-$state"
+  n=0
+  while [ ! -f "$G/hook-release" ] && [ "$n" -lt 3000 ]; do sleep 0.1; n=$((n + 1)); done
+  if [ "$state" = prepared ] && [ -f "$G/hook-abort" ]; then
+    echo aborted >"$G/hook-aborted"
+    exit 1
+  fi
+fi
+exit 0

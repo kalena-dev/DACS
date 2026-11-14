@@ -17,10 +17,27 @@ task instructions (which the worker places in the prompt):
 
   FAKE_OMP_EDIT_FILE=<relative path>      file to write in the isolated workspace
   FAKE_OMP_EDIT_TEXT=<one line>           exact content (a trailing newline is added)
-  FAKE_OMP_HOLD_MARKER=<absolute path>    first (non-restart) session only: write the
+  FAKE_OMP_HOLD_MARKER=<absolute path>    first (non-restart) session only, and only
+                                          while the marker does not exist yet: write the
                                           marker after editing and then hold, with a
                                           child process, until killed (crash drill)
-  FAKE_OMP_HOLD_MAX_SECONDS=<n>           safety bound for the hold (default 300)
+  FAKE_OMP_HOLD_MAX_SECONDS=<n>           safety bound for a hold or gate (default 300)
+
+Failure-scenario directives (docs/evidence/single-host-e2e/scenarios/):
+
+  FAKE_OMP_WAIT_FOR=<absolute path>       after editing, write <path>.waiting and wait
+                                          until <path> exists, then commit and submit
+  FAKE_OMP_COMMIT_TAG_GENERATION=1        put the DACS generation in the commit subject
+                                          so replacement attempts get distinct SHAs
+  FAKE_OMP_COST_CAP=1                     after editing, end the turn with a cost-cap
+                                          prompt_result (code cost_cap). FAKE: no
+                                          provider exists and nothing was spent
+  FAKE_OMP_DELEGATE_SPEC=<one-line JSON>  parent mode: call dacs_delegate once with this
+                                          TaskSpec (never again once the coordinator
+                                          lists a pending child or the session records
+                                          it), yield, and on a durable mailbox message
+                                          reporting the child `accepted` write
+                                          EDIT_FILE/EDIT_TEXT, commit and submit
 
 The worker's startup "provider-readiness turn" is answered locally with a
 completed prompt_result. That is NOT provider evidence; it only lets the
@@ -30,6 +47,7 @@ control plane treat this host as agent-ready.
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -68,6 +86,8 @@ class Rpc:
         self.prompts = queue.Queue()
         self.holding = threading.Event()
         self.closed_stdout = False
+        self.directives = {}
+        self.generation = None
 
     def trace(self, direction, payload):
         if not self.trace_path:
@@ -188,71 +208,184 @@ def git(*args, check=True):
     return out.stdout.decode(errors="replace").strip()
 
 
+def write_json(path, value):
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(value, f, sort_keys=True)
+    os.replace(path + ".tmp", path)
+
+
+def session_file(opts, name):
+    # The worker passes the same --session-dir to a resumed attempt, so these
+    # files survive a worker restart exactly like an OMP session transcript.
+    return os.path.join(opts["session_dir"] or os.getcwd(), name)
+
+
+def generation_of(message):
+    match = re.search(r"DACS managed assignment \S+ generation (\d+)", message)
+    return int(match.group(1)) if match else None
+
+
+def edit_and_submit(rpc, d, restart, opts, generation):
+    """Write the deterministic edit, optionally hold/wait/cap, then commit and submit.
+    Returns "cost_capped" when the turn already ended with a cost-cap prompt_result."""
+    path = d.get("EDIT_FILE", "FAKE_OMP_PROOF.txt")
+    if os.path.isabs(path) or ".." in path.split("/"):
+        raise RuntimeError("edit path must stay inside the workspace")
+    text = d.get("EDIT_TEXT", "edited by the DACS fake OMP stand-in") + "\n"
+    head = git("rev-parse", "HEAD")
+    dirty = git("status", "--porcelain")
+    existing = None
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            existing = f.read()
+    if existing == text:
+        rpc.log("edit already present in the workspace (not repeated)", file=path,
+                head=head, dirty=bool(dirty))
+    else:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        rpc.log("deterministic edit written", file=path)
+    marker = d.get("HOLD_MARKER")
+    if marker and not restart and not os.path.exists(marker):
+        hold = int(d.get("HOLD_MAX_SECONDS", "300"))
+        child = subprocess.Popen(["sleep", str(hold)])
+        rpc.holding.set()
+        write_json(marker, {"fake_omp_pid": os.getpid(), "fake_omp_pgid": os.getpgid(0),
+                            "child_pid": child.pid, "workspace": os.getcwd(),
+                            "uncommitted_edit": path, "generation": generation})
+        rpc.log("holding with an uncommitted edit until killed (crash drill)",
+                marker=marker, child_pid=child.pid, max_seconds=hold)
+        child.wait()
+        rpc.log("hold bound elapsed without being killed; refusing to continue")
+        os._exit(3)
+    gate = d.get("WAIT_FOR")
+    if gate and not os.path.exists(gate):
+        bound = time.time() + int(d.get("HOLD_MAX_SECONDS", "300"))
+        write_json(gate + ".waiting", {"fake_omp_pid": os.getpid(), "fake_omp_pgid": os.getpgid(0),
+                                       "workspace": os.getcwd(), "uncommitted_edit": path,
+                                       "generation": generation})
+        rpc.log("waiting for harness gate before commit/submit", gate=gate)
+        while not os.path.exists(gate):
+            if time.time() > bound:
+                rpc.log("gate never released; refusing to continue")
+                os._exit(3)
+            time.sleep(0.2)
+        rpc.log("harness gate released", gate=gate, stdin_closed=rpc.eof.is_set())
+    if d.get("COST_CAP") == "1":
+        # The frame shape follows the real-OMP adapter contract test
+        # (crates/dacs-worker/tests/omp_real.rs owner_cost_cap_is_reported_distinctly).
+        # No provider exists here and no money was spent: this is a FAKE cap report.
+        rpc.log("reporting a FAKE cost cap (no provider, no spend); edit left uncommitted")
+        rpc.emit({"type": "notice", "source": "cost-gate", "fake_omp": True,
+                  "message": "FAKE stand-in cost gate (no provider spend)"})
+        return "cost_capped"
+    if git("status", "--porcelain"):
+        git("add", "--", path)
+        subject = "fake-omp: write %s" % path
+        if d.get("COMMIT_TAG_GENERATION") == "1" and generation is not None:
+            subject += " (generation %d)" % generation
+        git("commit", "-q", "-m", subject)
+        rpc.log("committed", head=git("rev-parse", "HEAD"))
+    sha = git("rev-parse", "HEAD")
+    shown = subprocess.run(["git", "show", "HEAD:" + path], stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE)
+    passed = shown.returncode == 0 and shown.stdout.decode() == text
+    evidence = [{"name": "fake-omp content check",
+                 "command": "git show HEAD:%s == FAKE_OMP_EDIT_TEXT" % path,
+                 "source_sha": sha, "passed": passed, "artifact_digest": None}]
+    submit_err, submitted = rpc.call_tool("dacs_submit", {"evidence": evidence,
+                                                          "unresolved": []})
+    rpc.log("dacs_submit answered", is_error=submit_err, result=submitted[:2000],
+            candidate_sha=sha, check_passed=passed)
+    return "submitted"
+
+
+def delegate_once(rpc, d, pending, opts):
+    """Parent mode: delegate the child TaskSpec once, then yield and wait for mail."""
+    record = session_file(opts, "fake-omp-delegation.json")
+    children = pending.get("pending_children") or []
+    if os.path.exists(record) or children:
+        rpc.log("delegation already durable; not repeated; waiting for the mailbox",
+                pending_children=children, local_record=os.path.exists(record))
+        return
+    spec = json.loads(d["DELEGATE_SPEC"])
+    is_error, result = rpc.call_tool("dacs_delegate", {"spec": spec})
+    write_json(record, {"is_error": is_error, "result": result[:4000]})
+    rpc.log("dacs_delegate answered", is_error=is_error, result=result[:2000])
+    rpc.log("yielding the turn; parent obligation now waits for child_result mail")
+
+
+def end_turn(rpc, prompt_id, outcome):
+    rpc.emit({"type": "agent_end"})
+    if outcome == "cost_capped":
+        rpc.emit({"type": "prompt_result", "id": prompt_id, "status": "error",
+                  "error": {"code": "cost_cap", "retryable": False,
+                            "message": "Cost cap reached (FAKE OMP stand-in: no provider, no spend)"},
+                  "sessionSettled": True})
+    else:
+        rpc.emit({"type": "prompt_result", "id": prompt_id, "status": "completed",
+                  "sessionSettled": True})
+
+
 def agent_turn(rpc, frame, opts):
     message = frame.get("message", "")
     prompt_id = frame.get("id")
     restart = "This is a restart." in message
     d = directives(message)
+    rpc.directives = d
+    rpc.generation = generation_of(message)
     rpc.log("assignment prompt received", restart=restart, directives=sorted(d.keys()),
-            cwd=os.getcwd())
+            cwd=os.getcwd(), generation=rpc.generation)
+    outcome = None
     try:
-        pending_err, pending = rpc.call_tool("dacs_pending", {})
-        rpc.log("dacs_pending answered", is_error=pending_err, result=pending[:2000])
-        path = d.get("EDIT_FILE", "FAKE_OMP_PROOF.txt")
-        if os.path.isabs(path) or ".." in path.split("/"):
-            raise RuntimeError("edit path must stay inside the workspace")
-        text = d.get("EDIT_TEXT", "edited by the DACS fake OMP stand-in") + "\n"
-        head = git("rev-parse", "HEAD")
-        dirty = git("status", "--porcelain")
-        existing = None
-        if os.path.exists(path):
-            with open(path, encoding="utf-8") as f:
-                existing = f.read()
-        if existing == text:
-            rpc.log("edit already present in the workspace (not repeated)", file=path,
-                    head=head, dirty=bool(dirty))
+        pending_err, pending_text = rpc.call_tool("dacs_pending", {})
+        rpc.log("dacs_pending answered", is_error=pending_err, result=pending_text[:2000])
+        if d.get("DELEGATE_SPEC"):
+            pending = {}
+            if not pending_err:
+                try:
+                    pending = json.loads(pending_text)
+                except ValueError:
+                    pending = {}
+            delegate_once(rpc, d, pending, opts)
         else:
-            parent = os.path.dirname(path)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(text)
-            rpc.log("deterministic edit written", file=path)
-        marker = d.get("HOLD_MARKER")
-        if marker and not restart:
-            hold = int(d.get("HOLD_MAX_SECONDS", "300"))
-            child = subprocess.Popen(["sleep", str(hold)])
-            rpc.holding.set()
-            with open(marker + ".tmp", "w", encoding="utf-8") as f:
-                json.dump({"fake_omp_pid": os.getpid(), "fake_omp_pgid": os.getpgid(0),
-                           "child_pid": child.pid, "workspace": os.getcwd(),
-                           "uncommitted_edit": path}, f)
-            os.replace(marker + ".tmp", marker)
-            rpc.log("holding with an uncommitted edit until killed (crash drill)",
-                    marker=marker, child_pid=child.pid, max_seconds=hold)
-            child.wait()
-            rpc.log("hold bound elapsed without being killed; refusing to continue")
-            os._exit(3)
-        if git("status", "--porcelain"):
-            git("add", "--", path)
-            git("commit", "-q", "-m", "fake-omp: write %s" % path)
-            rpc.log("committed", head=git("rev-parse", "HEAD"))
-        sha = git("rev-parse", "HEAD")
-        shown = subprocess.run(["git", "show", "HEAD:" + path], stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE)
-        passed = shown.returncode == 0 and shown.stdout.decode() == text
-        evidence = [{"name": "fake-omp content check",
-                     "command": "git show HEAD:%s == FAKE_OMP_EDIT_TEXT" % path,
-                     "source_sha": sha, "passed": passed, "artifact_digest": None}]
-        submit_err, submitted = rpc.call_tool("dacs_submit", {"evidence": evidence,
-                                                              "unresolved": []})
-        rpc.log("dacs_submit answered", is_error=submit_err, result=submitted[:2000],
-                candidate_sha=sha, check_passed=passed)
+            outcome = edit_and_submit(rpc, d, restart, opts, rpc.generation)
     except Exception as exc:  # a completed turn without submission; DACS must not accept it
         rpc.log("agent turn failed: %s" % exc)
-    rpc.emit({"type": "agent_end"})
-    rpc.emit({"type": "prompt_result", "id": prompt_id, "status": "completed",
-              "sessionSettled": True})
+    end_turn(rpc, prompt_id, outcome)
+
+
+def mailbox_turn(rpc, frame, opts):
+    """Parent mode: a child_result in the durable mailbox wakes the parent."""
+    message = frame.get("message", "")
+    prompt_id = frame.get("id")
+    payload = {}
+    if "): " in message:
+        try:
+            payload = json.loads(message.split("): ", 1)[1])
+        except ValueError:
+            payload = {}
+    rpc.log("durable mailbox message received", payload=payload, message=message[:2000])
+    outcome = None
+    try:
+        done = session_file(opts, "fake-omp-parent-submitted.json")
+        if payload.get("state") != "accepted":
+            rpc.log("child did not finish accepted; parent does not submit")
+        elif os.path.exists(done):
+            rpc.log("parent already submitted after this child result (replayed mail); not repeated")
+        else:
+            pending_err, pending_text = rpc.call_tool("dacs_pending", {})
+            rpc.log("dacs_pending answered", is_error=pending_err, result=pending_text[:2000])
+            parent = dict(rpc.directives)
+            parent.pop("WAIT_FOR", None)
+            outcome = edit_and_submit(rpc, parent, False, opts, rpc.generation)
+            write_json(done, {"child": payload.get("task_id"), "outcome": outcome})
+    except Exception as exc:
+        rpc.log("mailbox turn failed: %s" % exc)
+    end_turn(rpc, prompt_id, outcome)
 
 
 def main():
@@ -281,16 +414,22 @@ def main():
         if frame is None:
             break
         message = frame.get("message", "")
+        turn = None
         if frame.get("streamingBehavior") == "followUp":
-            rpc.log("follow-up prompt received; nothing further to do", message=message[:2000])
-            rpc.emit({"type": "prompt_result", "id": frame.get("id"), "status": "completed",
-                      "sessionSettled": True})
+            if message.startswith("Durable DACS mailbox message") and rpc.directives.get("DELEGATE_SPEC"):
+                turn = mailbox_turn
+            else:
+                rpc.log("follow-up prompt received; nothing further to do", message=message[:2000])
+                rpc.emit({"type": "prompt_result", "id": frame.get("id"), "status": "completed",
+                          "sessionSettled": True})
         elif opts["no_tools"] or message.startswith("Provider readiness check only"):
             rpc.log("provider-readiness prompt answered LOCALLY; NOT provider evidence")
             rpc.emit({"type": "prompt_result", "id": frame.get("id"), "status": "completed",
                       "sessionSettled": True})
         else:
-            worker = threading.Thread(target=agent_turn, args=(rpc, frame, opts))
+            turn = agent_turn
+        if turn:
+            worker = threading.Thread(target=turn, args=(rpc, frame, opts))
             worker.start()
             # Keep serving later prompts only after this turn; mirrors one active turn.
             while worker.is_alive():
