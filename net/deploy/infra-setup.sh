@@ -356,17 +356,34 @@ install_headscale() {
     local pol="$WORK_DIR/policy.hujson"
     sed -e "s/HS_DOMAIN/${HS_DOMAIN}/g" "$DEPLOY_DIR/headscale/policy.hujson" >"$pol"
 
+    # Validate the rendered policy before installing it. By default
+    # `headscale policy check` is a gRPC call to a running headscale, which does
+    # not exist on a first install (the check then always failed) and is still
+    # on the previous config before the restart below. Check offline instead,
+    # against a throwaway config + database in $WORK_DIR (/var/lib/headscale is
+    # never touched; --force only answers the "is headscale running?" prompt
+    # for that private database).
+    if headscale policy check --help 2>/dev/null | grep -q -- '--bypass-grpc-and-access-database-directly'; then
+        local chk="$WORK_DIR/policy-check" out
+        install -d -m 0700 -- "$chk"
+        sed -e "s|/var/lib/headscale/|$chk/|g" -e "s|/var/run/headscale/|$chk/|g" \
+            -e "s|^\([[:space:]]*path:[[:space:]]*\)/etc/headscale/policy\.hujson[[:space:]]*\$|\1$pol|" \
+            "$cfg" >"$chk/config.yaml"
+        if ! out="$(headscale -c "$chk/config.yaml" --force policy check \
+            --bypass-grpc-and-access-database-directly --file "$pol" 2>&1)"; then
+            printf '%s\n' "$out" >&2
+            die "headscale rejected the rendered policy.hujson (nothing installed)"
+        fi
+        info "policy validated"
+    else
+        warn "this headscale cannot check a policy offline; policy.hujson not validated"
+    fi
+
     local changed=0 hs_group=root
     getent group headscale >/dev/null && hs_group=headscale
     install -d -m 0755 /etc/headscale
     if install_file "$cfg" /etc/headscale/config.yaml 0640 root "$hs_group"; then changed=1; fi
     if install_file "$pol" /etc/headscale/policy.hujson 0640 root "$hs_group"; then changed=1; fi
-
-    if headscale policy check --help >/dev/null 2>&1; then
-        headscale policy check --file /etc/headscale/policy.hujson >/dev/null ||
-            die "headscale rejected /etc/headscale/policy.hujson"
-        info "policy validated"
-    fi
 
     systemctl enable headscale >/dev/null 2>&1
     if ((changed)) || ! systemctl is-active --quiet headscale; then
