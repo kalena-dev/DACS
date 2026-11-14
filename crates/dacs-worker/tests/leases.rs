@@ -1628,18 +1628,215 @@ fn effectful_attempt_is_not_replayed_after_worker_restart() {
         1,
         "external-effect attempt was replayed automatically"
     );
-    let failed = f
-        .events(&attempt.id)
-        .into_iter()
-        .find(|r| r.command["event"]["type"] == "failed")
-        .expect("explicit failure report");
+    let events = f.events(&attempt.id);
+    // Uncertain external effects are never settled as a terminal failure.
     assert!(
-        failed.command["event"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("automatic replay is forbidden")
+        events
+            .iter()
+            .all(|r| r.command["event"]["type"] != "failed"),
+        "crash report made the effectful attempt terminal"
     );
-    assert!(failed.at <= release.at);
+    let interrupted = events
+        .iter()
+        .find(|r| {
+            r.command["event"]["type"] == "progress"
+                && r.command["event"]["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("automatic replay is forbidden"))
+        })
+        .expect("explicit interruption report");
+    assert!(interrupted.at <= release.at);
+
+    // The worker's actual post-crash reports, replayed into the real
+    // coordinator state machine, leave the attempt awaiting explicit
+    // abandonment (not terminal), with its stopped reservation released.
+    let reported: Vec<(u64, WorkerEvent)> = events
+        .iter()
+        .filter(|r| r.status == 200 && r.command["event"]["type"] != "started")
+        .map(|r| {
+            (
+                r.command["sequence"].as_u64().unwrap(),
+                serde_json::from_value(r.command["event"].clone()).unwrap(),
+            )
+        })
+        .collect();
+    assert!(
+        reported
+            .iter()
+            .any(|(_, event)| matches!(event, WorkerEvent::Stopped))
+    );
+    real_coordinator_awaits_abandonment(&f.config.registration, &reported);
+}
+
+/// Real `dacs_core::Store`: admit an external-effect attempt, report Started
+/// as the worker did before its crash, then the given post-crash events. The
+/// task must stay unfinished with its reservation released, and the operator's
+/// explicit AbandonAttempt must be accepted.
+fn real_coordinator_awaits_abandonment(
+    registration: &WorkerRegistration,
+    reported: &[(u64, WorkerEvent)],
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let store = dacs_core::Store::open(
+        directory.path().join("coordinator.sqlite"),
+        "leases-administrator-token-with-32-bytes-or-more",
+    )
+    .unwrap();
+    let admin = Principal {
+        is_admin: true,
+        device_id: None,
+    };
+    let run = |principal: &Principal, command: Command| {
+        store
+            .execute(
+                principal,
+                CommandEnvelope {
+                    protocol_version: PROTOCOL_VERSION,
+                    command_id: uuid::Uuid::new_v4().to_string(),
+                    command,
+                },
+            )
+            .map(|response| response.result)
+    };
+    let project: Project = serde_json::from_value(
+        run(
+            &admin,
+            Command::CreateProject {
+                name: "leases".into(),
+                target_branch: "main".into(),
+                max_tasks: 10,
+                max_depth: 2,
+            },
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let invitation: Invitation = serde_json::from_value(
+        run(
+            &admin,
+            Command::CreateInvitation {
+                project_id: project.id.clone(),
+                host_name: registration.consent_host.clone(),
+                expires_in_seconds: 600,
+            },
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut registration = registration.clone();
+    registration.policy_revision = project.policy_revision;
+    let enrolled = store.enroll(&invitation.token, registration).unwrap();
+    run(
+        &admin,
+        Command::ApproveWorker {
+            worker_id: enrolled.worker.id.clone(),
+        },
+    )
+    .unwrap();
+    let device = store.authenticate(&enrolled.device_token).unwrap();
+    run(
+        &device,
+        Command::ReportRuntimeStatus {
+            status: WorkerRuntimeStatus {
+                worker_id: enrolled.worker.id.clone(),
+                provider_authenticated: Some(true),
+                network_ready: Some(true),
+                desktop_session: None,
+                desktop_active: false,
+                desktop_paused: false,
+                observed_at: now_s(),
+            },
+        },
+    )
+    .unwrap();
+    let task: TaskRecord = serde_json::from_value(
+        run(
+            &admin,
+            Command::CreateTask {
+                spec: TaskSpec {
+                    project_id: project.id.clone(),
+                    title: "external effect".into(),
+                    instructions: "host-level change".into(),
+                    source_commit: "1".repeat(40),
+                    execution: TaskExecution::Agent,
+                    dependencies: Vec::new(),
+                    required_capabilities: Vec::new(),
+                    resources: Resources {
+                        agent_slots: 1,
+                        cpu_millis: 500,
+                        memory_mb: 256,
+                        disk_mb: 256,
+                    },
+                    effect_class: EffectClass::External,
+                    lease_seconds: 300,
+                    max_runtime_seconds: 3600,
+                    contract_revision: project.contract_revision,
+                    policy_revision: project.policy_revision,
+                    max_retries: 2,
+                },
+            },
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let attempt: AttemptRecord = serde_json::from_value(
+        run(
+            &admin,
+            Command::AdmitTask {
+                task_id: task.id.clone(),
+                worker_id: Some(enrolled.worker.id.clone()),
+            },
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let report = |sequence: u64, event: WorkerEvent| {
+        run(
+            &device,
+            Command::ReportEvent {
+                attempt_id: attempt.id.clone(),
+                generation: attempt.generation,
+                sequence,
+                event,
+            },
+        )
+    };
+    report(1, WorkerEvent::Started).unwrap();
+    for (sequence, event) in reported {
+        report(*sequence, event.clone()).unwrap_or_else(|error| {
+            panic!("real coordinator refused {event:?} at {sequence}: {error}")
+        });
+    }
+    let snapshot = store.snapshot(&admin).unwrap();
+    let current = snapshot.tasks.iter().find(|t| t.id == task.id).unwrap();
+    assert_eq!(
+        current.state,
+        TaskState::Executing,
+        "crash report settled the effectful task: {current:?}"
+    );
+    assert_eq!(current.attempt_id.as_deref(), Some(attempt.id.as_str()));
+    let worker = snapshot
+        .workers
+        .iter()
+        .find(|w| w.id == enrolled.worker.id)
+        .unwrap();
+    assert_eq!(
+        worker.reserved,
+        Resources::default(),
+        "stopped attempt kept its reservation"
+    );
+    let abandoned: TaskRecord = serde_json::from_value(
+        run(
+            &admin,
+            Command::AbandonAttempt {
+                attempt_id: attempt.id.clone(),
+                reason: "operator inspected the interrupted external effects".into(),
+            },
+        )
+        .expect("explicit abandonment of the interrupted effectful attempt"),
+    )
+    .unwrap();
+    assert_eq!(abandoned.attempt_id, None);
 }
 
 // ---------------------------------------------------------------------------

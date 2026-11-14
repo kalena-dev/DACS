@@ -381,20 +381,21 @@ grep -q 'not repeated' "$RUN/evidence/task2-fake-omp-notes.jsonl" && grep -q 'op
   && gate passed "task2 resumed session: open_session + restart prompt, edit not repeated" "fake OMP trace (labelled stand-in)" \
   || gate failed "task2 resumed session trace" "see evidence/task2-fake-omp-notes.jsonl"
 
-# Drill B: external-effect attempt -> no automatic replay; explicit failure + stop.
+# Drill B: external-effect attempt -> no automatic replay; interrupted + stop, the
+# task stays unfinished until an explicit abandonment (never settled as failed).
 T3_TEXT="External-effect attempt interrupted by kill -9 (fake OMP stand-in)"
 crash_drill task3 external "$TASK2_INTEGRATED" external.txt "$T3_TEXT" no
 TASK3=$DRILL_TASK; ATTEMPT3=$DRILL_ATTEMPT
-wait_for 60 "task3 failure reconciled" "([.tasks[]|select(.id==\"$TASK3\")][0].state == \"failed\") and ([.attempts[]|select(.id==\"$ATTEMPT3\")][0].settled == true) and ([.workers[]|select(.id==\"$WORKER_ID\")][0].reserved.agent_slots == 0)" \
-  || gate failed "task3 external attempt failed + stopped" "$(jq -c "[.tasks[]|select(.id==\"$TASK3\")][0]" "$RUN/evidence/snapshot.json")"
+wait_for 60 "task3 interruption reconciled" "([.tasks[]|select(.id==\"$TASK3\")][0].state == \"executing\") and ([.attempts[]|select(.id==\"$ATTEMPT3\")][0].settled == true) and ([.workers[]|select(.id==\"$WORKER_ID\")][0].reserved.agent_slots == 0)" \
+  || gate failed "task3 external attempt interrupted + stopped, awaiting abandonment" "$(jq -c "[.tasks[]|select(.id==\"$TASK3\")][0]" "$RUN/evidence/snapshot.json")"
 attempt_events task3 "$ATTEMPT3"
-reason=$(jq -r '[.[]|select(.event.type=="failed")][0].event.message // ""' "$RUN/evidence/task3-worker-events.json")
+reason=$(jq -r '[.[]|select(.event.type=="progress" and (.event.message|test("automatic replay is forbidden")))][0].event.message // ""' "$RUN/evidence/task3-worker-events.json")
 cands3=$(jq "[.candidates[]|select(.submission.task_id==\"$TASK3\")]|length" "$RUN/evidence/snapshot.json")
 sessions3=$(grep -c 'assignment prompt received' "$RUN/evidence/task3-fake-omp-notes.jsonl" || true)
 git -C "$RUN/worker/workspaces/$ATTEMPT3" status --porcelain >"$RUN/evidence/task3-workspace-after-restart.txt"
 if [[ "$reason" == *"automatic replay is forbidden"* && "$cands3" == 0 && "$sessions3" == 1 \
       && "$(git --git-dir "$BARE" rev-parse refs/heads/main)" == "$TASK2_INTEGRATED" ]]; then
-  gate passed "task3 external attempt not replayed after crash" "task failed; events $(jq -c '[.[]|.event.type]' "$RUN/evidence/task3-worker-events.json"); OMP not relaunched; no candidate; main unchanged; workspace kept: $(tr '\n' ' ' <"$RUN/evidence/task3-workspace-after-restart.txt")"
+  gate passed "task3 external attempt not replayed after crash" "task awaits explicit abandonment; events $(jq -c '[.[]|.event.type]' "$RUN/evidence/task3-worker-events.json"); OMP not relaunched; no candidate; main unchanged; workspace kept: $(tr '\n' ' ' <"$RUN/evidence/task3-workspace-after-restart.txt")"
 else
   gate failed "task3 external attempt not replayed" "reason='$reason' candidates=$cands3 sessions=$sessions3"
 fi
