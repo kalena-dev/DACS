@@ -4,10 +4,12 @@ Machine A runs the coordinator. Machine B enrolls as a worker device. This uses 
 address with application TLS and device authentication (allowed for development by the general plan);
 it does **not** use the private overlay, which still needs public infrastructure.
 
-Verified on 2026-11-14 at `main` after merging through `894c14c`, on one Windows PC against its LAN
-address `172.30.80.30` (coordinator and "machine B" client as separate processes): steps 1-6 below.
-Step 7 (running the worker with OMP) was **not** run here; it needs the pinned OMP and a provider
-login on machine B. Replace `A_IP` with machine A's LAN address everywhere.
+Verified on 2026-11-14 on two physical Windows PCs on one phone hotspot: machine A (`GeorgePC`,
+coordinator) and machine B (`DESKTOP-DGIU5N0`, another person's PC, real OMP 18.20.0 with its own
+provider login). All steps below ran, including step 7: machine B's worker heartbeated to A,
+passed provider readiness, executed two agent tasks created on A in isolated workspaces, and both
+candidates were reviewed and published into A's repository (see "Two-PC run" at the end).
+Replace `A_IP` with machine A's LAN address everywhere.
 
 ## Both machines
 
@@ -44,8 +46,9 @@ instead of building also works if B has the MSVC runtime.
    # the result's "token" is the invitation token; give it to machine B privately
    ```
 
-   The dashboard does the same in a browser: open `https://A_IP:7443`, sign in with the contents of
-   `coord/admin.token`. The browser warns about the development certificate unless it is trusted.
+   The Manage page does the same in a browser: open `https://A_IP:7443/manage`, sign in with the
+   contents of `coord/admin.token`. The browser warns about the development certificate unless it is
+   trusted.
 
 ## Machine B: device
 
@@ -83,10 +86,10 @@ instead of building also works if B has the MSVC runtime.
    dacs snapshot --url https://A_IP:7443 --token-file device.token --ca server.pem
    ```
 
-7. Run the worker. **Not run in this verification.** A teammate's single-host run
-   (`docs/evidence/single-host-e2e.md`, macOS, fake OMP stand-in) used this configuration shape;
-   on machine B it needs the real installed OMP and a completed provider login. Write
-   `worker.json` (absolute paths; `registration` is the same object sent in step 6):
+7. Run the worker. It needs the real installed OMP and a completed provider login on machine B;
+   `omp_version` must equal what `omp --version` reports (for example `18.20.0`), and the same
+   value must be in the registration sent in step 6. Write `worker.json` (absolute paths;
+   `registration` is the same object sent in step 6):
 
    ```json
    {"coordinator_url":"https://A_IP:7443","credential_file":"/abs/device.token","worker_id":"WORKER_ID",
@@ -101,8 +104,8 @@ instead of building also works if B has the MSVC runtime.
    dacs worker status --data-dir /abs/b-state/worker
    ```
 
-   Machine A's dashboard then shows the worker's heartbeat and runtime status; create a task on the
-   project to see admission and execution.
+   Machine A's dashboard then shows the worker, its last contact and what it reports; create a task
+   on the Manage page to watch its assignment and the worker's replies in the dashboard conversation.
 
 
 ## What to show
@@ -119,3 +122,28 @@ instead of building also works if B has the MSVC runtime.
 - `crates/dacs-worker/tests/windows_workflow.rs` fails on a PC whose temp path is long (MSVC
   `LNK1181`, object paths past 260 characters) and passes with a short `TMP`/`TEMP` such as `C:\t`.
   If machine B's admitted Windows build fails at link time, set a short worker state directory.
+
+## Two-PC run (2026-11-14)
+
+Machine A `GeorgePC` at `172.20.10.2`, machine B `DESKTOP-DGIU5N0` at `172.20.10.7`, same hotspot.
+
+| Step | Result |
+|---|---|
+| B reaches A over TLS with only A's certificate | Pass (`/health` ready) |
+| B views the invitation | Pass, no side effects |
+| B enrolls | Pass, device pending; B's read of project state refused with 403 |
+| A approves; B reads project state with its own token | Pass |
+| B runs `dacs worker run` with real OMP | Pass: heartbeat seen on A within seconds, `provider_authenticated: true`, not draining |
+| Task 1 created and admitted on A, executed by the agent on B | Agent committed the file in an isolated workspace and called `dacs_submit`; **the submission was then never delivered** (defect below). After the turn was ended with the worker's emergency-cancel control, the staged submission was delivered and the candidate was reviewed and published on A |
+| Task 2 with the fixed worker | Pass with no intervention: admitted to submitted candidate in 21 s, reservation released at 24 s, reviewed and published on A |
+| After the tasks | B's worker idle, no leftover OMP processes; A's `refs/heads/main` holds both commits made on B |
+
+Defect found and fixed (`crates/dacs-worker/src/runtime.rs`): the worker sends a staged
+`SubmitCandidate` only after the OMP turn has ended, but the `dacs_submit` tool result said the
+submission was "not yet confirmed" and the task prompt said "yielding does not complete this
+attempt". A careful agent therefore kept its turn open, sleeping and polling `dacs_pending` for a
+confirmation that could only follow its own turn ending, until the task's maximum runtime. The
+tool result and the prompt now tell the agent to end its turn after `dacs_submit`.
+
+Not covered by this run: the private overlay (LAN addresses were used), a second physical worker,
+workflow/build tasks, desktop control, and anything on macOS or Linux.

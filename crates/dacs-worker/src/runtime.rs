@@ -1337,7 +1337,7 @@ async fn omp_session(
             rpc.request("open_session",json!({"sessionDir":state_dir.join("session")}),Duration::from_secs(60)).await?;
         }
         let (pending, restart) = if resumed { restored_obligations(coordinator, attempt).await? } else { (attempt.pending_children.clone(), String::new()) };
-        let prompt = format!("DACS managed assignment {} generation {}. Source {}. Contract {} policy {}.\n{}\n\nUse dacs_delegate/dacs_workflow for admitted remote or long-running work. Never native task/eval delegation or detached services. Local checks are ordinary reserved work. Commit changes and call dacs_submit with actual evidence; yielding does not complete this attempt. Pending durable children/jobs: {:?}. {}",task.id,attempt.generation,task.spec.source_commit,task.spec.contract_revision,task.spec.policy_revision,task.spec.instructions,pending,restart);
+        let prompt = format!("DACS managed assignment {} generation {}. Source {}. Contract {} policy {}.\n{}\n\nUse dacs_delegate/dacs_workflow for admitted remote or long-running work. Never native task/eval delegation or detached services. Local checks are ordinary reserved work. Commit changes and call dacs_submit with actual evidence, then end your turn: the staged submission is delivered to the coordinator only after the turn has ended, so do not wait, sleep or poll for its confirmation. Yielding without dacs_submit does not complete this attempt. Pending durable children/jobs: {:?}. {}",task.id,attempt.generation,task.spec.source_commit,task.spec.contract_revision,task.spec.policy_revision,task.spec.instructions,pending,restart);
         let prompt = if desktop { format!("{prompt}\nNative desktop is exclusively reserved for this attempt. Use computer.run for each multi-step workflow, first verify desktop.capabilities() is unlocked, awake and not secureInput, then acquire computer.control for foreground work and release in finally. Never continue after partial input failure without observing effects. Local owner pause cancels this session.") } else { prompt };
         rpc.request("prompt",json!({"message":prompt}),Duration::from_secs(60)).await?;
         let mut tick = tokio::time::interval(Duration::from_secs(2));
@@ -1470,6 +1470,11 @@ async fn omp_session(
     Ok((work, transport_closed || exited))
 }
 
+/// Tool result for `dacs_submit`. The attempt loop enqueues the staged
+/// `SubmitCandidate` only after the OMP turn has settled, so the agent must
+/// end its turn rather than wait for a confirmation.
+const SUBMISSION_STAGED: &str = "Submission staged durably. It is delivered to the coordinator only after this turn ends, so end your turn now: do not wait, sleep, poll dacs_pending or resubmit. If the coordinator refuses it, you will be prompted with the reason.";
+
 async fn host_call(
     coordinator: &Coordinator,
     supervisor: &Supervisor,
@@ -1556,7 +1561,7 @@ async fn host_call(
                     .get_value::<Command>(&format!("staged:{operation}"))?
                     .is_some()
                 {
-                    return Ok(json!({"pending":true,"operation_id":operation}));
+                    return Ok(json!({"pending":true,"operation_id":operation,"message":SUBMISSION_STAGED}));
                 }
             }
             // Submission intent and bytes can be durable while disconnected.
@@ -1602,6 +1607,10 @@ async fn host_call(
                 json!(Some(operation)),
             ),
         ])?;
+        // The staged command is enqueued only once the OMP turn settles (see
+        // the attempt loop). Saying "not yet confirmed" here made agents wait
+        // for a confirmation that can only follow their own turn ending.
+        return Ok(json!({"pending":true,"operation_id":operation,"message":SUBMISSION_STAGED}));
     } else {
         coordinator.enqueue(
             operation,
