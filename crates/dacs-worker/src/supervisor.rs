@@ -75,8 +75,9 @@ struct ProcessReceipt {
     /// live member shares it; older receipts without it are refused.
     #[serde(default)]
     session_id: Option<u32>,
-    /// Wall-clock seconds taken before spawn: a lower bound on the start time
-    /// of every descendant, even when the leader exits before it is observed.
+    /// Seconds taken before spawn, in the clock `sysinfo` reports start times
+    /// in (see `launch_time_bound`): a lower bound on the start time of every
+    /// descendant, even when the leader exits before it is observed.
     #[serde(default)]
     launched_at: Option<u64>,
 }
@@ -220,10 +221,7 @@ impl Supervisor {
             pid: None,
             start_time: None,
             session_id: None,
-            launched_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()
-                .map(|elapsed| elapsed.as_secs()),
+            launched_at: launch_time_bound(),
         };
         #[cfg(unix)]
         {
@@ -469,6 +467,26 @@ pub struct ReservationUsage {
     pub memory_bytes: u64,
 }
 
+/// Lower bound, taken before spawn, on the start time `sysinfo` will report for
+/// every process launched afterwards. On Linux that start time is `/proc/stat`
+/// `btime` plus whole seconds since boot, each truncated, so it trails the
+/// wall clock by up to a second; a wall-clock bound would make a child started
+/// in the same second look older than its launch. Reading the bound in the same
+/// boot-relative domain keeps it exact (`floor` of an earlier uptime).
+fn launch_time_bound() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        Some(sysinfo::System::boot_time().saturating_add(sysinfo::System::uptime()))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|elapsed| elapsed.as_secs())
+    }
+}
+
 /// A leaderless group is presumed to be the original tree only if every live
 /// member is in the recorded session and started no earlier than the recorded
 /// leader. Anything else stays unreconciled (receipt kept) instead of being
@@ -668,6 +686,33 @@ mod tests {
         );
         assert!(!receipts.join("probe.json").exists());
         assert!(supervisor.active_ids().await.is_empty());
+    }
+
+    /// Linux start times are truncated boot-relative seconds. A wall-clock bound
+    /// exceeded them for most children started in the same second, so restart
+    /// refused to reconcile DACS's own orphaned groups ("started before the
+    /// recorded leader").
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn launch_bound_never_exceeds_a_later_childs_reported_start_time() {
+        for _ in 0..50 {
+            let bound = launch_time_bound().unwrap();
+            let mut child = std::process::Command::new("/bin/sh")
+                .args(["-c", "sleep 30"])
+                .spawn()
+                .unwrap();
+            let pid = sysinfo::Pid::from_u32(child.id());
+            let mut system = sysinfo::System::new();
+            system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+            let started = system.process(pid).map(|process| process.start_time());
+            child.kill().unwrap();
+            child.wait().unwrap();
+            let started = started.expect("child visible to sysinfo");
+            assert!(
+                started >= bound,
+                "child start {started} precedes its launch bound {bound}"
+            );
+        }
     }
 
     #[tokio::test]
