@@ -1,0 +1,572 @@
+diff --git a/net/crates/dacs-netadmin/src/audit.rs b/net/crates/dacs-netadmin/src/audit.rs
+index 3bd952c..b7d4b11 100644
+--- a/net/crates/dacs-netadmin/src/audit.rs
++++ b/net/crates/dacs-netadmin/src/audit.rs
+@@ -33,8 +33,13 @@ impl Audit {
+         let line = serde_json::json!({ "at": at, "op": op, "detail": detail });
+         tracing::info!(target: "dacs_netadmin::audit", %line);
+         if let Some(file) = &self.file {
++            // The whole record goes out in one `write_all`: with the file in
++            // append mode a kill mid-record or the separate `issue` process
++            // cannot tear or interleave a line.
++            let mut record = line.to_string();
++            record.push('\n');
+             let mut f = file.lock().unwrap_or_else(|p| p.into_inner());
+-            if let Err(e) = writeln!(f, "{line}").and_then(|()| f.flush()) {
++            if let Err(e) = f.write_all(record.as_bytes()).and_then(|()| f.sync_data()) {
+                 tracing::error!(error = %e, "audit log write failed");
+             }
+         }
+diff --git a/net/crates/dacs-netadmin/src/http.rs b/net/crates/dacs-netadmin/src/http.rs
+index 9146ce5..2c5f84d 100644
+--- a/net/crates/dacs-netadmin/src/http.rs
++++ b/net/crates/dacs-netadmin/src/http.rs
+@@ -64,6 +64,28 @@ impl From<ServiceError> for Failure {
+     }
+ }
+ 
++/// Run a mutating service call in its own task. A client that disconnects
++/// (the coordinator gives up after 20 s) drops the handler future; the
++/// spawned task still runs to completion, so the Headscale mutation is always
++/// followed by its audit line.
++async fn detached<T, F>(op: F) -> Result<T, Failure>
++where
++    T: Send + 'static,
++    F: Future<Output = Result<T, ServiceError>> + Send + 'static,
++{
++    match tokio::spawn(op).await {
++        Ok(result) => Ok(result?),
++        Err(e) => {
++            tracing::error!(error = %e, "operation task did not complete");
++            Err(fail(
++                StatusCode::BAD_GATEWAY,
++                "headscale_unavailable",
++                "operation did not complete",
++            ))
++        }
++    }
++}
++
+ /// JSON body extractor whose rejections use the [`ApiError`] body.
+ pub struct ApiJson<T>(pub T);
+ 
+@@ -201,12 +223,12 @@ async fn contract<H: HeadscaleApi>(
+     }))
+ }
+ 
+-async fn enroll<H: HeadscaleApi>(
++async fn enroll<H: HeadscaleApi + 'static>(
+     State(st): State<Arc<AppState<H>>>,
+     ApiJson(req): ApiJson<EnrollmentRequest>,
+ ) -> Result<Json<EnrollmentGrant>, Failure> {
+     Ok(Json(
+-        st.service.enroll(&req, OffsetDateTime::now_utc()).await?,
++        detached(async move { st.service.enroll(&req, OffsetDateTime::now_utc()).await }).await?,
+     ))
+ }
+ 
+@@ -219,12 +241,12 @@ async fn membership<H: HeadscaleApi>(
+     ))
+ }
+ 
+-async fn revoke<H: HeadscaleApi>(
++async fn revoke<H: HeadscaleApi + 'static>(
+     State(st): State<Arc<AppState<H>>>,
+     ApiJson(req): ApiJson<RevocationRequest>,
+ ) -> Result<Json<RevocationOutcome>, Failure> {
+     Ok(Json(
+-        st.service.revoke(&req, OffsetDateTime::now_utc()).await?,
++        detached(async move { st.service.revoke(&req, OffsetDateTime::now_utc()).await }).await?,
+     ))
+ }
+ 
+diff --git a/net/crates/dacs-netadmin/src/main.rs b/net/crates/dacs-netadmin/src/main.rs
+index f288f66..931b033 100644
+--- a/net/crates/dacs-netadmin/src/main.rs
++++ b/net/crates/dacs-netadmin/src/main.rs
+@@ -89,8 +89,22 @@ async fn run(cli: Cli) -> anyhow_lite::Result<()> {
+             let svc = Service::new(client(&cfg)?, cfg.settings(), audit);
+             let req: dacs_net_contract::EnrollmentRequest =
+                 serde_json::from_str(&std::fs::read_to_string(&request)?)?;
+-            let grant = svc.enroll(&req, time::OffsetDateTime::now_utc()).await?;
+-            write_private(&out, &serde_json::to_vec_pretty(&grant)?)?;
++            // Claim the output file before any key exists: an unwritable or
++            // already existing `--out` must fail without creating a key.
++            let mut file = create_private(&out)?;
++            let grant = match svc.enroll(&req, time::OffsetDateTime::now_utc()).await {
++                Ok(grant) => grant,
++                Err(e) => {
++                    drop(file);
++                    let _ = std::fs::remove_file(&out);
++                    return Err(e.into());
++                }
++            };
++            {
++                use std::io::Write;
++                file.write_all(&serde_json::to_vec_pretty(&grant)?)?;
++                file.sync_all()?;
++            }
+             println!(
+                 "{}",
+                 serde_json::json!({
+@@ -149,7 +163,6 @@ async fn run(cli: Cli) -> anyhow_lite::Result<()> {
+                 tracing::warn!(error = %e, "headscale not healthy at startup; serving anyway");
+             }
+             let app = router(state);
+-            tracing::info!(listen = %cfg.listen, tls = cfg.tls.is_some(), "dacs-netadmin serving");
+             match &cfg.tls {
+                 Some(tls) => {
+                     let _ = rustls::crypto::ring::default_provider().install_default();
+@@ -158,12 +171,17 @@ async fn run(cli: Cli) -> anyhow_lite::Result<()> {
+                         &tls.key_path,
+                     )
+                     .await?;
+-                    axum_server::bind_rustls(cfg.listen, rustls_cfg)
++                    let listener = tokio::net::TcpListener::bind(cfg.listen)
++                        .await?
++                        .into_std()?;
++                    tracing::info!(listen = %cfg.listen, tls = true, "dacs-netadmin serving");
++                    axum_server::from_tcp_rustls(listener, rustls_cfg)
+                         .serve(app.into_make_service())
+                         .await?;
+                 }
+                 None => {
+                     let listener = tokio::net::TcpListener::bind(cfg.listen).await?;
++                    tracing::info!(listen = %cfg.listen, tls = false, "dacs-netadmin serving");
+                     axum::serve(listener, app).await?;
+                 }
+             }
+@@ -173,8 +191,7 @@ async fn run(cli: Cli) -> anyhow_lite::Result<()> {
+ }
+ 
+ /// Create `path` readable only by the owner (Unix); fail if it already exists.
+-fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+-    use std::io::Write;
++fn create_private(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+     let mut opts = std::fs::OpenOptions::new();
+     opts.write(true).create_new(true);
+     #[cfg(unix)]
+@@ -182,9 +199,7 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+         use std::os::unix::fs::OpenOptionsExt;
+         opts.mode(0o600);
+     }
+-    let mut f = opts.open(path)?;
+-    f.write_all(bytes)?;
+-    f.sync_all()
++    opts.open(path)
+ }
+ 
+ /// Boxed-error result without pulling in another crate.
+diff --git a/net/crates/dacs-netadmin/src/service.rs b/net/crates/dacs-netadmin/src/service.rs
+index fa122ec..4bbfc6b 100644
+--- a/net/crates/dacs-netadmin/src/service.rs
++++ b/net/crates/dacs-netadmin/src/service.rs
+@@ -80,6 +80,15 @@ fn node_name(node: &Node) -> &str {
+     }
+ }
+ 
++/// Coarse error class for audit lines; never includes the response body.
++fn error_class(e: &HeadscaleError) -> &'static str {
++    match e {
++        HeadscaleError::Transport(_) => "transport",
++        HeadscaleError::Status { .. } => "status",
++        HeadscaleError::Decode(_) => "decode",
++    }
++}
++
+ impl<H: HeadscaleApi> Service<H> {
+     pub fn new(hs: H, settings: Settings, audit: Audit) -> Self {
+         Self {
+@@ -122,18 +131,24 @@ impl<H: HeadscaleApi> Service<H> {
+         }
+ 
+         let expires_at = now + self.settings.key_ttl;
+-        let key = self.hs.create_tagged_key(&tags, expires_at).await?;
++        let key = match self.hs.create_tagged_key(&tags, expires_at).await {
++            Ok(key) => key,
++            Err(e) => {
++                self.audit_enroll_failure(req, &e, None);
++                return Err(e.into());
++            }
++        };
+         if key.key.is_empty() {
+-            return Err(ServiceError::Upstream(HeadscaleError::Decode(
+-                "pre-auth key returned without secret".into(),
+-            )));
++            let e = HeadscaleError::Decode("pre-auth key returned without secret".into());
++            self.audit_enroll_failure(req, &e, Some(key.id));
++            return Err(e.into());
+         }
+         if key.reusable || key.ephemeral {
+             // Never hand out a key that could enroll more than one device.
+             let _ = self.hs.expire_key(key.id).await;
+-            return Err(ServiceError::Upstream(HeadscaleError::Decode(
+-                "headscale created a reusable/ephemeral key".into(),
+-            )));
++            let e = HeadscaleError::Decode("headscale created a reusable/ephemeral key".into());
++            self.audit_enroll_failure(req, &e, Some(key.id));
++            return Err(e.into());
+         }
+ 
+         self.audit.record(
+@@ -205,7 +220,24 @@ impl<H: HeadscaleApi> Service<H> {
+         now: OffsetDateTime,
+     ) -> Result<NetworkMembership, ServiceError> {
+         let nodes = self.hs.list_nodes().await?;
+-        let node = Self::find_node(&nodes, q.node_id, q.auth_key_id)?;
++        let mut node = Self::find_node(&nodes, q.node_id, q.auth_key_id)?;
++
++        let mut key = None;
++        if node.is_none()
++            && let Some(key_id) = q.auth_key_id
++        {
++            key = self.find_key(key_id).await?;
++            // A join can land between the node list above and the key list:
++            // the key is then `used` although its node was not listed yet.
++            // Look once more before concluding the device was revoked.
++            if key
++                .as_ref()
++                .is_some_and(|k| k.used && is_dacs_tagset(&k.acl_tags))
++            {
++                let nodes = self.hs.list_nodes().await?;
++                node = Self::find_node(&nodes, q.node_id, q.auth_key_id)?;
++            }
++        }
+ 
+         if let Some(mut node) = node {
+             if !is_dacs_tagset(&node.tags) {
+@@ -236,7 +268,7 @@ impl<H: HeadscaleApi> Service<H> {
+         }
+ 
+         let state = match (q.auth_key_id, q.node_id) {
+-            (Some(key_id), node_id) => match self.find_key(key_id).await? {
++            (Some(key_id), node_id) => match key {
+                 Some(k) if !is_dacs_tagset(&k.acl_tags) => {
+                     return Err(ServiceError::Forbidden(format!(
+                         "key {key_id} is not a DACS enrollment key"
+@@ -329,11 +361,47 @@ impl<H: HeadscaleApi> Service<H> {
+             }
+         }
+ 
+-        let after = self.hs.list_nodes().await?;
+-        let verified_absent = matches!(
+-            Self::find_node(&after, req.node_id.or(node_deleted), req.auth_key_id),
+-            Ok(None)
+-        );
++        // Headscale has been changed from here on: always audit and report
++        // the outcome. A failed verification is `verified_absent = false`,
++        // which the coordinator retries.
++        let mut verified_absent = false;
++        match self.remaining(req, node_deleted).await {
++            Ok(None) => verified_absent = true,
++            Ok(Some(late)) if is_dacs_tagset(&late.tags) => {
++                // A device joined with the key between the first node list
++                // and the key expiry (or the delete did not take effect).
++                if late
++                    .pre_auth_key
++                    .as_ref()
++                    .is_some_and(|p| Some(p.id) == req.auth_key_id)
++                {
++                    // The key was consumed, not expired unused.
++                    key_expired = false;
++                }
++                match self.hs.delete_node(late.id).await {
++                    Ok(()) => node_deleted = Some(late.id),
++                    Err(e) if e.is_not_found() => {}
++                    Err(e) => {
++                        tracing::warn!(node = late.id, error = %e, "could not delete node that joined during revocation")
++                    }
++                }
++                match self.remaining(req, node_deleted).await {
++                    Ok(left) => verified_absent = left.is_none(),
++                    Err(e) => {
++                        tracing::warn!(error = %e, "could not verify revocation; reporting unverified")
++                    }
++                }
++            }
++            Ok(Some(other)) => {
++                tracing::warn!(
++                    node = other.id,
++                    "non-DACS node matches the revocation request after the mutation; left untouched"
++                )
++            }
++            Err(e) => {
++                tracing::warn!(error = %e, "could not verify revocation; reporting unverified")
++            }
++        }
+ 
+         self.audit.record(
+             "revoke",
+@@ -358,6 +426,49 @@ impl<H: HeadscaleApi> Service<H> {
+         })
+     }
+ 
++    /// A node still registered for this revocation request: the requested or
++    /// just-deleted node id, or any node that registered with the request's
++    /// key. Unlike [`Self::find_node`] this never reports a conflict, because
++    /// it runs after the mutation and must find a late joiner by key alone.
++    async fn remaining(
++        &self,
++        req: &RevocationRequest,
++        node_deleted: Option<u64>,
++    ) -> Result<Option<Node>, HeadscaleError> {
++        let nodes = self.hs.list_nodes().await?;
++        Ok(nodes.into_iter().find(|n| {
++            Some(n.id) == req.node_id
++                || Some(n.id) == node_deleted
++                || req
++                    .auth_key_id
++                    .is_some_and(|k| n.pre_auth_key.as_ref().is_some_and(|p| p.id == k))
++        }))
++    }
++
++    /// Audit a failed key creation. The request may have reached Headscale
++    /// (for example a timeout after the key was stored), so the line marks
++    /// that a key may exist. Never records the key or the response body.
++    fn audit_enroll_failure(
++        &self,
++        req: &EnrollmentRequest,
++        e: &HeadscaleError,
++        auth_key_id: Option<u64>,
++    ) {
++        // An explicit 4xx rejection created nothing; anything else may have.
++        let key_may_exist = auth_key_id.is_some()
++            || !matches!(e, HeadscaleError::Status { status, .. } if (400..500).contains(status));
++        self.audit.record(
++            "enroll_failed",
++            serde_json::json!({
++                "device_id": req.device_id,
++                "host_name": req.host_name,
++                "error_class": error_class(e),
++                "key_may_exist": key_may_exist,
++                "auth_key_id": auth_key_id,
++            }),
++        );
++    }
++
+     /// DACS-tagged overlay nodes, for Person 1's status UI.
+     pub async fn nodes(&self) -> Result<Vec<OverlayNode>, ServiceError> {
+         let mut out: Vec<OverlayNode> = self
+@@ -441,6 +552,16 @@ mod tests {
+         keys: Mutex<Vec<PreAuthKey>>,
+         nodes: Mutex<Vec<Node>>,
+         next: Mutex<u64>,
++        list_nodes_calls: Mutex<u64>,
++        /// Fail the n-th (1-based) and every later `list_nodes` call.
++        fail_list_nodes_from: Mutex<Option<u64>>,
++        /// Fail the next `create_tagged_key` with this error.
++        fail_create_key: Mutex<Option<HeadscaleError>>,
++        /// A device registers with (key id, name, ip) just before the next
++        /// `expire_key` takes effect.
++        join_before_expire: Mutex<Option<(u64, &'static str, &'static str)>>,
++        /// Same, just before the next `list_keys` answers.
++        join_before_list_keys: Mutex<Option<(u64, &'static str, &'static str)>>,
+     }
+ 
+     impl Fake {
+@@ -477,6 +598,9 @@ mod tests {
+             tags: &[String],
+             expiration: OffsetDateTime,
+         ) -> Result<PreAuthKey, HeadscaleError> {
++            if let Some(e) = self.fail_create_key.lock().unwrap().take() {
++                return Err(e);
++            }
+             let mut next = self.next.lock().unwrap();
+             *next += 1;
+             let k = PreAuthKey {
+@@ -490,15 +614,36 @@ mod tests {
+             Ok(k)
+         }
+         async fn expire_key(&self, id: u64) -> Result<(), HeadscaleError> {
++            let joining = self.join_before_expire.lock().unwrap().take();
++            if let Some((key_id, name, ip)) = joining {
++                self.register(key_id, name, ip);
++            }
+             let mut keys = self.keys.lock().unwrap();
+             let k = keys.iter_mut().find(|k| k.id == id).unwrap();
+             k.expiration = Some(datetime!(2000-01-01 0:00 UTC));
+             Ok(())
+         }
+         async fn list_keys(&self) -> Result<Vec<PreAuthKey>, HeadscaleError> {
++            let joining = self.join_before_list_keys.lock().unwrap().take();
++            if let Some((key_id, name, ip)) = joining {
++                self.register(key_id, name, ip);
++            }
+             Ok(self.keys.lock().unwrap().clone())
+         }
+         async fn list_nodes(&self) -> Result<Vec<Node>, HeadscaleError> {
++            let call = {
++                let mut calls = self.list_nodes_calls.lock().unwrap();
++                *calls += 1;
++                *calls
++            };
++            if self
++                .fail_list_nodes_from
++                .lock()
++                .unwrap()
++                .is_some_and(|from| call >= from)
++            {
++                return Err(HeadscaleError::Transport("injected list failure".into()));
++            }
+             Ok(self.nodes.lock().unwrap().clone())
+         }
+         async fn delete_node(&self, id: u64) -> Result<(), HeadscaleError> {
+@@ -522,6 +667,10 @@ mod tests {
+     }
+ 
+     fn service() -> Service<Fake> {
++        service_with(Audit::disabled())
++    }
++
++    fn service_with(audit: Audit) -> Service<Fake> {
+         Service::new(
+             Fake::default(),
+             Settings {
+@@ -536,10 +685,30 @@ mod tests {
+                     server: 10501,
+                 },
+             },
+-            Audit::disabled(),
++            audit,
+         )
+     }
+ 
++    /// Fresh audit log path in the temp directory, unique per test.
++    fn audit_path(test: &str) -> std::path::PathBuf {
++        let path = std::env::temp_dir().join(format!(
++            "dacs-netadmin-{}-{test}.jsonl",
++            std::process::id()
++        ));
++        let _ = std::fs::remove_file(&path);
++        path
++    }
++
++    /// Parse and remove the audit log; every line must be one JSON record.
++    fn audit_lines(path: &std::path::Path) -> Vec<serde_json::Value> {
++        let text = std::fs::read_to_string(path).unwrap();
++        let _ = std::fs::remove_file(path);
++        assert!(text.ends_with('\n'), "audit record not newline-terminated");
++        text.lines()
++            .map(|l| serde_json::from_str(l).unwrap())
++            .collect()
++    }
++
+     fn request(host: &str, roles: Vec<NodeRole>) -> EnrollmentRequest {
+         let device = DeviceId(format!("dev-{host}"));
+         let host = HostName::parse(host).unwrap();
+@@ -756,4 +925,115 @@ mod tests {
+         ));
+         assert!(svc.hs.keys.lock().unwrap().is_empty());
+     }
++
++    #[tokio::test]
++    async fn revoke_with_failed_verification_is_audited_and_unverified() {
++        let path = audit_path("revoke-verify-fails");
++        let svc = service_with(Audit::open(&path).unwrap());
++        let req = request("gina-pc", vec![NodeRole::Worker]);
++        let grant = svc.enroll(&req, NOW).await.unwrap();
++        let node_id = svc.hs.register(grant.auth_key_id, "gina-pc", "100.64.0.11");
++
++        // The pre-mutation list succeeds; the verification list fails.
++        let seen = *svc.hs.list_nodes_calls.lock().unwrap();
++        *svc.hs.fail_list_nodes_from.lock().unwrap() = Some(seen + 2);
++        let out = svc
++            .revoke(
++                &RevocationRequest {
++                    device_id: req.device_id.clone(),
++                    auth_key_id: Some(grant.auth_key_id),
++                    node_id: Some(node_id),
++                    requested_by: "owner".into(),
++                    reason: "test".into(),
++                },
++                NOW,
++            )
++            .await
++            .expect("a failed verification is not an error after the mutation");
++        assert_eq!(out.node_deleted, Some(node_id));
++        assert!(!out.verified_absent);
++        assert!(svc.hs.nodes.lock().unwrap().is_empty());
++
++        let lines = audit_lines(&path);
++        let revoke = lines
++            .iter()
++            .find(|l| l["op"] == "revoke")
++            .expect("revocation audited although verification failed");
++        assert_eq!(revoke["detail"]["node_deleted"], node_id);
++        assert_eq!(revoke["detail"]["verified_absent"], false);
++    }
++
++    #[tokio::test]
++    async fn revoke_deletes_node_that_joined_before_key_expiry() {
++        let svc = service();
++        let req = request("erin-pc", vec![NodeRole::Worker]);
++        let grant = svc.enroll(&req, NOW).await.unwrap();
++        // The device registers after revoke listed nodes and keys, just
++        // before the key is expired.
++        *svc.hs.join_before_expire.lock().unwrap() =
++            Some((grant.auth_key_id, "erin-pc", "100.64.0.12"));
++        let out = svc
++            .revoke(
++                &RevocationRequest {
++                    device_id: req.device_id.clone(),
++                    auth_key_id: Some(grant.auth_key_id),
++                    node_id: None,
++                    requested_by: "owner".into(),
++                    reason: "invite withdrawn".into(),
++                },
++                NOW,
++            )
++            .await
++            .unwrap();
++        assert!(svc.hs.nodes.lock().unwrap().is_empty(), "late node deleted");
++        assert!(out.node_deleted.is_some());
++        assert!(!out.key_expired, "the key was consumed, not expired unused");
++        assert!(out.verified_absent);
++    }
++
++    #[tokio::test]
++    async fn failed_key_creation_is_audited_without_secrets() {
++        let path = audit_path("enroll-create-fails");
++        let svc = service_with(Audit::open(&path).unwrap());
++        *svc.hs.fail_create_key.lock().unwrap() = Some(HeadscaleError::Transport(
++            "operation timed out".into(),
++        ));
++        let req = request("frank-pc", vec![NodeRole::Worker]);
++        assert!(matches!(
++            svc.enroll(&req, NOW).await,
++            Err(ServiceError::Upstream(HeadscaleError::Transport(_)))
++        ));
++
++        let lines = audit_lines(&path);
++        assert_eq!(lines.len(), 1, "{lines:?}");
++        let line = &lines[0];
++        assert_eq!(line["op"], "enroll_failed");
++        assert_eq!(line["detail"]["device_id"], "dev-frank-pc");
++        assert_eq!(line["detail"]["host_name"], "frank-pc");
++        assert_eq!(line["detail"]["error_class"], "transport");
++        assert_eq!(line["detail"]["key_may_exist"], true);
++    }
++
++    #[tokio::test]
++    async fn membership_sees_join_between_node_and_key_lists() {
++        let svc = service();
++        let req = request("hana-pc", vec![NodeRole::Worker]);
++        let grant = svc.enroll(&req, NOW).await.unwrap();
++        // The node list is taken first and is empty; the device registers
++        // before the key list, which then shows the key as used.
++        *svc.hs.join_before_list_keys.lock().unwrap() =
++            Some((grant.auth_key_id, "hana-pc", "100.64.0.13"));
++        let q = MembershipQuery {
++            device_id: req.device_id.clone(),
++            host_name: req.host_name.clone(),
++            auth_key_id: Some(grant.auth_key_id),
++            node_id: None,
++        };
++        let m = svc.membership(&q, NOW).await.unwrap();
++        assert!(
++            matches!(m.state, MembershipState::Joined { .. }),
++            "just-joined device reported as {:?}",
++            m.state
++        );
++    }
+ }
