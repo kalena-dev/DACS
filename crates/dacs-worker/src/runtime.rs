@@ -1223,6 +1223,104 @@ async fn agent_attempt(
     } else {
         None
     };
+    // A lost OMP process is not the end of the DACS attempt: its children/jobs
+    // stay pending at the coordinator and its reservation stays held. Relaunch
+    // OMP on the durable session with the obligations restored (bounded), so
+    // the attempt still ends only by explicit submission, stop or failure.
+    let mut resumed = resumed;
+    let mut restarts = 0;
+    loop {
+        let (work, session_lost) = omp_session(
+            config,
+            coordinator,
+            supervisor,
+            task,
+            attempt,
+            directory,
+            state_dir,
+            resumed,
+            desktop,
+            stop,
+        )
+        .await?;
+        let Err(error) = &work else { return work };
+        if !session_lost || *stop.borrow() || restarts >= MAX_OMP_RESTARTS {
+            return work;
+        }
+        restarts += 1;
+        resumed = true;
+        let reason: String = format!("{error:#}").chars().take(512).collect();
+        coordinator.journal.event(
+            &task.id,
+            &attempt.id,
+            attempt.generation,
+            attempt.last_sequence,
+            WorkerEvent::Progress {
+                message: format!(
+                    "OMP session ended before explicit submission ({reason}); restarting it on the durable session with pending obligations ({restarts}/{MAX_OMP_RESTARTS})"
+                ),
+            },
+        )?;
+    }
+}
+
+const MAX_OMP_RESTARTS: u32 = 3;
+
+/// Pending children and unconfirmed operations a replacement OMP session must
+/// be told about. The assignment snapshot may predate later delegations, so ask
+/// the coordinator; without it, fall back and say so.
+async fn restored_obligations(
+    coordinator: &Coordinator,
+    attempt: &AttemptRecord,
+) -> Result<(Vec<String>, String)> {
+    let current = tokio::time::timeout(
+        Duration::from_secs(5),
+        coordinator.get::<Snapshot>("/api/state"),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .and_then(|s| s.attempts.into_iter().find(|a| a.id == attempt.id))
+    .map(|a| a.pending_children);
+    let unconfirmed: Vec<String> = coordinator
+        .journal
+        .get_value(&format!("pending-tools:{}", attempt.id))?
+        .unwrap_or_default();
+    let submission: Option<String> = coordinator
+        .journal
+        .get_value::<Option<String>>(&format!("submission:{}", attempt.id))?
+        .flatten();
+    let mut note = String::from(
+        "This is a restart. Inspect durable messages and existing source before acting; do not duplicate external effects.",
+    );
+    if current.is_none() {
+        note.push_str(" Coordinator unreachable: pending children are as of assignment; call dacs_pending later.");
+    }
+    if !unconfirmed.is_empty() {
+        note.push_str(&format!(" DACS operations awaiting a durable outcome (do not repeat them): {unconfirmed:?}."));
+    }
+    if let Some(submission) = submission {
+        note.push_str(&format!(" Submission {submission} is already pending; await its outcome."));
+    }
+    Ok((current.unwrap_or_else(|| attempt.pending_children.clone()), note))
+}
+
+/// One OMP process for an agent attempt. Returns the attempt outcome and whether
+/// the OMP session itself was lost (transport closed or process exited).
+#[allow(clippy::too_many_arguments)]
+async fn omp_session(
+    config: &WorkerConfig,
+    coordinator: &Coordinator,
+    supervisor: &Supervisor,
+    task: &TaskRecord,
+    attempt: &AttemptRecord,
+    directory: &Path,
+    state_dir: &Path,
+    resumed: bool,
+    desktop: bool,
+    stop: &mut watch::Receiver<bool>,
+) -> Result<(Result<()>, bool)> {
+    let mut transport_closed = false;
     let (process_id, rpc, mut events, stderr) = launch_omp(
         config,
         supervisor,
@@ -1238,8 +1336,8 @@ async fn agent_attempt(
         if resumed {
             rpc.request("open_session",json!({"sessionDir":state_dir.join("session")}),Duration::from_secs(60)).await?;
         }
-        let pending = attempt.pending_children.clone();
-        let prompt = format!("DACS managed assignment {} generation {}. Source {}. Contract {} policy {}.\n{}\n\nUse dacs_delegate/dacs_workflow for admitted remote or long-running work. Never native task/eval delegation or detached services. Local checks are ordinary reserved work. Commit changes and call dacs_submit with actual evidence; yielding does not complete this attempt. Pending durable children/jobs: {:?}. {}",task.id,attempt.generation,task.spec.source_commit,task.spec.contract_revision,task.spec.policy_revision,task.spec.instructions,pending,if resumed { "This is a restart. Inspect durable messages and existing source before acting; do not duplicate external effects." } else { "" });
+        let (pending, restart) = if resumed { restored_obligations(coordinator, attempt).await? } else { (attempt.pending_children.clone(), String::new()) };
+        let prompt = format!("DACS managed assignment {} generation {}. Source {}. Contract {} policy {}.\n{}\n\nUse dacs_delegate/dacs_workflow for admitted remote or long-running work. Never native task/eval delegation or detached services. Local checks are ordinary reserved work. Commit changes and call dacs_submit with actual evidence; yielding does not complete this attempt. Pending durable children/jobs: {:?}. {}",task.id,attempt.generation,task.spec.source_commit,task.spec.contract_revision,task.spec.policy_revision,task.spec.instructions,pending,restart);
         let prompt = if desktop { format!("{prompt}\nNative desktop is exclusively reserved for this attempt. Use computer.run for each multi-step workflow, first verify desktop.capabilities() is unlocked, awake and not secureInput, then acquire computer.control for foreground work and release in finally. Never continue after partial input failure without observing effects. Local owner pause cancels this session.") } else { prompt };
         rpc.request("prompt",json!({"message":prompt}),Duration::from_secs(60)).await?;
         let mut tick = tokio::time::interval(Duration::from_secs(2));
@@ -1290,7 +1388,10 @@ async fn agent_attempt(
                     coordinator.journal.set_value(&format!("pending-tools:{}",attempt.id),&remaining)?;
                 }
                 event = events.recv() => {
-                    let event = event.context("OMP transport closed before explicit submission")?;
+                    let Some(event) = event else {
+                        transport_closed = true;
+                        bail!("OMP transport closed before explicit submission");
+                    };
                     match event {
                         OmpEvent::ToolCall { id,tool_call_id,name,arguments } => {
                             anyhow::ensure!(!id.is_empty() && !tool_call_id.is_empty(), "OMP host tool call omitted correlation identity");
@@ -1339,6 +1440,26 @@ async fn agent_attempt(
         Ok(())
     }.await;
     let _ = rpc.close().await;
+    transport_closed |= work.as_ref().err().is_some_and(|e| {
+        matches!(
+            e.downcast_ref::<crate::OmpRpcError>(),
+            Some(crate::OmpRpcError::Closed | crate::OmpRpcError::Write(_))
+        )
+    });
+    // Reap a dead leader before terminating (macOS refuses to signal a group
+    // holding only a zombie). A closed transport usually means OMP is exiting;
+    // give its exit a bounded moment to become observable.
+    let mut exited = false;
+    for _ in 0..40 {
+        exited = matches!(
+            supervisor.state(&process_id).await,
+            Ok(crate::ProcessState::Exited { .. })
+        );
+        if exited || !transport_closed {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
     anyhow::ensure!(
         supervisor
             .terminate(&process_id, Duration::from_secs(10))
@@ -1346,7 +1467,7 @@ async fn agent_attempt(
         "OMP tree remains active"
     );
     tokio::time::timeout(Duration::from_secs(10), stderr).await???;
-    work
+    Ok((work, transport_closed || exited))
 }
 
 async fn host_call(
