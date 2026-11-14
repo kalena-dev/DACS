@@ -70,6 +70,15 @@ struct ProcessReceipt {
     reservation_id: Option<String>,
     pid: Option<u32>,
     start_time: Option<u64>,
+    /// Session the group was created in (the launching worker's; the child
+    /// only changes its group). Restart kills a leaderless group only if every
+    /// live member shares it; older receipts without it are refused.
+    #[serde(default)]
+    session_id: Option<u32>,
+    /// Wall-clock seconds taken before spawn: a lower bound on the start time
+    /// of every descendant, even when the leader exits before it is observed.
+    #[serde(default)]
+    launched_at: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -154,7 +163,8 @@ impl Supervisor {
                 .pid
                 .context("interrupted process launch: local process reconciliation required")?;
             let system = sysinfo::System::new_all();
-            if let Some(process) = system.process(sysinfo::Pid::from_u32(pid)) {
+            let leader = system.process(sysinfo::Pid::from_u32(pid));
+            if let Some(process) = leader {
                 anyhow::ensure!(
                     Some(process.start_time()) == receipt.start_time,
                     "PID reused; original process tree cannot be certified stopped"
@@ -168,11 +178,17 @@ impl Supervisor {
             }
             // Policy: a crashed worker's RPC pipes are gone, so surviving trees
             // are never re-adopted; the whole process group is killed and its
-            // absence verified. The group id is the original leader PID. A PID
-            // is not reallocated while it still names a process group, so a live
-            // group whose leader already exited holds the original descendants.
+            // absence verified. The group id is the original leader PID. While
+            // the group exists its id cannot be reallocated, but after the tree
+            // fully exits an unrelated process may reuse the PID and lead a new
+            // group, so a leaderless group is only killed after an identity check.
             #[cfg(unix)]
-            terminate_group(pid).await?;
+            {
+                if leader.is_none() {
+                    verify_leaderless_group(pid, &receipt)?;
+                }
+                terminate_group(pid).await?;
+            }
             std::fs::remove_file(path)?;
             if let Some(attempt) = receipt.reservation_id {
                 stopped.push(attempt);
@@ -203,7 +219,16 @@ impl Supervisor {
             reservation_id: descriptor.reservation_id.clone(),
             pid: None,
             start_time: None,
+            session_id: None,
+            launched_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|elapsed| elapsed.as_secs()),
         };
+        #[cfg(unix)]
+        {
+            receipt.session_id = u32::try_from(nix::unistd::getsid(None)?.as_raw()).ok();
+        }
         self.save_receipt(&receipt)?;
         let mut command = CommandWrap::with_new(&descriptor.program, |command| {
             command
@@ -393,6 +418,63 @@ impl Supervisor {
         attempts.dedup();
         attempts
     }
+}
+
+/// A leaderless group is presumed to be the original tree only if every live
+/// member is in the recorded session and started no earlier than the recorded
+/// leader. Anything else stays unreconciled (receipt kept) instead of being
+/// killed: DACS never signals processes it cannot attribute to its own launch.
+#[cfg(unix)]
+fn verify_leaderless_group(group: u32, receipt: &ProcessReceipt) -> Result<()> {
+    use nix::{
+        errno::Errno,
+        sys::signal::killpg,
+        unistd::{Pid, getpgid, getsid},
+    };
+    let raw = i32::try_from(group).context("invalid process group")?;
+    match killpg(Pid::from_raw(raw), None) {
+        Err(Errno::ESRCH) => return Ok(()),
+        Ok(()) => (),
+        Err(error) => bail!("prior process group {group} cannot be inspected: {error}"),
+    }
+    let unreconciled = |why: String| {
+        anyhow::anyhow!(
+            "prior process group {group} is unreconciled: {why}; owner must inspect it before restart"
+        )
+    };
+    let bound = receipt.launched_at.or(receipt.start_time);
+    let (Some(session), Some(started)) = (receipt.session_id, bound) else {
+        return Err(unreconciled(
+            "receipt lacks the launch session or start time".into(),
+        ));
+    };
+    let system = sysinfo::System::new_all();
+    let mut members = 0;
+    for (pid, process) in system.processes() {
+        let Ok(member) = i32::try_from(pid.as_u32()) else {
+            continue;
+        };
+        if getpgid(Some(Pid::from_raw(member))).ok() != Some(Pid::from_raw(raw)) {
+            continue;
+        }
+        members += 1;
+        let member_session = getsid(Some(Pid::from_raw(member)))
+            .map_err(|error| unreconciled(format!("session of member {member}: {error}")))?;
+        if u32::try_from(member_session.as_raw()).ok() != Some(session) {
+            return Err(unreconciled(format!(
+                "member {member} is in session {member_session}, not recorded session {session}"
+            )));
+        }
+        if process.start_time() < started {
+            return Err(unreconciled(format!(
+                "member {member} started before the recorded leader"
+            )));
+        }
+    }
+    if members == 0 {
+        return Err(unreconciled("live members cannot be identified".into()));
+    }
+    Ok(())
 }
 
 /// Kill a prior worker's process group and wait until the kernel reports no
