@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/dacs-protocol", "crates/dacs-core", "crates/dacs-source", "crates/dacs-setup", "crates/dacs-ui", "crates/dacs-app", "crates/dacs-worker", "person-4/builds-release"]
+members = ["crates/dacs-protocol", "crates/dacs-core", "crates/dacs-source", "crates/dacs-setup", "crates/dacs-ui", "crates/dacs-app", "crates/dacs-worker", "person-4/builds-release", "net/crates/dacs-net-contract", "net/crates/dacs-netclient", "net/crates/dacs-netadmin"]
 resolver = "3"
 
 [workspace.package]
@@ -15,6 +15,9 @@ dacs-core = { path = "crates/dacs-core" }
 dacs-source = { path = "crates/dacs-source" }
 dacs-setup = { path = "crates/dacs-setup" }
 dacs-ui = { path = "crates/dacs-ui" }
+dacs-worker = { path = "crates/dacs-worker" }
+dacs-net-contract = { path = "net/crates/dacs-net-contract" }
+dacs-netclient = { path = "net/crates/dacs-netclient" }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -26,7 +29,7 @@ rand = "0.9"
 rusqlite = { version = "0.37", features = ["bundled"] }
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["macros", "multipart"] }
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "stream"] }
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
@@ -38,6 +41,9 @@ url = "2"
 semver = { version = "1", features = ["serde"] }
 ed25519-dalek = "2"
 base64 = "0.22"
+time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+subtle = "2"
 
 [profile.release]
 lto = "thin"

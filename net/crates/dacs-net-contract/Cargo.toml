@@ -1,0 +1,15 @@
+[package]
+name = "dacs-net-contract"
+description = "DACS network enrollment wire contract (Person 3 -> Persons 1, 2, 4)"
+version.workspace = true
+edition.workspace = true
+license = "UNLICENSED"
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

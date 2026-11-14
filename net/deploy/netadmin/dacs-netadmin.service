@@ -1,0 +1,29 @@
+[Unit]
+Description=DACS network enrollment adapter
+After=network-online.target headscale.service tailscaled.service
+Wants=network-online.target
+Requires=headscale.service
+
+[Service]
+User=dacs-netadmin
+Group=dacs-netadmin
+ExecStartPre=/usr/local/bin/dacs-netadmin check --config /etc/dacs-netadmin/config.json
+ExecStart=/usr/local/bin/dacs-netadmin serve --config /etc/dacs-netadmin/config.json
+Restart=on-failure
+RestartSec=3
+StateDirectory=dacs-netadmin
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+MemoryDenyWriteExecute=true
+ReadOnlyPaths=/etc/dacs-netadmin
+
+[Install]
+WantedBy=multi-user.target

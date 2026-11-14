@@ -81,7 +81,7 @@ impl Fixture {
             .arg("-c")
             .arg(format!(
                 "core.hooksPath={}",
-                PathBuf::from(crate::git::argument(self.path.join("no-hooks").as_os_str()).as_ref()).display()
+                crate::git::argument(self.path.join("no-hooks").as_os_str()).to_string_lossy()
             ))
             .args(args.iter().map(|arg| crate::git::argument(std::ffi::OsStr::new(arg))))
             .output()

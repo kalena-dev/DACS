@@ -4,6 +4,8 @@
 //! the worker durably accept commands before executing them while shared contract
 //! types are being finalized by Person 1.
 
+/// Person 4 build planning/evidence adapter over Person 2's process descriptor.
+pub mod build_execution;
 mod journal;
 mod omp;
 mod supervisor;
