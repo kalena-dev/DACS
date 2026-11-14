@@ -218,8 +218,8 @@ before body parsing.
 | GET | `/v1/health` | — | `{ok, contract_revision, headscale_pinned, headscale_error}` | 503 when Headscale is unhealthy (same body, `ok: false`) |
 | GET | `/v1/contract` | — | `{contract_revision, admin_disclosure_revision, admin_disclosure, tailnet_switch_disclosure, login_server, coordinator, key_ttl_minutes}` | 401 |
 | POST | `/v1/enrollments` | `EnrollmentRequest` | `EnrollmentGrant` | 400, 401, 403, 409, 502 |
-| POST | `/v1/memberships/query` | `MembershipQuery` | `NetworkMembership` | 401, 403, 502 |
-| POST | `/v1/revocations` | `RevocationRequest` | `RevocationOutcome` | 400, 401, 403, 502 |
+| POST | `/v1/memberships/query` | `MembershipQuery` | `NetworkMembership` | 401, 403, 409, 502 |
+| POST | `/v1/revocations` | `RevocationRequest` | `RevocationOutcome` | 400, 401, 403, 409, 502 |
 | GET | `/v1/nodes` | — | `Vec<OverlayNode>` (DACS-tagged nodes only, by `node_id`) | 401, 502 |
 | GET | `/v1/compiler-endpoints` | — | `Vec<CompilerEndpoint>` | 401, 502 |
 
@@ -230,7 +230,7 @@ Error codes (`ApiError.code`):
 | 400 | `bad_request` | `EnrollmentRequest` validation failed; revocation without `auth_key_id`/`node_id` or `requested_by` |
 | 401 | `unauthorized` | Missing or invalid operation token |
 | 403 | `forbidden` | Enrollment requests the `infra` role; membership/revocation targets a node or key that is not exclusively DACS-tagged (non-infra) |
-| 409 | `conflict` | `host_name` already registered in Headscale |
+| 409 | `conflict` | `host_name` already registered in Headscale; `node_id` and `auth_key_id` both given but not the same node (revocation changes nothing in that case) |
 | 502 | `headscale_unavailable` | Headscale request failed or returned an unusable key |
 
 A body that does not deserialize (malformed JSON, invalid `HostName`, unknown
@@ -390,10 +390,10 @@ contact a real Headscale server or modify the local Tailscale client.
 
 | Check | Result | Evidence |
 |---|---|---|
-| Unit tests (`cargo test --workspace`, 32 tests) and `cargo clippy --workspace --all-targets` | Passed | Run from `net/` on Windows, Rust 1.100 |
+| Unit tests (`cargo test --workspace`, 33 tests) and `cargo clippy --workspace --all-targets` | Passed | Run from `net/` on Windows, Rust 1.100 |
 | `dacs-netadmin` against real Headscale v0.29.7 + Tailscale 1.104.7 client (isolated WSL): enroll, single-use reuse refused, join, rename, membership, compiler endpoints, 401/400/409, revoke, no reconnect, revoke-before-use | Passed | `evidence/local-headscale-integration.md` |
 | `dacs-net status` / `assess` against the real Windows Tailscale 1.104.7 client (logged out) | Passed: `logged_out`, no switch consent needed | Local run |
-| `deploy/infra-setup.sh` | Syntax and ShellCheck only; not executed | — |
+| `deploy/infra-setup.sh` | Syntax and ShellCheck only; not executed. Its policy-before-user ordering is confirmed: in the WSL run Headscale started with the unchanged policy before `dacs-admin` existed | — |
 | Public Linux server, DNS, Let's Encrypt TLS, nginx SNI router, public DERP/STUN | Not run: no server, domain or DNS access was available | — |
 | netadmin over TLS on the infra overlay IP | Not run | — |
 | `dacs-net join` end to end, tailnet-switch consent on a host with an existing login | Not run (decision logic unit-tested only) | — |

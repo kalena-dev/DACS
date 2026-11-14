@@ -165,14 +165,27 @@ impl<H: HeadscaleApi> Service<H> {
         })
     }
 
-    fn find_node(nodes: &[Node], node_id: Option<u64>, key_id: Option<u64>) -> Option<Node> {
-        nodes
-            .iter()
-            .find(|n| {
-                node_id.is_some_and(|id| n.id == id)
-                    || key_id.is_some_and(|k| n.pre_auth_key.as_ref().is_some_and(|p| p.id == k))
-            })
-            .cloned()
+    /// Resolve the device's node. When both ids are given they must identify
+    /// the same node; a stale or mistyped pair is a conflict, never a guess.
+    fn find_node(
+        nodes: &[Node],
+        node_id: Option<u64>,
+        key_id: Option<u64>,
+    ) -> Result<Option<Node>, ServiceError> {
+        let by_id = node_id.and_then(|id| nodes.iter().find(|n| n.id == id));
+        let by_key = key_id.and_then(|k| {
+            nodes
+                .iter()
+                .find(|n| n.pre_auth_key.as_ref().is_some_and(|p| p.id == k))
+        });
+        match (node_id, key_id, by_id, by_key) {
+            (Some(_), Some(_), None, None) => Ok(None),
+            (Some(_), Some(_), Some(a), Some(b)) if a.id == b.id => Ok(Some(a.clone())),
+            (Some(id), Some(k), ..) => Err(ServiceError::Conflict(format!(
+                "node_id {id} and auth_key_id {k} do not identify the same node"
+            ))),
+            _ => Ok(by_id.or(by_key).cloned()),
+        }
     }
 
     async fn find_key(&self, key_id: u64) -> Result<Option<PreAuthKey>, ServiceError> {
@@ -192,7 +205,7 @@ impl<H: HeadscaleApi> Service<H> {
         now: OffsetDateTime,
     ) -> Result<NetworkMembership, ServiceError> {
         let nodes = self.hs.list_nodes().await?;
-        let node = Self::find_node(&nodes, q.node_id, q.auth_key_id);
+        let node = Self::find_node(&nodes, q.node_id, q.auth_key_id)?;
 
         if let Some(mut node) = node {
             if !is_dacs_tagset(&node.tags) {
@@ -273,31 +286,42 @@ impl<H: HeadscaleApi> Service<H> {
             return Err(ServiceError::BadRequest("requested_by is required".into()));
         }
 
-        let mut key_expired = false;
-        if let Some(key_id) = req.auth_key_id
-            && let Some(k) = self.find_key(key_id).await?
+        // Resolve and check everything before mutating anything, so a
+        // mismatched or foreign target changes nothing.
+        let nodes = self.hs.list_nodes().await?;
+        let target = Self::find_node(&nodes, req.node_id, req.auth_key_id)?;
+        if let Some(node) = &target
+            && !is_dacs_tagset(&node.tags)
         {
-            if !is_dacs_tagset(&k.acl_tags) {
-                return Err(ServiceError::Forbidden(format!(
-                    "key {key_id} is not a DACS enrollment key"
-                )));
-            }
-            let live = !k.used && k.expiration.is_some_and(|e| e > now);
-            if live {
-                self.hs.expire_key(key_id).await?;
-                key_expired = true;
-            }
+            return Err(ServiceError::Forbidden(format!(
+                "node {} is not a DACS-enrolled node",
+                node.id
+            )));
+        }
+        let key = match req.auth_key_id {
+            Some(key_id) => self.find_key(key_id).await?,
+            None => None,
+        };
+        if let Some(k) = &key
+            && !is_dacs_tagset(&k.acl_tags)
+        {
+            return Err(ServiceError::Forbidden(format!(
+                "key {} is not a DACS enrollment key",
+                k.id
+            )));
         }
 
-        let nodes = self.hs.list_nodes().await?;
+        let mut key_expired = false;
+        if let Some(k) = &key
+            && !k.used
+            && k.expiration.is_some_and(|e| e > now)
+        {
+            self.hs.expire_key(k.id).await?;
+            key_expired = true;
+        }
+
         let mut node_deleted = None;
-        if let Some(node) = Self::find_node(&nodes, req.node_id, req.auth_key_id) {
-            if !is_dacs_tagset(&node.tags) {
-                return Err(ServiceError::Forbidden(format!(
-                    "node {} is not a DACS-enrolled node",
-                    node.id
-                )));
-            }
+        if let Some(node) = target {
             match self.hs.delete_node(node.id).await {
                 Ok(()) => node_deleted = Some(node.id),
                 Err(e) if e.is_not_found() => {}
@@ -306,8 +330,10 @@ impl<H: HeadscaleApi> Service<H> {
         }
 
         let after = self.hs.list_nodes().await?;
-        let verified_absent =
-            Self::find_node(&after, req.node_id.or(node_deleted), req.auth_key_id).is_none();
+        let verified_absent = matches!(
+            Self::find_node(&after, req.node_id.or(node_deleted), req.auth_key_id),
+            Ok(None)
+        );
 
         self.audit.record(
             "revoke",
@@ -676,6 +702,36 @@ mod tests {
         assert!(matches!(err, ServiceError::Forbidden(_)));
         assert_eq!(svc.hs.nodes.lock().unwrap().len(), 1);
         assert!(svc.nodes().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mismatched_node_and_key_changes_nothing() {
+        let svc = service();
+        let a = svc
+            .enroll(&request("alice-pc", vec![NodeRole::Worker]), NOW)
+            .await
+            .unwrap();
+        let node_a = svc.hs.register(a.auth_key_id, "alice-pc", "100.64.0.5");
+        let b = svc
+            .enroll(&request("bob-pc", vec![NodeRole::Worker]), NOW)
+            .await
+            .unwrap();
+        // Bob's key is still unused; the request pairs it with Alice's node.
+        let req = RevocationRequest {
+            device_id: DeviceId("dev-bob-pc".into()),
+            auth_key_id: Some(b.auth_key_id),
+            node_id: Some(node_a),
+            requested_by: "owner".into(),
+            reason: "stale node id".into(),
+        };
+        assert!(matches!(
+            svc.revoke(&req, NOW).await,
+            Err(ServiceError::Conflict(_))
+        ));
+        assert_eq!(svc.hs.nodes.lock().unwrap().len(), 1, "alice's node kept");
+        let keys = svc.hs.keys.lock().unwrap();
+        let bob_key = keys.iter().find(|k| k.id == b.auth_key_id).unwrap();
+        assert!(bob_key.expiration > Some(NOW), "bob's key not expired");
     }
 
     #[tokio::test]
