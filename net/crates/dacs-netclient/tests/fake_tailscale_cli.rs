@@ -51,6 +51,10 @@ case "$1" in
     cp "$d/status.joined.json" "$d/status.json"
     cp "$d/prefs.joined.json" "$d/prefs.json"
     exit 0 ;;
+  logout)
+    echo '{"BackendState":"NeedsLogin","Self":{"TailscaleIPs":null},"CurrentTailnet":null}' > "$d/status.json"
+    echo '{"ControlURL":"","LoggedOut":true}' > "$d/prefs.json"
+    exit 0 ;;
   *) echo "fake tailscale: unexpected command $1" >&2; exit 3 ;;
 esac
 "#;
@@ -347,4 +351,48 @@ fn compiler_check_refuses_non_overlay_endpoints_before_probing() {
     }
     // Only the read-only local state lookup ran; no ping was sent.
     read_only_calls_only(&fake);
+}
+
+#[test]
+fn leave_logs_out_only_the_active_dacs_profile_once() {
+    let fake = Fake::new(STATUS_DACS_RUNNING, PREFS_DACS_RUNNING);
+    let out = fake.run(&["leave", "https://HS.dacs.test/"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mutations: Vec<String> = fake
+        .calls()
+        .into_iter()
+        .filter(|c| MUTATING.contains(&c.split_whitespace().next().unwrap_or("")))
+        .collect();
+    assert_eq!(
+        mutations,
+        ["logout"],
+        "only a plain logout of the DACS profile"
+    );
+
+    // Already logged out: leaving again changes nothing.
+    let before = fake.calls().len();
+    let out = fake.run(&["leave", DACS]);
+    assert!(out.status.success());
+    let again = &fake.calls()[before..];
+    assert!(
+        again
+            .iter()
+            .all(|c| c == "status --json" || c == "debug prefs"),
+        "{again:?}"
+    );
+}
+
+#[test]
+fn join_when_already_on_dacs_does_not_rejoin() {
+    let fake = Fake::new(STATUS_DACS_RUNNING, PREFS_DACS_RUNNING);
+    let g = fake.write_json("grant.json", &grant());
+    let c = fake.write_json("consent.json", &consent(None));
+    let out = fake.run(&["join", "--grant", &g, "--consent", &c]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("already joined"));
+    fake.assert_no_mutation();
 }

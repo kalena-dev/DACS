@@ -217,3 +217,107 @@ fn restart_without_live_processes_clears_receipts_only_after_inspection() {
     assert_eq!(stopped, vec!["attempt"]);
     assert!(!receipts.join("gone.json").exists());
 }
+
+/// Starts `sleep 600` in a process group whose leader has already exited and
+/// been reaped. `new_session` puts the group in a fresh session (via setsid).
+fn leaderless_group(directory: &Path, new_session: bool) -> (i32, i32) {
+    let script = "sleep 600 & echo $! > member.pid; echo $$ > leader.pid";
+    let mut command = if new_session {
+        let mut command = Command::new("perl");
+        command.args([
+            "-MPOSIX",
+            "-e",
+            "POSIX::setsid() or die; exec '/bin/sh', '-c', $ARGV[0]",
+            script,
+        ]);
+        command
+    } else {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", script]);
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        command
+    };
+    let status = command
+        .current_dir(directory)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .status()
+        .expect("fixture shell (perl is required for the new-session fixture)");
+    assert!(status.success());
+    let leader = read_pid(directory, "leader.pid").unwrap();
+    let member = read_pid(directory, "member.pid").unwrap();
+    assert!(!alive(leader) && alive(member));
+    (leader, member)
+}
+
+fn write_receipt(receipts: &Path, leader: i32, start_time: u64, session: Option<i32>) {
+    let mut receipt = serde_json::json!({
+        "id": "leaderless",
+        "reservation_id": "attempt",
+        "pid": leader,
+        "start_time": start_time,
+    });
+    if let Some(session) = session {
+        receipt["session_id"] = session.into();
+    }
+    std::fs::write(
+        receipts.join("leaderless.json"),
+        serde_json::to_vec(&receipt).unwrap(),
+    )
+    .unwrap();
+}
+
+fn reconcile(receipts: &Path) -> anyhow::Result<Vec<String>> {
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(async { Supervisor::persistent(receipts)?.reconcile_previous().await })
+}
+
+fn own_session() -> i32 {
+    nix::unistd::getsid(None).unwrap().as_raw()
+}
+
+#[test]
+fn leaderless_group_in_another_session_is_never_killed() {
+    let temporary = tempfile::tempdir().unwrap();
+    let receipts = temporary.path().join("processes");
+    std::fs::create_dir_all(&receipts).unwrap();
+    let (leader, member) = leaderless_group(temporary.path(), true);
+    let _guard = GroupGuard(vec![leader]);
+    // The recorded launch session is ours; the live group belongs to another.
+    write_receipt(&receipts, leader, 0, Some(own_session()));
+    let error = reconcile(&receipts).unwrap_err().to_string();
+    assert!(error.contains("unreconciled"), "{error}");
+    assert!(alive(member), "foreign process group was signalled");
+    assert!(receipts.join("leaderless.json").exists());
+}
+
+#[test]
+fn leaderless_group_is_killed_only_when_its_identity_matches_the_receipt() {
+    let temporary = tempfile::tempdir().unwrap();
+    let receipts = temporary.path().join("processes");
+    std::fs::create_dir_all(&receipts).unwrap();
+    let (leader, member) = leaderless_group(temporary.path(), false);
+    let _guard = GroupGuard(vec![leader]);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // A receipt from before session recording cannot attribute the group.
+    write_receipt(&receipts, leader, 0, None);
+    assert!(reconcile(&receipts).is_err());
+    assert!(alive(member) && receipts.join("leaderless.json").exists());
+    // A member older than the recorded leader cannot be its descendant.
+    write_receipt(&receipts, leader, now + 3600, Some(own_session()));
+    let error = reconcile(&receipts).unwrap_err().to_string();
+    assert!(
+        error.contains("started before the recorded leader"),
+        "{error}"
+    );
+    assert!(alive(member) && receipts.join("leaderless.json").exists());
+    // Matching session and start order: the orphaned tree is killed and verified.
+    write_receipt(&receipts, leader, now - 60, Some(own_session()));
+    assert_eq!(reconcile(&receipts).unwrap(), vec!["attempt"]);
+    assert!(!alive(member));
+    assert!(!receipts.join("leaderless.json").exists());
+}
