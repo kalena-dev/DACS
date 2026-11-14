@@ -674,7 +674,10 @@ pub async fn run(mut config: WorkerConfig) -> Result<()> {
                     a.worker_id != config.worker_id || matches!(a.state.as_str(), "fenced" | "abandoned" | "stopping" | "stopped") || snapshot.tasks.iter().find(|t| t.id == a.task_id).is_none_or(|t| t.generation != a.generation || t.attempt_id.as_deref() != Some(id) || t.cancel_requested || matches!(t.state,TaskState::Accepted|TaskState::Cancelled|TaskState::Failed) || !same_pins(&t.spec, &runtime.pins))
                 });
                 if stale {
-                    let reason = if current.and_then(|a| snapshot.tasks.iter().find(|t| t.id == a.task_id)).is_some_and(|t| t.cancel_requested) { "coordinator_cancel" } else { "coordinator_fenced" };
+                    // The attempt watchdog acts on local controls without waiting
+                    // for this loop, so the snapshot may already show our own stop.
+                    let local: OwnerControls = journal.get_value("owner_controls")?.unwrap_or_default();
+                    let reason = if local.emergency_cancel { "emergency_cancel" } else if runtime.desktop && local.desktop_paused { "desktop_paused" } else if current.and_then(|a| snapshot.tasks.iter().find(|t| t.id == a.task_id)).is_some_and(|t| t.cancel_requested) { "coordinator_cancel" } else { "coordinator_fenced" };
                     local_control::record_stop(&journal, id, reason)?;
                     let _ = runtime.stop.send(true);
                 }
@@ -700,7 +703,10 @@ pub async fn run(mut config: WorkerConfig) -> Result<()> {
                 if phase.as_deref() == Some("finished") { continue; }
                 if phase.is_some() && task.spec.effect_class == EffectClass::External {
                     relay_compiler_telemetry(&coordinator,&task,attempt,&config.data_dir.join("attempts").join(&attempt.id))?;
-                    journal.event(&task.id,&attempt.id,attempt.generation,attempt.last_sequence,WorkerEvent::Failed { message:"Worker restarted during external-effect execution; automatic replay is forbidden. Inspect effects and explicitly abandon/reassign.".into() })?;
+                    // Interrupted, not Failed: a terminal failure would let the coordinator
+                    // settle uncertain external effects. The attempt stays current and
+                    // unfinished (stopped, reservation released) until explicitly abandoned.
+                    journal.event(&task.id,&attempt.id,attempt.generation,attempt.last_sequence,WorkerEvent::Progress { message:"Interrupted: worker restarted during external-effect execution; effects are unreconciled and automatic replay is forbidden. Inspect effects, then explicitly abandon/reassign.".into() })?;
                     journal.event(&task.id,&attempt.id,attempt.generation,attempt.last_sequence,WorkerEvent::Stopped)?;
                     journal.set_value(&format!("phase:{}",attempt.id),&"finished")?;
                     journal.mark_command(&command.command_id,"done")?;

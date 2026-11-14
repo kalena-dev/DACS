@@ -595,10 +595,10 @@ mod real_loop {
                         let snapshot = &mut self.snapshot;
                         if let Some(a) = snapshot.attempts.iter_mut().find(|a| a.id == *id) {
                             a.settled = true;
-                            if let Some(t) = snapshot.tasks.iter_mut().find(|t| t.id == a.task_id) {
-                                if t.cancel_requested {
-                                    t.state = TaskState::Cancelled;
-                                }
+                            if let Some(t) = snapshot.tasks.iter_mut().find(|t| t.id == a.task_id)
+                                && t.cancel_requested
+                            {
+                                t.state = TaskState::Cancelled;
                             }
                         }
                     }
@@ -1291,7 +1291,12 @@ exit 0
                     .any(|s| s.attempt_id == "attempt-1" && s.phase == StopPhase::Cancelled)
             })
         });
-        assert!(harness.reported("attempt-1", "stopped"));
+        // Accepted as Stopped, or as the runtime's ReconcileWorker fallback
+        // when the resolution lands between the refused Stopped and its retry.
+        let releases = harness.releases("attempt-1");
+        assert!(releases.iter().any(|l| l.status == 409));
+        assert!(releases.iter().any(|l| l.status == 200));
+        assert_released_only_after_termination(&harness, "attempt-1");
         assert_eq!(harness.attempt_launches("attempt-1"), 1);
         local_control::request(&harness.data_dir, ControlAction::Drain).unwrap();
         assert!(harness.wait_exit().success());
@@ -1470,6 +1475,14 @@ exit 0
         });
         assert!(!alive(descendant));
         assert_released_only_after_termination(&harness, "attempt-1");
+        assert!(
+            harness
+                .status()
+                .unwrap()
+                .stops
+                .iter()
+                .any(|s| { s.attempt_id == "attempt-1" && s.reason == "desktop_paused" })
+        );
         local_control::request(&harness.data_dir, ControlAction::Drain).unwrap();
         assert!(harness.wait_exit().success());
         // A manual restart resets drain, never the owner's pause.
