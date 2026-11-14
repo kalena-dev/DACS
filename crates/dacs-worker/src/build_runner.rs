@@ -517,7 +517,7 @@ async fn run(
         (
             "source",
             &request.git,
-            vec!["rev-parse".into(), "HEAD".into()],
+            crate::workspace::git_arguments(vec!["rev-parse".into(), "HEAD".into()]),
             task.spec.source_commit.as_str(),
         ),
         (
@@ -541,11 +541,11 @@ async fn run(
         (
             "clean-source",
             &request.git,
-            vec![
+            crate::workspace::git_arguments(vec![
                 "status".into(),
                 "--porcelain".into(),
                 "--untracked-files=all".into(),
-            ],
+            ]),
             "",
         ),
     ];
@@ -913,7 +913,13 @@ async fn run(
             let observed = command(
                 supervisor,
                 &format!("{}-{}-{phase}", attempt.id, shard.name),
-                &descriptor(&request.git, args, workspace, attempt, &env),
+                &descriptor(
+                    &request.git,
+                    crate::workspace::git_arguments(args),
+                    workspace,
+                    attempt,
+                    &env,
+                ),
                 root,
                 deadline,
             )

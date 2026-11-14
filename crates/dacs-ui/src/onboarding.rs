@@ -159,34 +159,38 @@ pub fn render_onboarding(status: &Value, notice: Option<&str>, csrf: &str) -> St
                 <option value="drain">"Drain worker; finish admitted work"</option>
             </select></label>
         }, "Request local control")}
-        {form("/ui/onboarding/worker_control", csrf, view! {
-            {hidden("review", &review)}{hidden("action", "emergency_cancel")}
-            {checkbox("Cancel admitted work now; external effects may require reconciliation", "emergency_approved", true)}
-        }, "Emergency cancel")}
+        <details><summary>"Emergency cancellation"</summary>
+            {form("/ui/onboarding/worker_control", csrf, view! {
+                {hidden("review", &review)}{hidden("action", "emergency_cancel")}
+                {checkbox("Cancel admitted work now; external effects may require reconciliation", "emergency_approved", true)}
+            }, "Emergency cancel")}
+        </details>
         <p>"Control requests are durable. Refresh to inspect what the running worker has actually observed; a request is not proof of termination."</p>
     });
     page(
         "Local owner onboarding",
         notice,
         view! {
+            <div class="onboarding-layout">
             <h1>"Enroll this PC with a named coordinator"</h1>
             <p>"Authenticated local owner only. Opening this page or any invitation link never enrolls, installs, changes a network, logs in to a provider or launches a worker. Each operation runs in the existing local Jobs journal; follow its job link, then return here to continue."</p>
-            <p><a href="/onboarding">"Refresh saved onboarding status"</a>" · "<a href="/setup">"Local setup and jobs"</a></p>
+            <div class="actions"><a class="button" href="/onboarding">"Refresh saved onboarding status"</a><a class="button" href="/setup">"Local setup and jobs"</a></div>
             {blocker}
-            <section><h2>"1. Inspect a remote invitation"</h2>
+            <section><details open=invitation.is_none()><summary>"1. Inspect a remote invitation"</summary>
                 <p>"Use the coordinator's public bootstrap HTTPS origin (normally port 7444). Paste the invitation token only into this authenticated local POST, never a local query string. Optional custom CA trust remains local; TLS verification is never disabled."</p>
                 {form("/ui/onboarding/inspect",csrf,view! {
                     {input("Coordinator bootstrap origin","endpoint","url",text(status,"endpoint"),true)}
                     {input("Invitation token","invitation_token","password","",true)}
                     {input("Trusted CA PEM file on this PC (optional)","ca_file","text","",false)}
                 },"Inspect invitation and current network disclosure")}
-            </section>
+            </details></section>
             {review_card}{plan}{setup_result}{disclosure}{registration}{pending}{retry_consent}{assess}{assessment}{joined}
             <section><h2>"Manual readiness and worker launch"</h2>
                 <p>"Complete provider login manually through the installed pinned OMP on this PC. Never paste provider credentials here. Review and launch the worker manually only after project approval, required tool compatibility and confirmed network membership. Onboarding never starts OMP login or the worker."</p>
                 <p>"The device credential remains in the owner's private DACS state directory under onboarding/owner.json. Do not publish or attach this file to job reports. The LocalJoinResult above contains only non-secret network handoff information."</p>
                 {worker_setup}{worker_controls}
             </section>
+            </div>
         },
     )
 }

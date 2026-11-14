@@ -2,7 +2,7 @@
 
 Rust coordinator, local setup interface and supporting worker/network/build crates for a private team of PCs. The coordinator stores orchestration state in SQLite, source in local bare Git repositories, and immutable artifacts in a private data directory.
 
-The shared integration branch is `person-1-expanded-track`. See [team integration](docs/team-integration.md) for ownership and wire contracts. This branch is not a certified release or evidence of a running distributed cluster.
+The shared implementation is on `main`. See [team integration](docs/team-integration.md) for ownership and wire contracts, and [assignment handoffs](docs/assignments/) for each track's implementation and verification status. This is an integration checkpoint, not a certified release or evidence of a running distributed cluster.
 
 ## Build
 

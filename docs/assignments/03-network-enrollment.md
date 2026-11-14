@@ -4,7 +4,7 @@
 
 The implementation is in `C:/Users/PC/Documents/GitHub/DACS`, shared branch `main`. `net/` contains the network contract, netadmin service, device client and deployment configuration. Coordinator authorization, separate TLS bootstrap/control listeners and owner onboarding are connected. The private task-board frontend is in `examples/task-board-web/`; `dacs task-board` serves its compiled assets and persistent backend on loopback.
 
-Verified: 14 network-client tests passed; the Rust/Leptos WebAssembly release build passed. The latest combined worker/UI/application check passed 62 tests, and the native application build passed. Browser login and dashboard mutation were exercised earlier; the completed task-board browser scenario is pending.
+Verified: 14 network-client tests passed; the Rust/Leptos WebAssembly release build passed. The combined worker/UI/application check passed 62 tests, and the native application build passed. Real browser checks passed for dashboard login and mutation, owner-onboarding display, and task-board create/edit/status/filter/delete, keyboard operation, a 390px layout without horizontal overflow and persistence through backend restart. These were local checks; no four-agent construction run is claimed.
 
 Use repository `net/README.md` for infrastructure deployment and `docs/team-integration.md` for endpoint/authentication contracts. Control/bootstrap ports are 7443/7444; netadmin is 9443; compiler defaults are 10600/10501. Headscale administration credentials stay on the infrastructure host.
 

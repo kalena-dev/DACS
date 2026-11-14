@@ -25,10 +25,10 @@ pub fn render_setup(
     let packages = catalogue.get("packages").and_then(Value::as_array);
     let category_cards = CATEGORIES.iter().map(|(id, label)| {
         let entries: Vec<_> = packages.into_iter().flatten().filter(|p| p.get("category").and_then(Value::as_str) == Some(*id)).collect();
-        view! { <fieldset><legend>{*label}</legend>
+        view! { <details><summary>{*label}</summary><fieldset><legend>{*label}</legend>
             {empty(entries.is_empty(), "No reviewed entries supplied for this category. Unavailable; do not substitute an unreviewed command.")}
             {entries.into_iter().map(|p| package_card(p)).collect_view()}
-        </fieldset> }
+        </fieldset></details> }
     }).collect_view();
     let plan = status.and_then(extract_plan);
     let plan_review = plan.map(|plan| {
@@ -60,9 +60,12 @@ pub fn render_setup(
         "Local setup",
         notice,
         view! {
+            <div class="setup-layout">
             <h1>"Local owner setup"</h1>
             <p>"This page must be served by an authenticated loopback-only setup listener. Public installation and invitation viewing confer no access. Choose optional tools; the catalogue is not an instruction to install every category."</p>
             <aside class="warning"><strong>"Consent boundary"</strong><p>"The local owner approves installation and named-host administrator access. Host device approval, network membership, project readiness and manual OMP provider login remain separate gates. Never paste provider secrets into this page."</p></aside>
+            {result}{plan_review}
+            {empty(plan.is_none(), "No reviewable plan available. Detection/planning or job completion is required before local approval.")}
             <section><h2>"1. Detect this device"</h2><p>"Read installed versions and package-manager availability before planning. A missing report means unknown, not absent or incompatible."</p>
                 {form("/ui/setup/detect", csrf, (), "Detect installed tools")}
                 {json_details("Catalogue platform and supported recipes", catalogue)}
@@ -82,18 +85,17 @@ pub fn render_setup(
                     <p>"Invitation secrets belong only in this authenticated local POST, never a URL. The resulting plan must name the host before local approval. No arbitrary scripts or unreviewed sources are accepted."</p>
                 }, "Detect and create reviewable plan")}
             </section>
-            {result}{plan_review}
-            {empty(plan.is_none(), "No reviewable plan available. Detection/planning or job completion is required before local approval.")}
-            <section><h2>"4. Signed application updates"</h2><p>"Updates use the locally configured trusted Ed25519 public key and actual current app version, never a key supplied by a coordinator or manifest. A missing trusted key blocks verification. Staging does not mean installation; review the result before applying. Dependency updates above remain owner-controlled."</p>
-                {form("/ui/setup/update/verify", csrf, textarea("Signed release envelope JSON", "manifest", "", true), "Verify signature and compatibility")}
-                {form("/ui/setup/update/stage", csrf, textarea("Signed release envelope JSON to download and stage", "manifest", "", true), "Verify and stage update")}
+            <section><details class="advanced"><summary>"4. Signed application updates"</summary><p>"Updates use the locally configured trusted Ed25519 public key and actual current app version, never a key supplied by a coordinator or manifest. A missing trusted key blocks verification. Staging does not mean installation; review the result before applying. Dependency updates above remain owner-controlled."</p>
+                <details><summary>"Verify a release signature"</summary>{form("/ui/setup/update/verify", csrf, textarea("Signed release envelope JSON", "manifest", "", true), "Verify signature and compatibility")}</details>
+                <details><summary>"Download and stage a verified release"</summary>{form("/ui/setup/update/stage", csrf, textarea("Signed release envelope JSON to download and stage", "manifest", "", true), "Verify and stage update")}</details>
                 <details><summary>"Apply staged update using local helper"</summary><p>"Stop the target application and reconcile pending work first. Apply from the separate helper, especially on Windows where a running executable is locked. Failed replacement must preserve the previous executable and recovery evidence."</p>
                     {form("/ui/setup/update/apply", csrf, input("Absolute local target executable path", "target", "text", "", true), "Apply verified staged update")}
                 </details>
                 <details><summary>"Roll back a recorded application update"</summary><p>"Use the retained local update journal and backup. Stop the target application first. Rollback is available only when the engine can verify the recorded previous executable; it does not undo project or dependency changes."</p>
                     {form("/ui/setup/update/rollback", csrf, input("Absolute local target executable path", "target", "text", "", true), "Restore verified previous executable")}
                 </details>
-            </section>
+            </details></section>
+            </div>
         },
     )
 }

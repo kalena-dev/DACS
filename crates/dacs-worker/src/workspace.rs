@@ -127,19 +127,54 @@ pub(crate) async fn capture(
     Ok((code, out, err))
 }
 
+// Git for Windows parses its own path arguments. Keep canonical paths inside
+// the worker and translate verbatim drive/UNC prefixes only at this boundary.
+fn git_argument(value: String) -> String {
+    #[cfg(windows)]
+    {
+        let mut value = value;
+        if value.starts_with(r"\\?\UNC\") {
+            value.replace_range(..8, r"\\");
+        } else if value.strip_prefix(r"\\?\").is_some_and(|path| {
+            matches!(path.as_bytes(), [drive, b':', b'\\', ..] if drive.is_ascii_alphabetic())
+        }) {
+            value.replace_range(..4, "");
+        }
+        value
+    }
+    #[cfg(not(windows))]
+    {
+        value
+    }
+}
+
+pub(crate) fn git_arguments(args: impl IntoIterator<Item = String>) -> Vec<String> {
+    const OPTIONS: [&str; 10] = [
+        "-c",
+        "core.longpaths=true",
+        "-c",
+        "core.autocrlf=false",
+        "-c",
+        "core.eol=lf",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "protocol.file.allow=always",
+    ];
+    let args = args.into_iter();
+    let mut options = Vec::with_capacity(OPTIONS.len() + args.size_hint().0);
+    options.extend(OPTIONS.into_iter().map(String::from));
+    options.extend(args.map(git_argument));
+    options
+}
+
 pub(crate) async fn git(
     supervisor: &Supervisor,
     attempt: &str,
     cwd: &Path,
     args: &[&str],
 ) -> Result<String> {
-    let mut options = vec![
-        "-c".into(),
-        "core.hooksPath=/dev/null".into(),
-        "-c".into(),
-        "protocol.file.allow=always".into(),
-    ];
-    options.extend(args.iter().map(|s| (*s).to_owned()));
+    let options = git_arguments(args.iter().map(|s| (*s).to_owned()));
     let (code, out, err) = capture(
         supervisor,
         Some(attempt),
@@ -289,5 +324,82 @@ mod tests {
             assert!(super::safe_id(invalid).is_err());
         }
         assert!(super::safe_id("attempt-123_abc").is_ok());
+    }
+
+    #[tokio::test]
+    async fn canonical_workspace_paths_support_bundle_checkout() {
+        use super::*;
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let source = root.join("source with spaces");
+        let bundle = root.join("source.bundle");
+        let checkout = root.join("isolated checkout");
+        let supervisor = Supervisor::new();
+        git(
+            &supervisor,
+            "attempt",
+            &root,
+            &["init", "--initial-branch=main", source.to_str().unwrap()],
+        )
+        .await
+        .unwrap();
+        let content = "canonical checkout proof\npinned input bytes\n";
+        std::fs::write(source.join("proof.txt"), content).unwrap();
+        git(&supervisor, "attempt", &source, &["add", "proof.txt"])
+            .await
+            .unwrap();
+        git(
+            &supervisor,
+            "attempt",
+            &source,
+            &[
+                "-c",
+                "user.name=DACS fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "Pinned fixture",
+            ],
+        )
+        .await
+        .unwrap();
+        let expected = git(&supervisor, "attempt", &source, &["rev-parse", "HEAD"])
+            .await
+            .unwrap();
+        git(
+            &supervisor,
+            "attempt",
+            &source,
+            &["bundle", "create", bundle.to_str().unwrap(), "--all"],
+        )
+        .await
+        .unwrap();
+        git(
+            &supervisor,
+            "attempt",
+            &root,
+            &[
+                "clone",
+                "--config",
+                "core.autocrlf=true",
+                bundle.to_str().unwrap(),
+                checkout.to_str().unwrap(),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            git(&supervisor, "attempt", &checkout, &["rev-parse", "HEAD"])
+                .await
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("proof.txt")).unwrap(),
+            content
+        );
     }
 }
