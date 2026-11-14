@@ -4,6 +4,8 @@ This is the consolidated handoff for finishing DACS from one computer. Implement
 
 A single computer can host the coordinator, multiple agent sessions and isolated Linux development environments. Those runs can complete local integration, but cannot establish the original requirement for three physical PCs or two distinct remote physical compiler hosts. Keep that distinction in the final report.
 
+Integration note: this handoff preserved incoming `main` changes through `86a1d1b`, including supervisor/crash-recovery tests, compiler-network/placement code and packaging changes. This session did not rerun those incoming changes. Check their focused tests and owner evidence when pinning the next baseline; earlier passes below apply to their recorded revisions.
+
 ## Already done: do not repeat without a relevant change
 
 - Coordinator, worker, source/artifact transport, setup/onboarding, UI and build/release adapters are integrated. The restrained UI redesign is on `main`.
