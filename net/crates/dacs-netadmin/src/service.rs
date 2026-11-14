@@ -347,13 +347,14 @@ impl<H: HeadscaleApi> Service<H> {
             )));
         }
 
-        let mut key_expired = false;
+        // A key without an expiry never expires in Headscale; expire it too.
+        let mut expire_sent = false;
         if let Some(k) = &key
             && !k.used
-            && k.expiration.is_some_and(|e| e > now)
+            && k.expiration.is_none_or(|e| e > now)
         {
             self.hs.expire_key(k.id).await?;
-            key_expired = true;
+            expire_sent = true;
         }
 
         let mut node_deleted = None;
@@ -366,10 +367,28 @@ impl<H: HeadscaleApi> Service<H> {
         }
 
         let after = self.hs.list_nodes().await?;
-        let verified_absent = matches!(
+        let node_absent = matches!(
             Self::find_node(&after, req.node_id.or(node_deleted), req.auth_key_id),
             Ok(None)
         );
+        // Re-read the key instead of trusting the expire reply: a no-op expire,
+        // or a retry after a lost reply, must report what Headscale now holds.
+        // Headscale stamps the expiry with its own clock, so compare against
+        // the current time rather than the request time.
+        let (key_expired, key_unusable) = match req.auth_key_id {
+            Some(key_id) => {
+                let checked_at = OffsetDateTime::now_utc().max(now);
+                match self.find_key(key_id).await? {
+                    Some(k) => {
+                        let expired = k.expiration.is_some_and(|e| e <= checked_at);
+                        (!k.used && expired, k.used || expired)
+                    }
+                    None => (false, true),
+                }
+            }
+            None => (false, true),
+        };
+        let verified_absent = node_absent && key_unusable;
 
         self.audit.record(
             "revoke",
@@ -379,6 +398,7 @@ impl<H: HeadscaleApi> Service<H> {
                 "node_id": req.node_id,
                 "requested_by": req.requested_by,
                 "reason": req.reason,
+                "expire_sent": expire_sent,
                 "key_expired": key_expired,
                 "node_deleted": node_deleted,
                 "verified_absent": verified_absent,

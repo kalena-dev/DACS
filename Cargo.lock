@@ -881,6 +881,7 @@ dependencies = [
  "clap",
  "dacs-net-contract",
  "hex",
+ "http-body",
  "rand 0.9.5",
  "rcgen",
  "reqwest",

@@ -92,6 +92,11 @@ pub enum Fault {
     EchoAuth,
     /// Apply the operation, then reply 200 with this body instead.
     ApplyThenBody(Value),
+    /// Handle normally (lets a later fault for the same op hit the N-th call).
+    Pass,
+    /// Run this on the server state first (e.g. a device joining at that
+    /// moment), then handle normally.
+    Before(fn(&mut HsState)),
 }
 
 #[derive(Clone, Debug)]
@@ -149,6 +154,37 @@ fn ts(t: Option<OffsetDateTime>) -> Value {
 }
 
 impl HsState {
+    /// What a Tailscale client does with `--auth-key` (see [`MockHeadscale::register`]).
+    pub fn register(&mut self, secret: &str, os_name: &str, ip: &str) -> Result<u64, String> {
+        let s = self;
+        let now = OffsetDateTime::now_utc();
+        let k = s
+            .keys
+            .iter_mut()
+            .find(|k| k.secret == secret)
+            .ok_or("invalid authkey")?;
+        if k.used && !k.reusable {
+            return Err("authkey already used".into());
+        }
+        if k.expiration.is_some_and(|e| e <= now) {
+            return Err("authkey expired".into());
+        }
+        k.used = true;
+        let (key_id, tags) = (k.id, k.tags.clone());
+        s.next_id += 1;
+        let id = s.next_id;
+        s.nodes.push(HsNode {
+            id,
+            name: os_name.into(),
+            given_name: os_name.into(),
+            ips: vec![ip.into()],
+            tags,
+            key_id: Some(key_id),
+            online: true,
+        });
+        Ok(id)
+    }
+
     fn key_json(&self, k: &Key, full_secret: bool) -> Value {
         // Real list responses mask the key (`hskey-auth-<prefix>-***`); only the
         // create response carries the full secret.
@@ -283,12 +319,23 @@ impl HsState {
 
 type Shared = Arc<Mutex<HsState>>;
 
-/// A response whose declared length exceeds its body: hyper aborts the
-/// connection, so the client sees a transport error after the status line.
+/// A body that fails after the status line and headers are sent: hyper aborts
+/// the connection, so the client sees a transport error mid-response.
+struct FailingBody;
+
+impl axum::body::HttpBody for FailingBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, std::io::Error>>> {
+        std::task::Poll::Ready(Some(Err(std::io::Error::other("connection lost"))))
+    }
+}
+
 fn broken() -> Response {
-    let mut r = Response::new(Body::from("{\"pre"));
-    r.headers_mut()
-        .insert(header::CONTENT_LENGTH, "4096".parse().unwrap());
+    let mut r = Response::new(Body::new(FailingBody));
     r.headers_mut()
         .insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
     r
@@ -333,6 +380,7 @@ async fn handle(
         }
         Some(Fault::DropBeforeApply) => return broken(),
         Some(Fault::NoopOk) => return axum::Json(json!({})).into_response(),
+        Some(Fault::Before(hook)) => hook(&mut s),
         Some(Fault::EchoAuth) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -426,33 +474,7 @@ impl MockHeadscale {
     /// single-use key or an expired key; otherwise it registers a node that
     /// inherits the key's tags.
     pub fn register(&self, secret: &str, os_name: &str, ip: &str) -> Result<u64, String> {
-        let mut s = self.lock();
-        let now = OffsetDateTime::now_utc();
-        let k = s
-            .keys
-            .iter_mut()
-            .find(|k| k.secret == secret)
-            .ok_or("invalid authkey")?;
-        if k.used && !k.reusable {
-            return Err("authkey already used".into());
-        }
-        if k.expiration.is_some_and(|e| e <= now) {
-            return Err("authkey expired".into());
-        }
-        k.used = true;
-        let (key_id, tags) = (k.id, k.tags.clone());
-        s.next_id += 1;
-        let id = s.next_id;
-        s.nodes.push(HsNode {
-            id,
-            name: os_name.into(),
-            given_name: os_name.into(),
-            ips: vec![ip.into()],
-            tags,
-            key_id: Some(key_id),
-            online: true,
-        });
-        Ok(id)
+        self.lock().register(secret, os_name, ip)
     }
 
     /// Add a node that netadmin did not enroll (infrastructure, personal).
