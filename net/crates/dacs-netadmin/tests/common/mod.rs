@@ -625,7 +625,8 @@ impl Harness {
     }
 
     pub async fn membership(&self, q: &Value) -> (StatusCode, String) {
-        self.op("POST", "/v1/memberships/query", Some(q.clone())).await
+        self.op("POST", "/v1/memberships/query", Some(q.clone()))
+            .await
     }
 }
 
@@ -649,7 +650,9 @@ pub async fn call(
     };
     let resp = app.clone().oneshot(req).await.unwrap();
     let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
     (status, String::from_utf8(bytes.to_vec()).unwrap())
 }
 
@@ -768,11 +771,20 @@ pub fn write_private(path: &Path, contents: &str) {
 }
 
 /// Write the secret files and a config for `listen`; returns the config path.
-pub fn write_config(dir: &Path, listen: &str, headscale_url: &str, api_key: &str, extra: Value) -> PathBuf {
+pub fn write_config(
+    dir: &Path,
+    listen: &str,
+    headscale_url: &str,
+    api_key: &str,
+    extra: Value,
+) -> PathBuf {
     let key_path = dir.join("headscale-api-key");
     let tokens_path = dir.join("operation-tokens.sha256");
     write_private(&key_path, &format!("{api_key}\n"));
-    write_private(&tokens_path, &format!("# coordinator\n{}\n", hex::encode(hash_token(TOKEN))));
+    write_private(
+        &tokens_path,
+        &format!("# coordinator\n{}\n", hex::encode(hash_token(TOKEN))),
+    );
     let mut cfg = json!({
         "listen": listen,
         "headscale_url": headscale_url,

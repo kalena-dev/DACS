@@ -3,7 +3,9 @@
 //! than the machine it runs on.
 #![cfg(unix)]
 
-use dacs_protocol::{Resources, WorkerRegistration};
+mod support;
+
+use dacs_protocol::{EffectClass, Resources, WorkerRegistration};
 use dacs_worker::{ManagedChild, Supervisor, capacity, runtime::WorkerConfig};
 use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
 use std::{
@@ -224,4 +226,60 @@ async fn worker_refuses_to_declare_more_than_the_physical_host() {
         "{error:#}"
     );
     assert!(!root.join("launched").exists());
+}
+
+/// Real worker loop: an assignment that would exceed the declaration beside a
+/// running attempt is held unstarted, and starts only once the running
+/// attempt's whole tree is verifiably gone.
+#[test]
+fn assignment_beyond_declared_capacity_waits_for_running_work_to_release() {
+    let mut harness = support::Harness::new(EffectClass::Workspace);
+    // Declared: 2 agent slots, 2000 cpu_millis, 1024 MB memory and disk.
+    // attempt-1 holds 1000 cpu_millis; attempt-2 needs 1500.
+    harness.add_assignment(
+        "task-2",
+        "attempt-2",
+        Resources {
+            agent_slots: 1,
+            cpu_millis: 1500,
+            memory_mb: 256,
+            disk_mb: 256,
+        },
+    );
+    harness.start_worker();
+    harness.wait_for("first attempt running", || {
+        !harness.trees().is_empty() && harness.accepted_for(support::ATTEMPT, "started")
+    });
+    // Twenty 100 ms worker cycles later the oversubscribing assignment has
+    // neither launched a process nor reported anything.
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(harness.trees().len(), 1, "{}", harness.worker_log());
+    assert!(!harness.reported("attempt-2"));
+
+    let (leader, descendant) = harness.trees()[0];
+    std::fs::write(
+        harness.log.join("old-pids"),
+        format!("{leader} {descendant}\n"),
+    )
+    .unwrap();
+    harness.update(|fake| fake.watch = vec![leader, descendant]);
+    harness.fence(support::ATTEMPT);
+    harness.wait_for("second attempt started after the first released", || {
+        harness.trees().len() == 2 && harness.accepted_for("attempt-2", "started")
+    });
+    let release = harness
+        .log()
+        .into_iter()
+        .find(|l| l.releases(support::ATTEMPT))
+        .expect("first attempt released");
+    assert_eq!(release.watched_alive, vec![false, false]);
+    // The second OMP checked the first tree's pids itself at launch.
+    assert!(harness.lines("overlap").is_empty());
+
+    harness.fence("attempt-2");
+    harness.wait_for("second attempt released", || {
+        harness.log().iter().any(|l| l.releases("attempt-2"))
+    });
+    harness.drain_and_wait();
+    assert_eq!(harness.receipts(), 0);
 }

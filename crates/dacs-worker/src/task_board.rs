@@ -59,18 +59,20 @@ pub struct FilterTasks {
     pub q: Option<String>,
 }
 
+/// redb errors are boxed: `TransactionError` alone is 160 bytes, which would
+/// make every `Result<_, BoardError>` carry it (`clippy::result_large_err`).
 #[derive(Debug, Error)]
 pub enum BoardError {
     #[error("redb database error: {0}")]
-    Db(#[from] redb::DatabaseError),
+    Db(#[source] Box<redb::DatabaseError>),
     #[error("redb transaction error: {0}")]
-    Transaction(#[from] redb::TransactionError),
+    Transaction(#[source] Box<redb::TransactionError>),
     #[error("redb storage error: {0}")]
-    Storage(#[from] redb::StorageError),
+    Storage(#[source] Box<redb::StorageError>),
     #[error("redb table error: {0}")]
-    Table(#[from] redb::TableError),
+    Table(#[source] Box<redb::TableError>),
     #[error("redb commit error: {0}")]
-    Commit(#[from] redb::CommitError),
+    Commit(#[source] Box<redb::CommitError>),
     #[error("task not found")]
     NotFound,
     #[error("task title cannot be empty")]
@@ -78,6 +80,24 @@ pub enum BoardError {
     #[error("task encoding error: {0}")]
     Json(#[from] serde_json::Error),
 }
+
+macro_rules! boxed_redb_error {
+    ($($variant:ident($source:ty)),* $(,)?) => {$(
+        impl From<$source> for BoardError {
+            fn from(error: $source) -> Self {
+                Self::$variant(Box::new(error))
+            }
+        }
+    )*};
+}
+
+boxed_redb_error!(
+    Db(redb::DatabaseError),
+    Transaction(redb::TransactionError),
+    Storage(redb::StorageError),
+    Table(redb::TableError),
+    Commit(redb::CommitError),
+);
 
 #[derive(Clone)]
 pub struct TaskBoard {

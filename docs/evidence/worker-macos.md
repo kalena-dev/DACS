@@ -9,21 +9,22 @@ Date: 2026-11-14. Single host, loopback only, no model provider contacted.
 | Host | macOS 27.0.1 (build 26A434), Apple Silicon `arm64`, 14 logical CPUs, 24 GiB |
 | Toolchain | `rustc 1.99.0 (b940084d7 2026-09-28)` |
 | Installed OMP | `omp/18.16.0` at `~/.local/bin/omp`. The team pins `18.20.0`. These tests use a scripted OMP stand-in; the installed binary was only asked for `--version` |
-| Code under test | `crates/dacs-worker` at commit "worker: poll exiting process-group members instead of failing the stop", rebased on `origin/main` `23b67b6` |
+| Code under test | `crates/dacs-worker` at commit "worker: exercise the local capacity guard in the real worker loop", rebased on `origin/main` `894c14c` |
 
 ## What the tests do
 
 - **`tests/crash_recovery.rs`** re-executes the test binary as a worker. That process launches real process groups through `Supervisor::persistent`: a live leader with a descendant, and a leader that exits immediately while its descendant keeps the group alive. The worker is then SIGKILLed, so no destructor or `KillOnDrop` runs. The test confirms the trees are still alive, restarts from the same data directory, and checks every PID with `kill(2)`. A supervisor-reported stop does not count as proof. The file also covers leaderless groups that DACS must not kill.
-- **`tests/crash_reconnect.rs`** runs the real `runtime::run` in a separate worker process. It talks to an in-process fake coordinator (axum, protocol v1 routes) and a `sh`/`awk` stand-in for the pinned OMP that answers the JSONL frames and never contacts a provider. Each attempt OMP leads a process group with a `sleep 600` descendant and keeps running after its RPC stdin closes. The fake coordinator records every command and, when a release (`ReconcileWorker` or `Stopped`) arrives, checks whether the watched PIDs are alive at that moment.
-- **`tests/capacity.rs`** launches OMP-tool, build and compiler-daemon process trees under one reservation. It also runs `run()` with a declared capacity larger than the host.
+- **`tests/crash_reconnect.rs`** (harness in `tests/support/mod.rs`) runs the real `runtime::run` in a separate worker process. It talks to an in-process fake coordinator (axum, protocol v1 routes) and a `sh`/`awk` stand-in for the pinned OMP that answers the JSONL frames and never contacts a provider. Each attempt OMP leads a process group with a `sleep 600` descendant and keeps running after its RPC stdin closes. The fake coordinator records every command and, when a release (`ReconcileWorker` or `Stopped`) arrives, checks whether the watched PIDs are alive at that moment.
+- **`tests/capacity.rs`** launches OMP-tool, build and compiler-daemon process trees under one reservation. It also runs `run()` with a declared capacity larger than the host. Its third test uses the same harness to admit two assignments whose combined reservations exceed the worker's declaration.
 
 ## Commands and results
 
 | Command | Result |
 |---|---|
-| `cargo test -p dacs-worker` | Passed: lib 33, `capacity` 2, `crash_reconnect` 2, `crash_recovery` 4, `windows_workflow` 0 (Windows-only). The 2 ignored tests are helper processes their parent tests re-execute |
+| `cargo test -p dacs-worker` | Passed at `894c14c`: lib 36, `capacity` 3, `crash_reconnect` 2, `crash_recovery` 4, `windows_workflow` 0 (Windows-only), plus other owners' `journal_read_only` 6, `lifecycle` 6 and `omp_real` 12. The 3 ignored tests are helper processes their parent tests re-execute |
 | `cargo test -p dacs-worker --test crash_reconnect -- --nocapture crash_then_fenced` | Passed. Restart trace below |
-| Repeated runs (`cargo test -q -p dacs-worker --test <name>` in a loop) | `capacity` 60/60, `crash_recovery` 30/30, `crash_reconnect` 15/15 and 5/5. After each loop, `ps` showed no leftover fixture processes |
+| Repeated runs (`cargo test -q -p dacs-worker --test <name>` in a loop) | `capacity` 60/60 (two-test version) and 15/15 (with the end-to-end test), `crash_recovery` 30/30, `crash_reconnect` 15/15, 5/5 and 10/10. Fixture processes seen by `ps` after a loop had all exited within seconds; other agents run the same tests on this host concurrently |
+| Mutation: capacity guard disabled in `run()` (`if false && !fits(..)`) | `assignment_beyond_declared_capacity_waits_for_running_work_to_release` **failed** as intended: both OMPs launched (`left: 2, right: 1`). Source restored |
 | Mutation: `supervisor.reconcile_previous()` commented out in `run()` | Both `crash_reconnect` tests **failed** as intended: the release arrived with the crashed tree alive (`watched_alive=[true, true]`), and the relaunch overlapped it. Source restored |
 | Mutation: pre-fix `supervisor.rs` with the new `crash_recovery` test | **Failed** as intended: `prior process group remains or cannot be inspected` (orphaned group). The leaked fixture processes were killed by hand |
 | `perl` zombie-only process group, `kill(0, -pgid)` before and after reaping | `EPERM` while the only member was an unreaped zombie, `ESRCH` after reaping. This explained a 1-in-40 `EPERM` failure of `Supervisor::terminate`, now fixed |
@@ -53,7 +54,7 @@ Restart trace from the fenced-attempt test (phase 2, after the crash; heartbeats
 | Stop reported only after confirmed process termination (an abort response is not proof) | Release checks in both `crash_reconnect` tests. `exiting_group_members_are_polled_until_absent` covers the macOS zombie `EPERM` case | **Passed** |
 | OMP tools, build/test processes and compiler allocations count against their reservation | `capacity::every_process_of_an_attempt_tree_counts_against_its_reservation` (`Supervisor::usage`, attribution by kernel process group, unreserved probe kept apart, release kills the whole tree) | **Passed** |
 | Declared capacity cannot exceed the physical host | `capacity::worker_refuses_to_declare_more_than_the_physical_host`: `run()` refuses before launching OMP. Unit tests cover CPU, memory and disk limits | **Passed** |
-| Local guard: an assignment that would exceed the declaration beside running attempts is held unstarted | `capacity::fits` unit test only. The branch in `run()` was not exercised end to end | **Not run** (end to end) |
+| Local guard: an assignment that would exceed the declaration beside running attempts is held unstarted | `capacity::assignment_beyond_declared_capacity_waits_for_running_work_to_release`: over twenty 100 ms worker cycles the second assignment launched nothing and reported nothing. It started only after the first attempt's release, which arrived with `watched_alive=[false, false]`, and its OMP saw no first-tree PID alive | **Passed** (fake coordinator) |
 | A VM is not counted as another machine | The coordinator folds capacity by `physical_host_id` (Person 1). The worker cannot detect virtualization and relies on the configured host id | **Not run** |
 | The same behaviour on Linux and Windows | Linux not run. On Windows, restart still refuses while a previous job is active, and `Supervisor::usage` counts only job leaders | **Not run** |
 | Crash with the real pinned OMP instead of the stand-in | Installed 18.16.0 does not match the 18.20.0 pin, and a live `dacs worker run` sends a provider-readiness prompt, which was not allowed | **Not run** |
