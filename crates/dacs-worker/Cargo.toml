@@ -31,6 +31,8 @@ uuid.workspace = true
 nix = { version = "0.30", features = ["signal", "process"] }
 
 [dev-dependencies]
+# Real coordinator state machine behind an HTTP shim in tests/obligations.rs.
+dacs-core.workspace = true
 tempfile.workspace = true
 
 [target.'cfg(all(windows, target_env = "msvc"))'.dev-dependencies]

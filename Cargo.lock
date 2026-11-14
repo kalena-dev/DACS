@@ -1006,6 +1006,7 @@ dependencies = [
  "anyhow",
  "axum",
  "base64 0.22.1",
+ "dacs-core",
  "dacs-protocol",
  "dacs-release-audit",
  "find-msvc-tools",
