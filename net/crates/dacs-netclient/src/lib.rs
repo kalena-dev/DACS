@@ -11,6 +11,7 @@
 //! - [`peers`], [`ping`], [`probe_tcp`] report direct/relayed paths, transfer
 //!   counters and private reachability for build evidence.
 
+pub mod compiler;
 pub mod preflight;
 pub mod tailscale;
 

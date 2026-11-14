@@ -326,3 +326,25 @@ fn leave_refuses_a_non_dacs_profile() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("refusing to log out"));
     fake.assert_no_mutation();
 }
+
+#[test]
+fn compiler_check_refuses_non_overlay_endpoints_before_probing() {
+    let fake = Fake::new(STATUS_MACOS_STOPPED, PREFS_MACOS_STOPPED);
+    // A guest reached through its host's NAT/LAN address is not an overlay node.
+    let list = r#"[
+      {"host_name": "compile-guest", "role": "scheduler", "overlay_ip": "100.64.0.5", "port": 10600},
+      {"host_name": "compile-guest", "role": "server", "overlay_ip": "192.168.1.20", "port": 10501}
+    ]"#;
+    let path = fake.path("endpoints.json");
+    std::fs::write(&path, list).unwrap();
+    for extra in [&[][..], &["--from", "client"][..]] {
+        let mut args = vec!["compiler-check", "--endpoints", path.to_str().unwrap()];
+        args.extend_from_slice(extra);
+        let out = fake.run(&args);
+        assert_eq!(out.status.code(), Some(1), "{extra:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("not a private overlay address"), "{err}");
+    }
+    // Only the read-only local state lookup ran; no ping was sent.
+    read_only_calls_only(&fake);
+}
