@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod workflow;
+
 pub const PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,12 +84,31 @@ pub struct Project {
     pub requirements: Value,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TaskExecution {
+    #[default]
+    Agent,
+    Workflow {
+        request: Value,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowCompletion {
+    pub success: bool,
+    pub artifact_digest: String,
+    pub evidence: Vec<CheckEvidence>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskSpec {
     pub project_id: String,
     pub title: String,
     pub instructions: String,
     pub source_commit: String,
+    #[serde(default)]
+    pub execution: TaskExecution,
     #[serde(default)]
     pub dependencies: Vec<String>,
     #[serde(default)]
@@ -111,6 +132,8 @@ pub struct TaskRecord {
     pub parent_task_id: Option<String>,
     pub attempt_id: Option<String>,
     pub integrated_sha: Option<String>,
+    #[serde(default)]
+    pub workflow_result: Option<WorkflowCompletion>,
     pub blocked_reason: Option<String>,
     pub cancel_requested: bool,
 }
@@ -303,6 +326,14 @@ pub enum WorkerEvent {
         estimated: bool,
     },
     Settled,
+    WorkflowCompleted {
+        success: bool,
+        artifact_digest: String,
+        evidence: Vec<CheckEvidence>,
+    },
+    CompilerTelemetry {
+        records: Vec<Value>,
+    },
     Failed {
         message: String,
     },

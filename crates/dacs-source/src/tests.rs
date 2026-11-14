@@ -196,6 +196,7 @@ impl Fixture {
                     title: "Integrate fixture".into(),
                     instructions: "Fixture source publication".into(),
                     source_commit: base.into(),
+                    execution: dacs_protocol::TaskExecution::Agent,
                     dependencies: vec![],
                     required_capabilities: vec![],
                     resources: Resources {

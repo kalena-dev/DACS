@@ -89,17 +89,39 @@ pub(crate) fn release(db: &Connection, attempt: &AttemptRecord) -> Result<bool> 
 }
 
 pub(crate) fn result_eligible(db: &Connection, a: &AttemptRecord, t: &TaskRecord) -> Result<bool> {
-    if a.lease_expires_at > now() { return Ok(true); }
-    if t.spec.effect_class != EffectClass::External || !a.settled { return Ok(false); }
-    db.query_row("SELECT EXISTS(SELECT 1 FROM records WHERE kind='execution_stopped' AND id=?1)", [&a.id], |r| r.get(0)).map_err(sql)
+    if a.lease_expires_at > now() {
+        return Ok(true);
+    }
+    if t.spec.effect_class != EffectClass::External || !a.settled {
+        return Ok(false);
+    }
+    db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM records WHERE kind='execution_stopped' AND id=?1)",
+        [&a.id],
+        |r| r.get(0),
+    )
+    .map_err(sql)
 }
 
-pub(crate) fn reconcile_stop(db: &Connection, a: &mut AttemptRecord, t: &TaskRecord) -> Result<bool> {
+pub(crate) fn reconcile_stop(
+    db: &Connection,
+    a: &mut AttemptRecord,
+    t: &TaskRecord,
+) -> Result<bool> {
     put(db, "execution_stopped", &a.id, &t.spec.project_id, &now())?;
+    crate::builds::reconcile_stopped(db, a)?;
     let released = release(db, a)?;
-    if !released && !matches!(a.state.as_str(), "fenced" | "abandoned" | "failed" | "cost_capped") {
+    if !released
+        && !matches!(
+            a.state.as_str(),
+            "fenced" | "abandoned" | "failed" | "cost_capped"
+        )
+    {
         a.state = "waiting".into();
-    } else if !matches!(a.state.as_str(), "fenced" | "abandoned" | "failed" | "accepted" | "result_submitted" | "cost_capped") {
+    } else if !matches!(
+        a.state.as_str(),
+        "fenced" | "abandoned" | "failed" | "accepted" | "result_submitted" | "cost_capped"
+    ) {
         a.state = "stopped".into();
     }
     a.settled = true;
@@ -109,24 +131,55 @@ pub(crate) fn reconcile_stop(db: &Connection, a: &mut AttemptRecord, t: &TaskRec
 }
 
 pub(crate) fn resume_waiting(db: &Connection, a: &mut AttemptRecord, t: &TaskRecord) -> Result<()> {
-    let reserved: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM reservations WHERE attempt=?1)", [&a.id], |r| r.get(0)).map_err(sql)?;
+    let reserved: bool = db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM reservations WHERE attempt=?1)",
+            [&a.id],
+            |r| r.get(0),
+        )
+        .map_err(sql)?;
     if !reserved || a.started_at + t.spec.max_runtime_seconds as i64 <= now() {
-        return Err(conflict("waiting attempt has no resumable reservation or exceeded runtime"));
+        return Err(conflict(
+            "waiting attempt has no resumable reservation or exceeded runtime",
+        ));
     }
-    db.execute("DELETE FROM records WHERE kind='execution_stopped' AND id=?1", [&a.id]).map_err(sql)?;
+    db.execute(
+        "DELETE FROM records WHERE kind='execution_stopped' AND id=?1",
+        [&a.id],
+    )
+    .map_err(sql)?;
     a.state = "executing".into();
     a.settled = false;
-    a.lease_expires_at = (now() + t.spec.lease_seconds as i64).min(a.started_at + t.spec.max_runtime_seconds as i64);
+    a.lease_expires_at =
+        (now() + t.spec.lease_seconds as i64).min(a.started_at + t.spec.max_runtime_seconds as i64);
     Ok(())
 }
 
 pub(crate) fn finalize_cancellation(db: &Connection, task_id: &str) -> Result<()> {
     let mut t: TaskRecord = get(db, "task", task_id)?;
-    if !t.cancel_requested || terminal(t.state) || t.state == TaskState::Publishing { return Ok(()); }
-    if all::<TaskRecord>(db, "task")?.iter().any(|child| child.parent_task_id.as_deref() == Some(task_id) && !terminal(child.state)) { return Ok(()); }
-    for a in all::<AttemptRecord>(db, "attempt")?.iter().filter(|a| a.task_id == task_id) {
-        let held: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM reservations WHERE attempt=?1)", [&a.id], |r| r.get(0)).map_err(sql)?;
-        if held || !a.pending_children.is_empty() { return Ok(()); }
+    if !t.cancel_requested || terminal(t.state) || t.state == TaskState::Publishing {
+        return Ok(());
+    }
+    if all::<TaskRecord>(db, "task")?
+        .iter()
+        .any(|child| child.parent_task_id.as_deref() == Some(task_id) && !terminal(child.state))
+    {
+        return Ok(());
+    }
+    for a in all::<AttemptRecord>(db, "attempt")?
+        .iter()
+        .filter(|a| a.task_id == task_id)
+    {
+        let held: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM reservations WHERE attempt=?1)",
+                [&a.id],
+                |r| r.get(0),
+            )
+            .map_err(sql)?;
+        if held || !a.pending_children.is_empty() {
+            return Ok(());
+        }
     }
     t.state = TaskState::Cancelled;
     t.blocked_reason = Some("cancellation completed after owned execution reconciliation".into());
@@ -145,6 +198,26 @@ pub(crate) fn validate_spec(
     resources_valid(&spec.resources)?;
     if spec.resources.agent_slots == 0 && spec.resources.cpu_millis == 0 {
         return Err(invalid("task must reserve agent or CPU capacity"));
+    }
+    if spec
+        .required_capabilities
+        .iter()
+        .any(|cap| cap == "desktop")
+        && (spec.effect_class != EffectClass::External || spec.resources.agent_slots == 0)
+    {
+        return Err(invalid(
+            "desktop tasks require external effects and an agent reservation",
+        ));
+    }
+    if let TaskExecution::Workflow { request } = &spec.execution {
+        if spec.effect_class != EffectClass::External || spec.resources.cpu_millis == 0 {
+            return Err(invalid(
+                "workflow execution requires external effects and CPU reservation",
+            ));
+        }
+        if !request.is_object() {
+            return Err(invalid("workflow request must be a typed object"));
+        }
     }
     if spec.lease_seconds < 1
         || spec.lease_seconds > 86400
@@ -245,6 +318,7 @@ pub(crate) fn create_task(
         parent_task_id: parent.map(|p| p.id.clone()),
         attempt_id: None,
         integrated_sha: None,
+        workflow_result: None,
         blocked_reason: if ready {
             None
         } else {
@@ -283,6 +357,11 @@ pub(crate) fn admit(db: &Connection, task_id: &str, chosen: Option<&str>) -> Res
         return Err(conflict("task retry bound reached"));
     }
     let workers: Vec<WorkerRecord> = all(db, "worker")?;
+    let desktop = t
+        .spec
+        .required_capabilities
+        .iter()
+        .any(|cap| cap == "desktop");
     let mut selected = None;
     for w in &workers {
         if chosen.is_some_and(|id| id != w.id)
@@ -303,14 +382,46 @@ pub(crate) fn admit(db: &Connection, task_id: &str, chosen: Option<&str>) -> Res
         {
             continue;
         }
-        if t.spec.resources.agent_slots > 0 {
+        if t.spec.resources.agent_slots > 0 || desktop {
             match get::<WorkerRuntimeStatus>(db, "runtime", &w.id) {
                 Ok(status)
                     if status.provider_authenticated == Some(true)
-                        && now() - status.observed_at <= 90 => {}
+                        && now() - status.observed_at <= 90
+                        && (!desktop
+                            || (status.desktop_session.is_some()
+                                && !status.desktop_paused
+                                && !status.desktop_active)) => {}
                 Ok(_) => continue,
                 Err(e) if e.code == ErrorCode::NotFound => continue,
                 Err(e) => return Err(e),
+            }
+        }
+        if desktop {
+            // Observation alone cannot fence two admissions before the next heartbeat.
+            let mut query = db
+                .prepare("SELECT attempt FROM reservations WHERE physical_host=?1")
+                .map_err(sql)?;
+            let held = query
+                .query_map([&w.registration.physical_host_id], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(sql)?;
+            let mut occupied = false;
+            for held in held {
+                let attempt: AttemptRecord = get(db, "attempt", &held.map_err(sql)?)?;
+                let task: TaskRecord = get(db, "task", &attempt.task_id)?;
+                if task
+                    .spec
+                    .required_capabilities
+                    .iter()
+                    .any(|cap| cap == "desktop")
+                {
+                    occupied = true;
+                    break;
+                }
+            }
+            if occupied {
+                continue;
             }
         }
         let own = reserved(db, "worker", &w.id)?;
@@ -319,10 +430,11 @@ pub(crate) fn admit(db: &Connection, task_id: &str, chosen: Option<&str>) -> Res
         }
         // Multiple agents/VMs declaring one physical host never multiply its budget.
         let mut physical_cap = w.registration.capacity.clone();
-        for other in workers
-            .iter()
-            .filter(|o| o.approved && !o.revoked && o.registration.physical_host_id == w.registration.physical_host_id)
-        {
+        for other in workers.iter().filter(|o| {
+            o.approved
+                && !o.revoked
+                && o.registration.physical_host_id == w.registration.physical_host_id
+        }) {
             physical_cap.agent_slots = physical_cap
                 .agent_slots
                 .min(other.registration.capacity.agent_slots);
@@ -386,6 +498,7 @@ pub(crate) fn admit(db: &Connection, task_id: &str, chosen: Option<&str>) -> Res
     t.blocked_reason = None;
     put(db, "attempt", &a.id, &p.id, &a)?;
     put(db, "task", &t.id, &p.id, &t)?;
+    crate::builds::acquire_for_workflow(db, &t, &a)?;
     message(
         db,
         &w.id,
@@ -397,7 +510,7 @@ pub(crate) fn admit(db: &Connection, task_id: &str, chosen: Option<&str>) -> Res
     event(db, Some(&p.id), "attempt_admitted", value(&a)?)?;
     Ok(a)
 }
-pub(crate) fn current(
+pub(crate) fn owned_attempt(
     db: &Connection,
     p: &Principal,
     attempt_id: &str,
@@ -412,11 +525,22 @@ pub(crate) fn current(
             "attempt belongs to another worker",
         ));
     }
-    if a.generation != generation
-        || t.generation != generation
+    if a.generation != generation {
+        return Err(conflict("attempt generation does not match"));
+    }
+    Ok((a, t))
+}
+
+pub(crate) fn current(
+    db: &Connection,
+    p: &Principal,
+    attempt_id: &str,
+    generation: u64,
+) -> Result<(AttemptRecord, TaskRecord)> {
+    let (a, t) = owned_attempt(db, p, attempt_id, generation)?;
+    if t.generation != generation
         || t.attempt_id.as_deref() != Some(&a.id)
-        || a.state == "fenced"
-        || a.state == "abandoned"
+        || matches!(a.state.as_str(), "fenced" | "abandoned")
         || terminal(t.state)
         || t.cancel_requested
     {
@@ -439,7 +563,7 @@ pub(crate) fn notify_parent(db: &Connection, t: &TaskRecord) -> Result<()> {
                 &a.worker_id,
                 Some(&a),
                 "child_result",
-                json!({"task_id":t.id,"state":t.state,"integrated_sha":t.integrated_sha}),
+                json!({"task_id":t.id,"state":t.state,"integrated_sha":t.integrated_sha,"workflow_result":t.workflow_result}),
                 None,
             )?;
         }
@@ -507,7 +631,9 @@ pub(crate) fn cancel(db: &Connection, t: &mut TaskRecord, reason: &str) -> Resul
             None,
         )?;
     }
-    t.blocked_reason = Some(format!("{reason}; awaiting owned execution and child reconciliation"));
+    t.blocked_reason = Some(format!(
+        "{reason}; awaiting owned execution and child reconciliation"
+    ));
     put(db, "task", &t.id, &t.spec.project_id, t)?;
     for mut child in all::<TaskRecord>(db, "task")?
         .into_iter()

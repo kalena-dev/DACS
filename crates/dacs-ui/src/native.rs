@@ -24,9 +24,12 @@ fn validated_url(raw: &str) -> Result<Url> {
     if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
         bail!("remote coordinator requires HTTPS; HTTP is allowed only on loopback");
     }
-    if !matches!(url.path(), "/" | "/login" | "/setup") {
+    if !matches!(
+        url.path(),
+        "/" | "/login" | "/setup" | "/onboarding" | "/network" | "/builds"
+    ) {
         bail!(
-            "launch the dashboard, login or local setup path; invitation and credential paths are not launch URLs"
+            "launch a dashboard, login, compiler pools, network or local setup page; invitation and credential paths are not launch URLs"
         );
     }
     Ok(url)

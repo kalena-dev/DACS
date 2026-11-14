@@ -52,6 +52,7 @@ impl Journal {
     }
 
     fn from_connection(db: Connection) -> Result<Self, JournalError> {
+        db.busy_timeout(std::time::Duration::from_secs(5))?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
             CREATE TABLE IF NOT EXISTS commands(
                 command_id TEXT PRIMARY KEY, body TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'received', received_at_ms INTEGER NOT NULL
@@ -65,7 +66,10 @@ impl Journal {
                 result_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, attempt_id TEXT NOT NULL,
                 generation INTEGER NOT NULL, sequence INTEGER NOT NULL, body TEXT NOT NULL,
                 state TEXT NOT NULL DEFAULT 'pending', created_at_ms INTEGER NOT NULL
-            );")?;
+            );
+            CREATE TABLE IF NOT EXISTS values_store(key TEXT PRIMARY KEY,body TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS outbound_receipts(id TEXT PRIMARY KEY,body TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS sequences(attempt TEXT PRIMARY KEY,value INTEGER NOT NULL);")?;
         Ok(Self { db: Mutex::new(db) })
     }
 
@@ -97,7 +101,9 @@ impl Journal {
             )
             .optional()?
             .flatten();
-        if latest.is_some_and(|generation| command.generation < generation) {
+        if !command.task_id.is_empty()
+            && latest.is_some_and(|generation| command.generation < generation)
+        {
             return Err(JournalError::StaleGeneration);
         }
         tx.execute("INSERT INTO commands(command_id,body,state,received_at_ms) VALUES(?1,?2,'received',?3)", params![command.command_id, body, now_ms()])?;
@@ -119,16 +125,29 @@ impl Journal {
 
     /// Append an event/result to the durable outbox before attempting transport.
     pub fn append_result(&self, result: &PendingResult) -> Result<(), JournalError> {
-        let db = self.db.lock().map_err(|_| JournalError::Poisoned)?;
+        let mut db = self.db.lock().map_err(|_| JournalError::Poisoned)?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let body = serde_json::to_string(result)?;
-        db.execute("INSERT OR IGNORE INTO results(result_id,task_id,attempt_id,generation,sequence,body,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+        let prior: Option<String> = tx
+            .query_row(
+                "SELECT body FROM results WHERE result_id=?1",
+                [&result.result_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if prior.as_ref().is_some_and(|old| old != &body) {
+            return Err(JournalError::DuplicateMismatch);
+        }
+        tx.execute("INSERT OR IGNORE INTO results(result_id,task_id,attempt_id,generation,sequence,body,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7)",
             params![result.result_id, result.task_id, result.attempt_id, result.generation, result.sequence, body, now_ms()])?;
+        tx.commit()?;
         Ok(())
     }
 
     pub fn pending_results(&self, limit: usize) -> Result<Vec<PendingResult>, JournalError> {
         let db = self.db.lock().map_err(|_| JournalError::Poisoned)?;
-        let mut stmt = db.prepare("SELECT body FROM results WHERE state='pending' ORDER BY created_at_ms,result_id LIMIT ?1")?;
+        let mut stmt =
+            db.prepare("SELECT body FROM results WHERE state='pending' ORDER BY rowid LIMIT ?1")?;
         let rows = stmt.query_map([limit as u64], |r| r.get::<_, String>(0))?;
         rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
     }
@@ -150,6 +169,129 @@ impl Journal {
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
     }
+
+    pub fn get_value<T: serde::de::DeserializeOwned>(
+        &self,
+        key: &str,
+    ) -> Result<Option<T>, JournalError> {
+        let db = self.db.lock().map_err(|_| JournalError::Poisoned)?;
+        let value: Option<String> = db
+            .query_row("SELECT body FROM values_store WHERE key=?1", [key], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        value
+            .map(|body| serde_json::from_str(&body).map_err(Into::into))
+            .transpose()
+    }
+
+    pub fn set_value<T: Serialize>(&self, key: &str, value: &T) -> Result<(), JournalError> {
+        let db = self.db.lock().map_err(|_| JournalError::Poisoned)?;
+        db.execute("INSERT INTO values_store(key,body) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET body=excluded.body", params![key, serde_json::to_string(value)?])?;
+        Ok(())
+    }
+
+    pub fn set_values(&self, values: &[(&str, serde_json::Value)]) -> Result<(), JournalError> {
+        let mut db = self.db.lock().map_err(|_| JournalError::Poisoned)?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (key, value) in values {
+            tx.execute("INSERT INTO values_store(key,body) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET body=excluded.body",params![key,value.to_string()])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn receipt(&self, id: &str) -> Result<Option<serde_json::Value>, JournalError> {
+        let db = self.db.lock().map_err(|_| JournalError::Poisoned)?;
+        let value: Option<String> = db
+            .query_row(
+                "SELECT body FROM outbound_receipts WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        value
+            .map(|body| serde_json::from_str(&body).map_err(Into::into))
+            .transpose()
+    }
+
+    pub fn complete_result(
+        &self,
+        id: &str,
+        response: &serde_json::Value,
+    ) -> Result<(), JournalError> {
+        let mut db = self.db.lock().map_err(|_| JournalError::Poisoned)?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("INSERT INTO outbound_receipts(id,body) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET body=excluded.body", params![id, response.to_string()])?;
+        tx.execute(
+            "UPDATE results SET state='acknowledged' WHERE result_id=?1",
+            [id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Sequence allocation and enqueue are one transaction: a crash cannot leave
+    /// an allocated event missing from the ordered outbox.
+    pub fn event(
+        &self,
+        task: &str,
+        attempt: &str,
+        generation: u64,
+        minimum: u64,
+        event: dacs_protocol::WorkerEvent,
+    ) -> Result<String, JournalError> {
+        self.event_checkpoint(task, attempt, generation, minimum, event, None)
+    }
+
+    pub fn event_checkpoint(
+        &self,
+        task: &str,
+        attempt: &str,
+        generation: u64,
+        minimum: u64,
+        event: dacs_protocol::WorkerEvent,
+        checkpoint: Option<(&str, serde_json::Value)>,
+    ) -> Result<String, JournalError> {
+        let mut db = self.db.lock().map_err(|_| JournalError::Poisoned)?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let prior: u64 = tx
+            .query_row(
+                "SELECT value FROM sequences WHERE attempt=?1",
+                [attempt],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        let sequence = prior.max(minimum) + 1;
+        let id = uuid::Uuid::new_v4().to_string();
+        let envelope = dacs_protocol::CommandEnvelope {
+            protocol_version: dacs_protocol::PROTOCOL_VERSION,
+            command_id: id.clone(),
+            command: dacs_protocol::Command::ReportEvent {
+                attempt_id: attempt.into(),
+                generation,
+                sequence,
+                event,
+            },
+        };
+        let result = PendingResult {
+            result_id: id.clone(),
+            task_id: task.into(),
+            attempt_id: attempt.into(),
+            generation,
+            sequence,
+            payload: serde_json::to_value(envelope)?,
+        };
+        tx.execute("INSERT INTO sequences(attempt,value) VALUES(?1,?2) ON CONFLICT(attempt) DO UPDATE SET value=excluded.value",params![attempt,sequence])?;
+        tx.execute("INSERT INTO results(result_id,task_id,attempt_id,generation,sequence,body,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![id,task,attempt,generation,sequence,serde_json::to_string(&result)?,now_ms()])?;
+        if let Some((key, value)) = checkpoint {
+            tx.execute("INSERT INTO values_store(key,body) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET body=excluded.body",params![key,value.to_string()])?;
+        }
+        tx.commit()?;
+        Ok(id)
+    }
 }
 
 fn now_ms() -> i64 {
@@ -157,4 +299,91 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn command(id: &str, task: &str, generation: u64) -> PendingCommand {
+        PendingCommand {
+            command_id: id.into(),
+            task_id: task.into(),
+            attempt_id: format!("attempt-{generation}"),
+            generation,
+            payload: json!({"pin":"source"}),
+        }
+    }
+
+    #[test]
+    fn receipts_reject_changed_duplicates_and_stale_generations() {
+        let journal = Journal::in_memory().unwrap();
+        let command = command("first", "task", 3);
+        assert!(journal.receive(&command).unwrap());
+        assert!(!journal.receive(&command).unwrap());
+        let mut changed = command.clone();
+        changed.payload = json!({"pin":"different"});
+        assert!(matches!(
+            journal.receive(&changed),
+            Err(JournalError::DuplicateMismatch)
+        ));
+        let mut stale = command.clone();
+        stale.command_id = "stale".into();
+        stale.generation = 2;
+        assert!(matches!(
+            journal.receive(&stale),
+            Err(JournalError::StaleGeneration)
+        ));
+    }
+
+    #[test]
+    fn mailbox_generations_do_not_fence_unrelated_tasks() {
+        let journal = Journal::in_memory().unwrap();
+        assert!(journal.receive(&command("mail-high", "", 12)).unwrap());
+        assert!(journal.receive(&command("mail-low", "", 1)).unwrap());
+    }
+
+    #[test]
+    fn event_order_and_checkpoint_survive_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("journal.sqlite");
+        {
+            let journal = Journal::open(&path).unwrap();
+            journal
+                .event_checkpoint(
+                    "t",
+                    "a",
+                    2,
+                    4,
+                    dacs_protocol::WorkerEvent::Started,
+                    Some(("offset", json!(123))),
+                )
+                .unwrap();
+            journal
+                .event("t", "a", 2, 0, dacs_protocol::WorkerEvent::Stopped)
+                .unwrap();
+        }
+        let journal = Journal::open(&path).unwrap();
+        let results = journal.pending_results(10).unwrap();
+        assert_eq!(
+            results.iter().map(|r| r.sequence).collect::<Vec<_>>(),
+            vec![5, 6]
+        );
+        assert_eq!(journal.get_value::<u64>("offset").unwrap(), Some(123));
+        let mut changed = results[0].clone();
+        changed.payload = json!({"different":true});
+        assert!(matches!(
+            journal.append_result(&changed),
+            Err(JournalError::DuplicateMismatch)
+        ));
+        journal
+            .complete_result(&results[0].result_id, &json!({"ok":true}))
+            .unwrap();
+        assert_eq!(journal.pending_results(10).unwrap().len(), 1);
+        assert_eq!(
+            journal.receipt(&results[0].result_id).unwrap().unwrap()["ok"],
+            true
+        );
+    }
 }

@@ -6,7 +6,10 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -302,7 +305,10 @@ impl Jobs {
     }
 }
 
-pub fn launch_update_helper(value: &Value, restart_arguments: Option<&[String]>) -> anyhow::Result<bool> {
+pub fn launch_update_helper(
+    value: &Value,
+    restart_arguments: Option<&[String]>,
+) -> anyhow::Result<bool> {
     if value.get("exit_required").and_then(Value::as_bool) != Some(true) {
         return Ok(false);
     }
@@ -323,7 +329,8 @@ pub fn launch_update_helper(value: &Value, restart_arguments: Option<&[String]>)
     let mut command = std::process::Command::new(executable);
     command.args(arguments);
     if let Some(arguments) = restart_arguments {
-        let path = Path::new(executable).with_file_name(format!("restart-{}.json", uuid::Uuid::new_v4()));
+        let path =
+            Path::new(executable).with_file_name(format!("restart-{}.json", uuid::Uuid::new_v4()));
         save_json(&path, &arguments)?;
         command.arg("--restart-args").arg(path);
     }
@@ -344,34 +351,40 @@ mod tests {
         let (release_first, first_gate) = std::sync::mpsc::channel();
         let first_path = root.path().join("first");
         let first_output = first_path.clone();
-        let first = jobs.start("first", move || {
-            first_started.send(()).unwrap();
-            first_gate.recv().unwrap();
-            fs::write(first_output, b"first completed").map_err(io_error)?;
-            Ok(Value::Null)
-        }).unwrap();
+        let first = jobs
+            .start("first", move || {
+                first_started.send(()).unwrap();
+                first_gate.recv().unwrap();
+                fs::write(first_output, b"first completed").map_err(io_error)?;
+                Ok(Value::Null)
+            })
+            .unwrap();
         started.await.unwrap();
         let (second_started, started) = tokio::sync::oneshot::channel();
         let (release_second, second_gate) = std::sync::mpsc::channel();
         let second_path = root.path().join("second");
         let second_output = second_path.clone();
-        let second = jobs.start("second", move || {
-            second_started.send(()).unwrap();
-            second_gate.recv().unwrap();
-            fs::write(second_output, b"second completed").map_err(io_error)?;
-            Ok(Value::Null)
-        }).unwrap();
+        let second = jobs
+            .start("second", move || {
+                second_started.send(()).unwrap();
+                second_gate.recv().unwrap();
+                fs::write(second_output, b"second completed").map_err(io_error)?;
+                Ok(Value::Null)
+            })
+            .unwrap();
         let mut drain = std::pin::pin!(jobs.drain());
         std::future::poll_fn(|cx| {
             assert!(drain.as_mut().poll(cx).is_pending());
             Poll::Ready(())
-        }).await;
+        })
+        .await;
         release_first.send(()).unwrap();
         started.await.unwrap();
         std::future::poll_fn(|cx| {
             assert!(drain.as_mut().poll(cx).is_pending());
             Poll::Ready(())
-        }).await;
+        })
+        .await;
         release_second.send(()).unwrap();
         drain.await;
         assert_eq!(fs::read(first_path).unwrap(), b"first completed");

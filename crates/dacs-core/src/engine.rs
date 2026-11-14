@@ -228,7 +228,9 @@ pub(crate) fn execute(db: &Connection, p: &Principal, command: Command) -> Resul
             {
                 return Err(conflict("revoked device or stale local consent"));
             }
-            if !w.approved { w.draining = false; }
+            if !w.approved {
+                w.draining = false;
+            }
             w.approved = true;
             put(db, "worker", &w.id, &w.project_id, &w)?;
             event(db, Some(&w.project_id), "worker_approved", value(&w)?)?;
@@ -357,10 +359,17 @@ pub(crate) fn execute(db: &Connection, p: &Principal, command: Command) -> Resul
         } => {
             worker(db, p, true)?;
             let (mut a, t) = sched::current(db, p, &parent_attempt_id, generation)?;
-            if t.spec.effect_class == EffectClass::Workspace && spec.effect_class == EffectClass::External {
-                return Err(err(ErrorCode::Forbidden, "replayable workspace parent cannot delegate external effects"));
+            if t.spec.effect_class == EffectClass::Workspace
+                && spec.effect_class == EffectClass::External
+            {
+                return Err(err(
+                    ErrorCode::Forbidden,
+                    "replayable workspace parent cannot delegate external effects",
+                ));
             }
-            if a.state == "waiting" { sched::resume_waiting(db, &mut a, &t)?; }
+            if a.state == "waiting" {
+                sched::resume_waiting(db, &mut a, &t)?;
+            }
             if t.state != TaskState::Executing
                 || a.lease_expires_at <= now()
                 || matches!(a.state.as_str(), "cost_capped" | "stopped")
@@ -393,7 +402,13 @@ pub(crate) fn execute(db: &Connection, p: &Principal, command: Command) -> Resul
             event: reported,
         } => {
             worker(db, p, true)?;
-            let (mut a, mut t) = sched::current(db, p, &attempt_id, generation)?;
+            let (mut a, mut t) = if matches!(reported, WorkerEvent::Stopped) {
+                // Termination reconciles the owned generation even after acceptance,
+                // cancellation or replacement; it cannot submit a new task result.
+                sched::owned_attempt(db, p, &attempt_id, generation)?
+            } else {
+                sched::current(db, p, &attempt_id, generation)?
+            };
             if sequence
                 != a.last_sequence
                     .checked_add(1)
@@ -408,20 +423,32 @@ pub(crate) fn execute(db: &Connection, p: &Principal, command: Command) -> Resul
                     "worker events cannot change an unresolved publication",
                 ));
             }
-            if a.lease_expires_at <= now() && !matches!(reported, WorkerEvent::Stopped)
-                && !(a.state == "waiting" && matches!(reported, WorkerEvent::Started | WorkerEvent::Progress { .. }))
+            if a.lease_expires_at <= now()
+                && !matches!(reported, WorkerEvent::Stopped)
+                && !(a.state == "waiting"
+                    && matches!(
+                        reported,
+                        WorkerEvent::Started | WorkerEvent::Progress { .. }
+                    ))
             {
                 return Err(conflict("attempt lease expired"));
             }
             match &reported {
                 WorkerEvent::Started => {
-                    if a.state == "waiting" { sched::resume_waiting(db, &mut a, &t)?; }
-                    else if a.state == "admitted" { a.state = "executing".into(); a.settled = false; }
-                    else { return Err(conflict("attempt already started")); }
+                    if a.state == "waiting" {
+                        sched::resume_waiting(db, &mut a, &t)?;
+                    } else if a.state == "admitted" {
+                        a.state = "executing".into();
+                        a.settled = false;
+                    } else {
+                        return Err(conflict("attempt already started"));
+                    }
                 }
                 WorkerEvent::Progress { message } => {
                     bounded(message, 16384, "progress message")?;
-                    if a.state == "waiting" { sched::resume_waiting(db, &mut a, &t)?; }
+                    if a.state == "waiting" {
+                        sched::resume_waiting(db, &mut a, &t)?;
+                    }
                     if !matches!(a.state.as_str(), "admitted" | "executing" | "settled") {
                         return Err(conflict("attempt does not accept progress"));
                     }
@@ -449,18 +476,70 @@ pub(crate) fn execute(db: &Connection, p: &Principal, command: Command) -> Resul
                     put(db, "usage", &a.id, &t.spec.project_id, &usage)?;
                 }
                 WorkerEvent::Settled => {
-                    if !matches!(a.state.as_str(), "admitted" | "executing" | "settled" | "waiting" | "result_submitted") {
+                    if !matches!(
+                        a.state.as_str(),
+                        "admitted" | "executing" | "settled" | "waiting" | "result_submitted"
+                    ) {
                         return Err(conflict("attempt cannot settle in current state"));
                     }
                     a.settled = true;
                     if a.state != "result_submitted" {
-                        if a.state != "waiting" { a.state = "settled".into(); }
-                        t.blocked_reason = Some(if a.pending_children.is_empty() {
-                            "OMP settled; explicit result still required"
-                        } else {
-                            "OMP settled with unfinished child tasks"
-                        }.into());
+                        if a.state != "waiting" {
+                            a.state = "settled".into();
+                        }
+                        t.blocked_reason = Some(
+                            if a.pending_children.is_empty() {
+                                "OMP settled; explicit result still required"
+                            } else {
+                                "OMP settled with unfinished child tasks"
+                            }
+                            .into(),
+                        );
                     }
+                }
+                WorkerEvent::WorkflowCompleted {
+                    success,
+                    artifact_digest,
+                    evidence: checks,
+                } => {
+                    if !matches!(t.spec.execution, TaskExecution::Workflow { .. })
+                        || t.state != TaskState::Executing
+                        || !a.settled
+                        || !a.pending_children.is_empty()
+                        || !sched::result_eligible(db, &a, &t)?
+                        || matches!(a.state.as_str(), "failed" | "cost_capped")
+                    {
+                        return Err(conflict("workflow is not eligible for completion"));
+                    }
+                    if artifact_digest.len() != 64
+                        || !artifact_digest
+                            .bytes()
+                            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                    {
+                        return Err(invalid("invalid workflow artifact digest"));
+                    }
+                    evidence(checks, &t.spec.source_commit)?;
+                    if *success && (checks.is_empty() || checks.iter().any(|check| !check.passed)) {
+                        return Err(conflict(
+                            "successful workflow requires passing execution evidence",
+                        ));
+                    }
+                    t.workflow_result = Some(WorkflowCompletion {
+                        success: *success,
+                        artifact_digest: artifact_digest.clone(),
+                        evidence: checks.clone(),
+                    });
+                    t.state = if *success {
+                        TaskState::Accepted
+                    } else {
+                        TaskState::Failed
+                    };
+                    t.blocked_reason = (!success)
+                        .then(|| "workflow execution or required distribution failed".into());
+                    a.state = if *success { "accepted" } else { "failed" }.into();
+                }
+                WorkerEvent::CompilerTelemetry { records } => {
+                    crate::builds::record_telemetry(db, p, &a, &t, records)?;
                 }
                 WorkerEvent::CostCapped { message } => {
                     bounded(message, 16384, "cost cap reason")?;
@@ -478,10 +557,18 @@ pub(crate) fn execute(db: &Connection, p: &Principal, command: Command) -> Resul
                 }
                 WorkerEvent::Stopped => {
                     let released = sched::reconcile_stop(db, &mut a, &t)?;
-                    if !released {
-                        t.blocked_reason = Some("worker stopped while waiting; parent reservation retained for resume".into());
-                    } else if t.state != TaskState::Validating && a.state != "cost_capped" {
-                        t.blocked_reason = Some("worker stopped; explicit result or abandonment required".into());
+                    // reconcile_stop may finalize cancellation transactionally.
+                    t = get(db, "task", &a.task_id)?;
+                    if t.attempt_id.as_deref() == Some(&a.id) && !sched::terminal(t.state) {
+                        if !released {
+                            t.blocked_reason = Some(
+                                "worker stopped while waiting; parent reservation retained for resume".into(),
+                            );
+                        } else if t.state != TaskState::Validating && a.state != "cost_capped" {
+                            t.blocked_reason = Some(
+                                "worker stopped; explicit result or abandonment required".into(),
+                            );
+                        }
                     }
                 }
             }
@@ -506,6 +593,7 @@ pub(crate) fn execute(db: &Connection, p: &Principal, command: Command) -> Resul
                 sched::current(db, p, &submission.attempt_id, submission.generation)?;
             if t.id != submission.task_id
                 || t.state != TaskState::Executing
+                || !matches!(t.spec.execution, TaskExecution::Agent)
                 || !sched::result_eligible(db, &a, &t)?
                 || !a.pending_children.is_empty()
                 || matches!(a.state.as_str(), "failed" | "cost_capped")
@@ -614,13 +702,18 @@ pub(crate) fn execute(db: &Connection, p: &Principal, command: Command) -> Resul
             if t.state == TaskState::Publishing {
                 return Err(conflict("publication must reconcile before abandonment"));
             }
-            if t.attempt_id.as_deref() != Some(&a.id) || sched::terminal(t.state) || t.cancel_requested {
+            if t.attempt_id.as_deref() != Some(&a.id)
+                || sched::terminal(t.state)
+                || t.cancel_requested
+            {
                 return Err(conflict(
                     "only current unfinished attempts can be abandoned",
                 ));
             }
             if !a.pending_children.is_empty() {
-                return Err(conflict("cancel and reconcile pending children before abandoning their parent"));
+                return Err(conflict(
+                    "cancel and reconcile pending children before abandoning their parent",
+                ));
             }
             a.state = "abandoned".into();
             a.stop_reason = Some(reason.clone());

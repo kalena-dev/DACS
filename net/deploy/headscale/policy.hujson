@@ -1,11 +1,11 @@
 // DACS Headscale policy (grants). Default deny: only the flows below exist.
 //
-// Ports to confirm with owners before the final demo:
+// Control/bootstrap/netadmin ports match the integrated application listeners.
 //   7443  coordinator control API (Person 1)        -- application TLS + device auth
 //   7444  coordinator bootstrap API (Person 1)      -- reached only via the infra relay
 //   9443  dacs-netadmin operation API (Person 3)    -- infra host, overlay only
-//   10600 sccache-dist scheduler (Person 4)
-//   10501 sccache-dist build server (Person 4)
+//   10600 sccache-dist scheduler (Person 4; confirm actual engine configuration)
+//   10501 sccache-dist build server (Person 4; confirm actual engine configuration)
 {
   "groups": {
     // Infrastructure administrators. This Headscale user owns no nodes; it

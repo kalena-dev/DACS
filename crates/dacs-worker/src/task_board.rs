@@ -86,9 +86,13 @@ pub struct TaskBoard {
 
 impl TaskBoard {
     pub fn open(path: impl AsRef<FsPath>) -> Result<Self, BoardError> {
-        Ok(Self {
-            db: Arc::new(Database::create(path)?),
-        })
+        let db = Database::create(path)?;
+        let write = db.begin_write()?;
+        {
+            write.open_table(TASKS)?;
+        }
+        write.commit()?;
+        Ok(Self { db: Arc::new(db) })
     }
 
     pub fn create(&self, input: CreateTask) -> Result<BoardTask, BoardError> {
@@ -110,27 +114,25 @@ impl TaskBoard {
     }
 
     pub fn edit(&self, id: &str, input: EditTask) -> Result<BoardTask, BoardError> {
-        let mut task = self.get(id)?.ok_or(BoardError::NotFound)?;
-        if let Some(title) = input.title {
-            if title.trim().is_empty() {
-                return Err(BoardError::EmptyTitle);
+        self.update(id, |task| {
+            if let Some(title) = input.title {
+                if title.trim().is_empty() {
+                    return Err(BoardError::EmptyTitle);
+                }
+                task.title = title.trim().to_owned();
             }
-            task.title = title.trim().to_owned();
-        }
-        if let Some(description) = input.description {
-            task.description = description;
-        }
-        task.updated_at_ms = now_ms();
-        self.put(&task)?;
-        Ok(task)
+            if let Some(description) = input.description {
+                task.description = description;
+            }
+            Ok(())
+        })
     }
 
     pub fn set_status(&self, id: &str, status: TaskStatus) -> Result<BoardTask, BoardError> {
-        let mut task = self.get(id)?.ok_or(BoardError::NotFound)?;
-        task.status = status;
-        task.updated_at_ms = now_ms();
-        self.put(&task)?;
-        Ok(task)
+        self.update(id, |task| {
+            task.status = status;
+            Ok(())
+        })
     }
 
     pub fn list(&self, filter: FilterTasks) -> Result<Vec<BoardTask>, BoardError> {
@@ -176,13 +178,28 @@ impl TaskBoard {
         Ok(())
     }
 
-    fn get(&self, id: &str) -> Result<Option<BoardTask>, BoardError> {
-        let read = self.db.begin_read()?;
-        let table = read.open_table(TASKS)?;
-        table
-            .get(id)?
-            .map(|v| Ok(serde_json::from_str(v.value())?))
-            .transpose()
+    // Read and modify under one write transaction: concurrent status/text edits
+    // cannot overwrite each other or resurrect a concurrently deleted task.
+    fn update(
+        &self,
+        id: &str,
+        change: impl FnOnce(&mut BoardTask) -> Result<(), BoardError>,
+    ) -> Result<BoardTask, BoardError> {
+        let write = self.db.begin_write()?;
+        let task = {
+            let mut table = write.open_table(TASKS)?;
+            let mut task: BoardTask = {
+                let value = table.get(id)?.ok_or(BoardError::NotFound)?;
+                serde_json::from_str(value.value())?
+            };
+            change(&mut task)?;
+            task.updated_at_ms = now_ms().max(task.updated_at_ms);
+            let encoded = serde_json::to_string(&task)?;
+            table.insert(id, encoded.as_str())?;
+            task
+        };
+        write.commit()?;
+        Ok(task)
     }
 
     fn put(&self, task: &BoardTask) -> Result<(), BoardError> {
@@ -261,4 +278,113 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_board_and_all_mutations_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("board.redb");
+        let board = TaskBoard::open(&path).unwrap();
+        assert!(board.list(FilterTasks::default()).unwrap().is_empty());
+        assert!(matches!(board.delete("missing"), Err(BoardError::NotFound)));
+        let task = board
+            .create(CreateTask {
+                title: "  First  ".into(),
+                description: "needle".into(),
+            })
+            .unwrap();
+        assert_eq!(task.title, "First");
+        board
+            .edit(
+                &task.id,
+                EditTask {
+                    title: Some("Updated".into()),
+                    description: Some("New detail".into()),
+                },
+            )
+            .unwrap();
+        board.set_status(&task.id, TaskStatus::InProgress).unwrap();
+        assert!(matches!(
+            board.edit(
+                &task.id,
+                EditTask {
+                    title: Some("  ".into()),
+                    description: Some("must roll back".into()),
+                }
+            ),
+            Err(BoardError::EmptyTitle)
+        ));
+        drop(board);
+        let board = TaskBoard::open(&path).unwrap();
+        let tasks = board
+            .list(FilterTasks {
+                status: Some(TaskStatus::InProgress),
+                q: Some("NEW DETAIL".into()),
+            })
+            .unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].title, "Updated");
+        assert_eq!(tasks[0].created_at_ms, task.created_at_ms);
+        assert!(
+            board
+                .list(FilterTasks {
+                    status: Some(TaskStatus::Done),
+                    q: None
+                })
+                .unwrap()
+                .is_empty()
+        );
+        board.delete(&task.id).unwrap();
+        assert!(matches!(
+            board.set_status(&task.id, TaskStatus::Done),
+            Err(BoardError::NotFound)
+        ));
+        drop(board);
+        assert!(
+            TaskBoard::open(&path)
+                .unwrap()
+                .list(FilterTasks::default())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn simultaneous_status_and_text_updates_preserve_both_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = TaskBoard::open(dir.path().join("board.redb")).unwrap();
+        let task = board
+            .create(CreateTask {
+                title: "Original".into(),
+                description: String::new(),
+            })
+            .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                board
+                    .edit(
+                        &task.id,
+                        EditTask {
+                            title: Some("Edited".into()),
+                            description: None,
+                        },
+                    )
+                    .unwrap();
+            });
+            scope.spawn(|| {
+                barrier.wait();
+                board.set_status(&task.id, TaskStatus::Done).unwrap();
+            });
+            barrier.wait();
+        });
+        let tasks = board.list(FilterTasks::default()).unwrap();
+        assert_eq!(tasks[0].title, "Edited");
+        assert_eq!(tasks[0].status, TaskStatus::Done);
+    }
 }

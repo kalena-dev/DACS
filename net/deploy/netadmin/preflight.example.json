@@ -1,0 +1,8 @@
+{
+  "login_server": "https://HS_DOMAIN",
+  "bootstrap_url": "https://BOOTSTRAP_DOMAIN",
+  "control_url": "https://coordinator.dacs.internal:7443",
+  "netadmin_url": "https://INFRA_OVERLAY_IP:9443",
+  "ca_files": ["/private/coordinator-ca.pem", "/private/netadmin-cert.pem"],
+  "timeout_ms": 5000
+}

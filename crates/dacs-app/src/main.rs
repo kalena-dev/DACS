@@ -27,6 +27,25 @@ struct Cli {
 enum Action {
     /// Run the coordinator. No worker or network membership starts automatically.
     Serve(Serve),
+    /// Manually run or locally control the enrolled worker.
+    Worker {
+        #[command(subcommand)]
+        command: WorkerCommand,
+    },
+    /// Serve the private persistent task-board preview and compiled Rust frontend.
+    TaskBoard {
+        #[arg(long, default_value = "127.0.0.1:7448")]
+        listen: SocketAddr,
+        #[arg(long, default_value = ".dacs/task-board.redb")]
+        data: PathBuf,
+        #[arg(long)]
+        assets: PathBuf,
+    },
+    /// Hash the installed Rust sysroot for an immutable distributed-build profile.
+    BuildSysrootDigest {
+        #[arg(long)]
+        sysroot: PathBuf,
+    },
     /// Send a typed Command or CommandEnvelope JSON document.
     Request {
         #[command(flatten)]
@@ -75,10 +94,42 @@ enum Action {
     },
 }
 
+#[derive(Subcommand)]
+enum WorkerCommand {
+    Run {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    Status {
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+    Control {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long, value_enum)]
+        action: WorkerControl,
+    },
+}
+
+#[derive(Clone, clap::ValueEnum)]
+enum WorkerControl {
+    Drain,
+    EmergencyCancel,
+    PauseDesktop,
+    ResumeDesktop,
+}
+
 #[derive(Args)]
 struct Serve {
     #[arg(long, default_value = "127.0.0.1:7447")]
     listen: SocketAddr,
+    /// Optional TLS-only enrollment listener, normally 0.0.0.0:7444.
+    #[arg(long)]
+    bootstrap_listen: Option<SocketAddr>,
+    /// JSON NetworkConfig for the coordinator-to-netadmin bridge.
+    #[arg(long)]
+    network_config: Option<PathBuf>,
     #[arg(long)]
     public_url: Option<String>,
     #[arg(long, default_value = "DACS coordinator")]
@@ -387,7 +438,10 @@ async fn main() -> Result<()> {
         Action::Serve(args) => {
             let update_state = args.data_dir.join("updates");
             let target = std::env::current_exe()?;
-            let recovery = tokio::task::spawn_blocking(move || dacs_setup::reconcile_update(&update_state, &target)).await??;
+            let recovery = tokio::task::spawn_blocking(move || {
+                dacs_setup::reconcile_update(&update_state, &target)
+            })
+            .await??;
             if restart_coordinator_after_update(&recovery)? {
                 return Ok(());
             }
@@ -416,6 +470,8 @@ async fn main() -> Result<()> {
             });
             let update = server::run(server::Config {
                 listen: args.listen,
+                bootstrap_listen: args.bootstrap_listen,
+                network_config: args.network_config,
                 public_url,
                 host_name: args.host_name,
                 data_dir: args.data_dir,
@@ -428,6 +484,46 @@ async fn main() -> Result<()> {
             if let Some(value) = update {
                 restart_coordinator_after_update(&value)?;
             }
+        }
+        Action::Worker { command } => match command {
+            WorkerCommand::Run { config } => {
+                let config = serde_json::from_value::<dacs_worker::runtime::WorkerConfig>(
+                    local::read_json(&config)?,
+                )?;
+                dacs_worker::runtime::run(config).await?;
+            }
+            WorkerCommand::Status { data_dir } => {
+                print(&serde_json::to_value(dacs_worker::local_control::status(
+                    &data_dir,
+                )?)?)?;
+            }
+            WorkerCommand::Control { data_dir, action } => {
+                use dacs_worker::local_control::ControlAction;
+                let action = match action {
+                    WorkerControl::Drain => ControlAction::Drain,
+                    WorkerControl::EmergencyCancel => ControlAction::EmergencyCancel,
+                    WorkerControl::PauseDesktop => ControlAction::PauseDesktop,
+                    WorkerControl::ResumeDesktop => ControlAction::ResumeDesktop,
+                };
+                dacs_worker::local_control::request(&data_dir, action)?;
+                print(
+                    &json!({"requested":true,"note":"Read worker status for observed application; a queued request is not completion."}),
+                )?;
+            }
+        },
+        Action::TaskBoard {
+            listen,
+            data,
+            assets,
+        } => {
+            dacs::task_board::serve(listen, data, assets).await?;
+        }
+        Action::BuildSysrootDigest { sysroot } => {
+            let digest = tokio::task::spawn_blocking(move || {
+                dacs_worker::build_runner::sysroot_digest(&sysroot)
+            })
+            .await??;
+            print(&json!({"sysroot_sha256":digest}))?;
         }
         Action::Request {
             connection,
@@ -520,10 +616,15 @@ async fn main() -> Result<()> {
                             &state_dir,
                         )?
                     }
-                    Update::Apply { state_dir, target, restart_args } => {
+                    Update::Apply {
+                        state_dir,
+                        target,
+                        restart_args,
+                    } => {
                         let value = dacs_setup::apply_staged_update(&state_dir, &target)?;
                         if let Some(path) = restart_args {
-                            let arguments: Vec<String> = serde_json::from_value(local::read_json(&path)?)?;
+                            let arguments: Vec<String> =
+                                serde_json::from_value(local::read_json(&path)?)?;
                             fs::remove_file(path)?;
                             restart = Some((target, arguments));
                         }
@@ -537,7 +638,10 @@ async fn main() -> Result<()> {
             })
             .await??;
             print(&value)?;
-            if !local::launch_update_helper(&value, restart.as_ref().map(|(_, args)| args.as_slice()))? {
+            if !local::launch_update_helper(
+                &value,
+                restart.as_ref().map(|(_, args)| args.as_slice()),
+            )? {
                 if let Some((target, arguments)) = restart {
                     std::process::Command::new(target).args(arguments).spawn()?;
                 }

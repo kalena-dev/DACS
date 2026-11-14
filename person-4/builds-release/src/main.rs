@@ -1,3 +1,6 @@
+mod instrumentation;
+mod packaging;
+
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -51,6 +54,46 @@ fn inspect(path: PathBuf) -> io::Result<Artifact> {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let arguments: Vec<_> = env::args_os().skip(1).collect();
+    if arguments
+        .first()
+        .is_some_and(|arg| arg == "instrument-sccache")
+    {
+        if arguments.len() != 2 {
+            return Err(
+                "usage: dacs-release-audit instrument-sccache <clean-v0.10.0-checkout>".into(),
+            );
+        }
+        return instrumentation::instrument(std::path::Path::new(&arguments[1]));
+    }
+    if arguments.first().is_some_and(|arg| arg == "package") {
+        if arguments.len() != 2 {
+            return Err("usage: dacs-release-audit package <request.json>".into());
+        }
+        let request: packaging::PackageRequest =
+            serde_json::from_reader(File::open(&arguments[1])?)?;
+        let report = packaging::produce(request)?;
+        // Reuse the same race-checked artifact inspector as standalone audits.
+        inspect(report.artifact.clone())?;
+        serde_json::to_writer_pretty(io::stdout().lock(), &report)?;
+        println!();
+        return Ok(());
+    }
+    if arguments.first().is_some_and(|arg| arg == "verify-signed") {
+        if arguments.len() != 3 {
+            return Err(
+                "usage: dacs-release-audit verify-signed <package> <new-log-directory>".into(),
+            );
+        }
+        packaging::verify_signed(
+            std::path::Path::new(&arguments[1]),
+            std::path::Path::new(&arguments[2]),
+        )?;
+        println!(
+            "Platform signature verification passed. Installation and authenticated application-update acceptance remain not run."
+        );
+        return Ok(());
+    }
     let paths: Vec<PathBuf> = env::args_os().skip(1).map(PathBuf::from).collect();
     if paths.is_empty() {
         return Err("usage: dacs-release-audit <artifact> [artifact ...]".into());

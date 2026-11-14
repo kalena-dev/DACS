@@ -1,4 +1,6 @@
+pub mod builds;
 mod engine;
+pub mod network;
 mod publication;
 mod scheduling;
 
@@ -369,6 +371,15 @@ impl Store {
     pub fn authorize_project(&self, principal: &Principal, project_id: &str) -> Result<Project> {
         let db = self.lock()?;
         project(&db, principal, project_id)
+    }
+    pub fn attempt_context(
+        &self,
+        principal: &Principal,
+        attempt_id: &str,
+        generation: u64,
+    ) -> Result<(AttemptRecord, TaskRecord)> {
+        let db = self.lock()?;
+        scheduling::owned_attempt(&db, principal, attempt_id, generation)
     }
     pub fn snapshot(&self, principal: &Principal) -> Result<Snapshot> {
         let db = self.lock()?;

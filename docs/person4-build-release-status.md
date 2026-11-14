@@ -1,81 +1,67 @@
-# Person 4: build, pool and release status
+# Person 4: build, compiler pool and release status
 
-Date checked: 2026-11-14. This is evidence from the current checkout and host;
-unobserved requirements are recorded as not run.
+Updated 2026-11-14 for the current Windows checkout. Earlier macOS/missing-workspace observations have been superseded. This file distinguishes implemented source from execution evidence.
 
-## Implemented in this increment
+## Implemented source
 
-`crates/dacs-worker/src/build_execution.rs` adds a Person 4 build adapter over
-Person 2's `ManagedChild` interface:
+- `build_runner::execute_admitted` parses strict workflow requests and verifies the external-effect admission, generation, source commit, clean checkout, lockfile, Cargo/rustc versions, verbose compiler identity and sysroot content digest. All child commands use the worker supervisor and attempt reservation.
+- Real Cargo builds and test shards run with private clones, target directories, temporary directories, database paths and ephemeral-listen hints. Shards run sequentially within admitted resources; a failing command is not retried or hidden. Applications must honor the shard database/listen environment when they use those facilities.
+- Logs are drained concurrently and durably bounded. Actual exit status, durations, checksums, Cargo-produced executables, requested artifacts and behavioral command results populate immutable workflow evidence. Cancellation fences subsequent child launches; uncertain process stops remain unreconciled.
+- Compiler scheduler/server workflows generate private stock sccache configurations from owner-local credential files. Their independently admitted reservations cover resources. Server workflows run in actual systemd CPU/memory scopes; instrumented server compilation slots are bounded. Missing systemd/bubblewrap/elevation fails execution rather than claiming enforcement.
+- Coordinator pool ownership validates all admitted services, enrolled physical hosts and exact pool membership. It prevents simultaneous ownership across pools and keeps ownership until the initiating process and every service report actual stop. Build stop requests service cancellation; heartbeat loss does not release ownership. Authenticated pool/evidence APIs expose real state.
+- Each initiating distribution profile owns its local daemon, port, cache and configuration. Occupied ports are refused; no owner daemon is restarted and no global Cargo/sccache files are modified.
 
-- Validates private pool registration, HTTPS scheduler URLs, unique server
-  addresses and one pool allocation per physical-host fingerprint.
-- Pins source revision, `Cargo.lock` SHA-256, exact Cargo/rustc version strings,
-  package, target, features/default-feature selection, rustc flags and declared
-  environment values.
-- Produces a Cargo `build --locked` descriptor with a fresh target directory,
-  `CARGO_INCREMENTAL=0`, a profile-specific sccache config, daemon port and local
-  cache path. A pre-existing target directory is rejected.
-- Writes separate sccache scheduler, server and client configurations with
-  address-bound JWT server authentication. Config files are created exclusively
-  with mode `0600` on Unix; secrets are excluded from evidence records.
-- Provides compile-action evidence fields and a gate validator requiring a
-  successful cold-cache build plus uncached, consumed invocations from both
-  distinct remote physical hosts.
-- Labels Cargo builds and sccache daemons/scheduler/servers as host-level effects
-  because build scripts and compiler processes are not sandboxed by this adapter.
+## Supported action provenance
 
-The sccache config shape follows Mozilla's [distributed configuration guide](https://github.com/mozilla/sccache/blob/main/docs/Distributed.md)
-and [quickstart](https://github.com/mozilla/sccache/blob/main/docs/DistributedQuickstart.md).
-The server token must be produced for the registered overlay address by
-`sccache-dist auth generate-jwt-hs256-server-token`. Build servers need Linux,
-`bubblewrap` 0.3.0 or newer, and the documented privileged builder setup. The
-adapter does not grant elevation or start remote machines.
+The supported instrumented engine is upstream sccache **v0.10.0**, commit
+`e3d1ed560a28d114bd26299b0f717b372e7fc3d2`. Its reviewed compiler-server path is native x86_64 Linux. This is not a claim that all native DACS platforms support remote compilation.
 
-## Observed environment
+`dacs-release-audit instrument-sccache <clean-checkout>` applies exact, unique source anchors only after checking the clean pinned revision. It does not download, compile, install or start the engine. On its release host, build the instrumented engine with:
 
-- Host: macOS 27, Apple Silicon `arm64`.
-- Rust: `rustc 1.99.0`, `cargo 1.99.0`.
-- `sccache`: not installed/on PATH.
-- Linux initiator and two other physical Linux hosts: unavailable in this
-  checkout session; no overlay addresses or device credentials were provided.
-- `Cargo.lock`: absent.
-- `00-general-plan.md`: absent from the checkout; the plan text supplied in the
-  conversation was used.
-- Workspace integration: `cargo check -p dacs-worker` stops before compilation
-  because `crates/dacs-coordinator/Cargo.toml` is missing. The workspace also
-  lists `dacs-net` and `dacs-console`, which are absent. The protocol crate
-  declares modules not yet present in the checkout.
-- Existing sccache daemon/configuration: not inspected or changed. No global
-  Cargo or sccache configuration was edited.
+```text
+cargo build --locked --release --no-default-features --features dist-client,dist-server
+```
 
-## Mandatory gates
+Pin the produced engine executable digests and the separately built `dacs-rustc-provenance` wrapper in workflow requests. Engine service stderr emits real job completion/output SHA-256 records; the worker journals and uploads these with authenticated worker/attempt identity. The initiator records received output digests. The wrapper records actual rustc `--extern` inputs and produced output digests around the real command.
 
-| Gate | Status | Evidence / blocker |
+The runner joins service job identities, reserved server addresses, received compiled-library bytes, and the transitive input/output graph ending in an executable that the runner actually exercised. It reuses the contributed release validator to require consumed uncached invocations from both distinct remote physical hosts. Missing telemetry, altered digests, replayed jobs, unrelated workers, unconsumed libraries and cache statistics cannot pass the requirement. Dependency-file rewrites are not treated as compiled-library provenance. Evidence is not a sandbox against a malicious elevated host owner.
+
+Profile sysroot pins are available through:
+
+```text
+dacs build-sysroot-digest --sysroot <rustc --print sysroot result>
+```
+
+Workflow `operation.kind` is `build`, `test` (with named filters), or `compiler_service`. Distributed requests include `pool`, `claim.service_attempt_ids`, private client-token path, engine/wrapper SHA-256 pins, enrolled initiator physical identity and the two required remote physical identities. `exercise` entries select an executable actually reported by Cargo and its arguments. Compiler services require owner-provisioned credentials and the reviewed `systemd-run`/bubblewrap executable paths. Runtime transport credentials never appear in request or result artifacts.
+
+## Native release production
+
+`dacs-release-audit package <request.json>` performs a real pinned `cargo build --locked --release --package dacs --features native` and invokes native packaging tools:
+
+| Native host | Installable output | Required external tool |
 |---|---|---|
-| Feasibility: Linux initiator plus two physical Linux workers | **Failed** | Current host is macOS arm64; required hosts and overlay addresses are absent. |
-| Real stock sccache build dispatched to both remote servers | **Not run** | sccache and the three-host Linux pool are unavailable. |
-| One cold native Linux Cargo build consuming uncached output from both physical remotes | **Not run** | No Linux pool, lockfile, workspace build, or action-level placement logs. |
-| Remove one compiler worker and observe fallback/retry behavior | **Not run** | No compiler pool exists to remove a worker from. |
-| Cache/local/distributed timing and transfer comparison | **Not run** | No actual build or scheduler/server telemetry. |
-| DACS admission, reservation and process accounting for compiler work | **Not run** | Coordinator and reservation APIs are not present in this checkout. |
-| Compiler concurrency and memory enforcement | **Not run** | No Linux server or cgroup/backend evidence. Pool slot declarations alone do not enforce process limits. |
-| Windows/Linux/macOS native package builds | **Not run** | No release pipeline/artifact definitions or platform SDK matrix in the checkout. |
-| Per-platform installer catalogue coverage and setup/update verification | **Not run** | Installer/catalogue are Person 1 scope and are not present. |
-| Signing/notarization | **Not run** | No signing identity or controlled signing environment was supplied. |
+| Windows x64/ARM64 | MSI | WiX 4 `wix` and the target MSVC SDK |
+| Linux x64/ARM64, Debian-compatible runtime | DEB | `dpkg-deb`, GTK/WebKit native build dependencies |
+| macOS x64/ARM64 | PKG installing the CLI/native-shell executable | Xcode SDK and `pkgbuild`/`pkgutil` |
 
-## Integration required
+Request fields: `workspace`, a new `output` directory outside the checkout, `target`, numeric `version`, `source_commit`, `cargo_lock_sha256`, `rustc_version`, `cargo_version`. A dirty/unpinned source, unavailable tool or foreign platform fails; stale output cannot be reused. Packages and reports are explicitly **UNSIGNED-PREVIEW**, not trusted updates. Hashing reuses the existing release audit checks.
 
-- Person 1 owns `Cargo.toml` and must register an owned build crate/module boundary
-  when the missing workspace crates and shared contracts are integrated. This
-  increment is placed under `dacs-worker` only to reuse the existing process
-  descriptor without changing the workspace manifest.
-- The present supervisor does not clear inherited environment variables or
-  capture process output. A production build runner needs an explicit environment
-  boundary and durable stdout/stderr/action evidence through the supervisor.
-- Placement records must be reconciled from actual sccache server/action logs;
-  scheduler totals or cache statistics cannot satisfy the per-host acceptance
-  gate by themselves.
-- `sccache-dist` resource limits must be enforced by a verified host mechanism
-  (for example the reviewed systemd/cgroup profile); the pool model's slot count
-  is accounting metadata and is not itself a process or memory limit.
+`dacs-release-audit verify-signed <package> <new-log-directory>` verifies packages returned by an existing trusted signing environment with Windows `signtool` or macOS `pkgutil`, Gatekeeper and stapler. It never acquires/imports signing keys or signs from an agent. Successful platform signature verification does not establish installation or DACS authenticated-update acceptance.
+
+## Verification status and required external gates
+
+Parent integration has passed `cargo test -p dacs-worker -p dacs-ui -p dacs --features dacs/native` (62 tests) and `cargo build -p dacs --features native`. The task-board WebAssembly release build also passed. No live compiler fleet, native package production or signing command has been verified. Added regressions cover nonzero supervised exits, bounded stream draining, exclusive locks, confined artifacts, actual consumption paths, worker/digest mismatches, replay rejection, package metadata validation and exact instrumentation anchors.
+
+| Required gate | Current evidence |
+|---|---|
+| Coherent code compilation and focused regressions | Combined worker/UI/application check: 62 passed; native application build passed |
+| Instrumented engine compilation on pinned Linux toolchain | Not run |
+| Linux initiator plus two other physical compiler hosts | Not available in this assignment |
+| One cold build consuming both remotes, link and behavioral checks | Not run; source adapter now present |
+| Worker removal, fallback/retry, local/distributed/warm timing and transfer comparisons | Not run; requires real pool observations |
+| Actual systemd resource enforcement and unchanged unrelated daemon | Not run on Linux |
+| Windows/Linux/macOS package production and install/repair/update | Not run; source production commands present |
+| Every catalogue category on every supported platform | Not run; no category removed |
+| Signing/notarization and trusted application-update acceptance | Not run; no signing identities or keys used |
+
+Official engine sources: [distributed guide](https://github.com/mozilla/sccache/blob/v0.10.0/docs/Distributed.md), [server completion](https://github.com/mozilla/sccache/blob/v0.10.0/src/bin/sccache-dist/main.rs), [initiator output handling](https://github.com/mozilla/sccache/blob/v0.10.0/src/compiler/compiler.rs).

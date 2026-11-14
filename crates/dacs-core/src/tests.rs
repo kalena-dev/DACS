@@ -106,6 +106,7 @@ fn spec(project: &Project, effect: EffectClass) -> TaskSpec {
         title: "implement feature".into(),
         instructions: "Implement and submit explicit evidence".into(),
         source_commit: SHA.into(),
+        execution: TaskExecution::Agent,
         dependencies: Vec::new(),
         required_capabilities: vec!["rust".into()],
         resources: Resources {
@@ -178,12 +179,25 @@ fn candidate(
         .unwrap(),
     )
     .unwrap();
-    let live = store.snapshot(&administrator()).unwrap().attempts.into_iter().find(|a| a.id == attempt.id).unwrap();
+    let live = store
+        .snapshot(&administrator())
+        .unwrap()
+        .attempts
+        .into_iter()
+        .find(|a| a.id == attempt.id)
+        .unwrap();
     if !live.settled {
-        command(store, worker, Command::ReportEvent {
-            attempt_id: attempt.id.clone(), generation: attempt.generation,
-            sequence: live.last_sequence + 1, event: WorkerEvent::Settled,
-        }).unwrap();
+        command(
+            store,
+            worker,
+            Command::ReportEvent {
+                attempt_id: attempt.id.clone(),
+                generation: attempt.generation,
+                sequence: live.last_sequence + 1,
+                event: WorkerEvent::Settled,
+            },
+        )
+        .unwrap();
     }
     store
         .stage_candidate(&administrator(), &c.id, Some(SHA.into()), MERGE.into())
@@ -384,12 +398,29 @@ fn heartbeat_cannot_widen_permissions_and_reduction_drains() {
         .code,
         ErrorCode::Forbidden
     );
-    command(&store, &administrator(), Command::ApproveWorker { worker_id: w.id.clone() }).unwrap();
+    command(
+        &store,
+        &administrator(),
+        Command::ApproveWorker {
+            worker_id: w.id.clone(),
+        },
+    )
+    .unwrap();
     assert!(store.snapshot(&administrator()).unwrap().workers[0].draining);
     let t = task(&store, &project, EffectClass::Workspace);
-    assert_eq!(command(&store, &administrator(), Command::AdmitTask {
-        task_id: t.id, worker_id: Some(w.id),
-    }).unwrap_err().code, ErrorCode::CapacityUnavailable);
+    assert_eq!(
+        command(
+            &store,
+            &administrator(),
+            Command::AdmitTask {
+                task_id: t.id,
+                worker_id: Some(w.id),
+            }
+        )
+        .unwrap_err()
+        .code,
+        ErrorCode::CapacityUnavailable
+    );
 }
 
 #[test]
@@ -476,10 +507,21 @@ fn pending_children_survive_restart_and_settled_is_not_finished() {
         },
     )
     .unwrap();
-    assert!(!store.commands(&p, 0).unwrap().iter().any(|m| m.kind == "child_result"));
-    command(&store, &p, Command::ReconcileWorker {
-        stopped_attempt_ids: vec![child["attempt"]["id"].as_str().unwrap().into()],
-    }).unwrap();
+    assert!(
+        !store
+            .commands(&p, 0)
+            .unwrap()
+            .iter()
+            .any(|m| m.kind == "child_result")
+    );
+    command(
+        &store,
+        &p,
+        Command::ReconcileWorker {
+            stopped_attempt_ids: vec![child["attempt"]["id"].as_str().unwrap().into()],
+        },
+    )
+    .unwrap();
     assert!(
         store
             .commands(&p, 0)
@@ -771,6 +813,29 @@ fn publication_reconciles_after_restart_before_releasing_dependencies() {
         TaskState::Ready
     );
     assert_eq!(snapshot.workers[0].reserved.agent_slots, 1);
+    command(
+        &store,
+        &p,
+        Command::ReportEvent {
+            attempt_id: a.id.clone(),
+            generation: a.generation,
+            sequence: snapshot
+                .attempts
+                .iter()
+                .find(|r| r.id == a.id)
+                .unwrap()
+                .last_sequence
+                + 1,
+            event: WorkerEvent::Stopped,
+        },
+    )
+    .unwrap();
+    let stopped = store.snapshot(&administrator()).unwrap();
+    assert_eq!(stopped.workers[0].reserved.agent_slots, 0);
+    let accepted = stopped.tasks.iter().find(|r| r.id == t.id).unwrap();
+    assert_eq!(accepted.state, TaskState::Accepted);
+    assert_eq!(accepted.integrated_sha.as_deref(), Some(MERGE));
+    assert!(accepted.blocked_reason.is_none());
 }
 
 #[test]
@@ -810,7 +875,14 @@ fn divergent_publication_remains_unresolved_and_cancellation_is_deferred() {
     let pending = store.snapshot(&administrator()).unwrap();
     assert!(pending.tasks[0].cancel_requested);
     assert!(!scheduling::terminal(pending.tasks[0].state));
-    command(&store, &p, Command::ReconcileWorker { stopped_attempt_ids: vec![a.id.clone()] }).unwrap();
+    command(
+        &store,
+        &p,
+        Command::ReconcileWorker {
+            stopped_attempt_ids: vec![a.id.clone()],
+        },
+    )
+    .unwrap();
     assert_eq!(
         store.snapshot(&administrator()).unwrap().tasks[0].state,
         TaskState::Cancelled
@@ -854,8 +926,17 @@ fn publication_and_cancellation_have_one_transactional_order() {
         Err(error) => {
             assert_eq!(error.code, ErrorCode::Conflict);
             assert!(store.snapshot(&administrator()).unwrap().tasks[0].cancel_requested);
-            assert!(!scheduling::terminal(store.snapshot(&administrator()).unwrap().tasks[0].state));
-            command(&store, &p, Command::ReconcileWorker { stopped_attempt_ids: vec![a.id.clone()] }).unwrap();
+            assert!(!scheduling::terminal(
+                store.snapshot(&administrator()).unwrap().tasks[0].state
+            ));
+            command(
+                &store,
+                &p,
+                Command::ReconcileWorker {
+                    stopped_attempt_ids: vec![a.id.clone()],
+                },
+            )
+            .unwrap();
             assert_eq!(
                 store.snapshot(&administrator()).unwrap().tasks[0].state,
                 TaskState::Cancelled
@@ -1053,15 +1134,67 @@ fn stopping_parent_with_pending_children_keeps_wait_capacity() {
         2
     );
     let snapshot = store.snapshot(&administrator()).unwrap();
-    let child = snapshot.tasks.iter().find(|child| child.parent_task_id.as_deref() == Some(&t.id)).unwrap();
-    let child_attempt = snapshot.attempts.iter().find(|attempt| attempt.task_id == child.id).unwrap();
+    let child = snapshot
+        .tasks
+        .iter()
+        .find(|child| child.parent_task_id.as_deref() == Some(&t.id))
+        .unwrap();
+    let child_attempt = snapshot
+        .attempts
+        .iter()
+        .find(|attempt| attempt.task_id == child.id)
+        .unwrap();
     let c = candidate(&store, &p, child, child_attempt);
     let publication = store.prepare_publication(&administrator(), &c.id).unwrap();
-    store.finish_publication(&publication.id, Some(MERGE)).unwrap();
-    command(&store, &p, Command::ReconcileWorker { stopped_attempt_ids: vec![child_attempt.id.clone()] }).unwrap();
-    command(&store, &p, Command::ReportEvent { attempt_id: a.id.clone(), generation: a.generation, sequence: 1, event: WorkerEvent::Started }).unwrap();
-    command(&store, &p, Command::ReportEvent { attempt_id: a.id.clone(), generation: a.generation, sequence: 2, event: WorkerEvent::Progress { message: "resumed after durable child delivery".into() } }).unwrap();
-    assert!(command(&store, &p, Command::Delegate { parent_attempt_id: a.id, generation: a.generation, spec: spec(&project, EffectClass::Workspace) }).unwrap()["admitted"].as_bool().unwrap());
+    store
+        .finish_publication(&publication.id, Some(MERGE))
+        .unwrap();
+    command(
+        &store,
+        &p,
+        Command::ReconcileWorker {
+            stopped_attempt_ids: vec![child_attempt.id.clone()],
+        },
+    )
+    .unwrap();
+    command(
+        &store,
+        &p,
+        Command::ReportEvent {
+            attempt_id: a.id.clone(),
+            generation: a.generation,
+            sequence: 1,
+            event: WorkerEvent::Started,
+        },
+    )
+    .unwrap();
+    command(
+        &store,
+        &p,
+        Command::ReportEvent {
+            attempt_id: a.id.clone(),
+            generation: a.generation,
+            sequence: 2,
+            event: WorkerEvent::Progress {
+                message: "resumed after durable child delivery".into(),
+            },
+        },
+    )
+    .unwrap();
+    assert!(
+        command(
+            &store,
+            &p,
+            Command::Delegate {
+                parent_attempt_id: a.id,
+                generation: a.generation,
+                spec: spec(&project, EffectClass::Workspace)
+            }
+        )
+        .unwrap()["admitted"]
+            .as_bool()
+            .unwrap()
+    );
 }
 
 #[test]
@@ -1069,17 +1202,54 @@ fn unapproved_and_revoked_host_declarations_cannot_reduce_authorized_capacity() 
     let store = Store::open(":memory:", ADMIN).unwrap();
     let project = create_project(&store);
     let (approved, _) = enroll(&store, &project, "shared-host", 2);
-    let invite: Invitation = serde_json::from_value(command(&store, &administrator(), Command::CreateInvitation {
-        project_id: project.id.clone(), host_name: "named coordinator".into(), expires_in_seconds: 300,
-    }).unwrap()).unwrap();
-    let pending = store.enroll(&invite.token, registration("shared-host", 0)).unwrap();
+    let invite: Invitation = serde_json::from_value(
+        command(
+            &store,
+            &administrator(),
+            Command::CreateInvitation {
+                project_id: project.id.clone(),
+                host_name: "named coordinator".into(),
+                expires_in_seconds: 300,
+            },
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let pending = store
+        .enroll(&invite.token, registration("shared-host", 0))
+        .unwrap();
     let first = task(&store, &project, EffectClass::Workspace);
     admit(&store, &first, &approved);
-    command(&store, &administrator(), Command::ApproveWorker { worker_id: pending.worker.id.clone() }).unwrap();
-    command(&store, &administrator(), Command::RevokeWorker { worker_id: pending.worker.id }).unwrap();
+    command(
+        &store,
+        &administrator(),
+        Command::ApproveWorker {
+            worker_id: pending.worker.id.clone(),
+        },
+    )
+    .unwrap();
+    command(
+        &store,
+        &administrator(),
+        Command::RevokeWorker {
+            worker_id: pending.worker.id,
+        },
+    )
+    .unwrap();
     let second = task(&store, &project, EffectClass::Workspace);
     admit(&store, &second, &approved);
-    assert_eq!(store.snapshot(&administrator()).unwrap().workers.iter().find(|w| w.id == approved.id).unwrap().reserved.agent_slots, 2);
+    assert_eq!(
+        store
+            .snapshot(&administrator())
+            .unwrap()
+            .workers
+            .iter()
+            .find(|w| w.id == approved.id)
+            .unwrap()
+            .reserved
+            .agent_slots,
+        2
+    );
 }
 
 #[test]
@@ -1090,10 +1260,36 @@ fn revoked_workers_still_contribute_held_physical_reservations() {
     let (second_worker, _) = enroll(&store, &project, "shared-host", 1);
     let first = task(&store, &project, EffectClass::Workspace);
     let first_attempt = admit(&store, &first, &first_worker);
-    command(&store, &administrator(), Command::RevokeWorker { worker_id: first_worker.id }).unwrap();
+    command(
+        &store,
+        &administrator(),
+        Command::RevokeWorker {
+            worker_id: first_worker.id,
+        },
+    )
+    .unwrap();
     let second = task(&store, &project, EffectClass::Workspace);
-    assert_eq!(command(&store, &administrator(), Command::AdmitTask { task_id: second.id.clone(), worker_id: Some(second_worker.id.clone()) }).unwrap_err().code, ErrorCode::CapacityUnavailable);
-    command(&store, &administrator(), Command::ReconcileWorker { stopped_attempt_ids: vec![first_attempt.id] }).unwrap();
+    assert_eq!(
+        command(
+            &store,
+            &administrator(),
+            Command::AdmitTask {
+                task_id: second.id.clone(),
+                worker_id: Some(second_worker.id.clone())
+            }
+        )
+        .unwrap_err()
+        .code,
+        ErrorCode::CapacityUnavailable
+    );
+    command(
+        &store,
+        &administrator(),
+        Command::ReconcileWorker {
+            stopped_attempt_ids: vec![first_attempt.id],
+        },
+    )
+    .unwrap();
     admit(&store, &second, &second_worker);
 }
 
@@ -1104,14 +1300,54 @@ fn reviewed_candidate_cannot_publish_until_post_submission_settlement() {
     let (w, p) = enroll(&store, &project, "host", 1);
     let t = task(&store, &project, EffectClass::Workspace);
     let a = admit(&store, &t, &w);
-    let c: CandidateRecord = serde_json::from_value(command(&store, &p, Command::SubmitCandidate { submission: submission(&t, &a) }).unwrap()).unwrap();
-    store.stage_candidate(&administrator(), &c.id, Some(SHA.into()), MERGE.into()).unwrap();
-    command(&store, &administrator(), Command::ReviewCandidate { candidate_id: c.id.clone(), decision: ReviewDecision {
-        candidate_sha: MERGE.into(), approve: true, reason: "explicit exact-SHA review".into(), checks_run: Vec::new(), skipped_checks: vec!["fixture exercises publication ordering, not a build".into()],
-    }}).unwrap();
-    assert_eq!(store.prepare_publication(&administrator(), &c.id).unwrap_err().code, ErrorCode::Conflict);
+    let c: CandidateRecord = serde_json::from_value(
+        command(
+            &store,
+            &p,
+            Command::SubmitCandidate {
+                submission: submission(&t, &a),
+            },
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    store
+        .stage_candidate(&administrator(), &c.id, Some(SHA.into()), MERGE.into())
+        .unwrap();
+    command(
+        &store,
+        &administrator(),
+        Command::ReviewCandidate {
+            candidate_id: c.id.clone(),
+            decision: ReviewDecision {
+                candidate_sha: MERGE.into(),
+                approve: true,
+                reason: "explicit exact-SHA review".into(),
+                checks_run: Vec::new(),
+                skipped_checks: vec!["fixture exercises publication ordering, not a build".into()],
+            },
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        store
+            .prepare_publication(&administrator(), &c.id)
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict
+    );
     assert!(store.pending_publications().unwrap().is_empty());
-    command(&store, &p, Command::ReportEvent { attempt_id: a.id.clone(), generation: a.generation, sequence: 1, event: WorkerEvent::Settled }).unwrap();
+    command(
+        &store,
+        &p,
+        Command::ReportEvent {
+            attempt_id: a.id.clone(),
+            generation: a.generation,
+            sequence: 1,
+            event: WorkerEvent::Settled,
+        },
+    )
+    .unwrap();
     let snapshot = store.snapshot(&administrator()).unwrap();
     assert_eq!(snapshot.attempts[0].state, "result_submitted");
     assert!(snapshot.attempts[0].settled);
@@ -1125,23 +1361,82 @@ fn cancelling_unreachable_external_child_retains_parent_obligation_until_stop() 
     let (w, p) = enroll(&store, &project, "host", 2);
     let t = task(&store, &project, EffectClass::External);
     let a = admit(&store, &t, &w);
-    let delegated = command(&store, &p, Command::Delegate { parent_attempt_id: a.id.clone(), generation: a.generation, spec: spec(&project, EffectClass::External) }).unwrap();
+    let delegated = command(
+        &store,
+        &p,
+        Command::Delegate {
+            parent_attempt_id: a.id.clone(),
+            generation: a.generation,
+            spec: spec(&project, EffectClass::External),
+        },
+    )
+    .unwrap();
     let child: TaskRecord = serde_json::from_value(delegated["task"].clone()).unwrap();
-    let child_attempt: AttemptRecord = serde_json::from_value(delegated["attempt"].clone()).unwrap();
+    let child_attempt: AttemptRecord =
+        serde_json::from_value(delegated["attempt"].clone()).unwrap();
     expire(&store, &child_attempt, &project);
-    command(&store, &administrator(), Command::CancelTask { task_id: child.id.clone() }).unwrap();
+    command(
+        &store,
+        &administrator(),
+        Command::CancelTask {
+            task_id: child.id.clone(),
+        },
+    )
+    .unwrap();
     store.maintain().unwrap();
     let snapshot = store.snapshot(&administrator()).unwrap();
     let cancelled = snapshot.tasks.iter().find(|t| t.id == child.id).unwrap();
     assert!(cancelled.cancel_requested);
     assert!(!scheduling::terminal(cancelled.state));
-    assert!(snapshot.attempts.iter().find(|parent| parent.id == a.id).unwrap().pending_children.contains(&child.id));
+    assert!(
+        snapshot
+            .attempts
+            .iter()
+            .find(|parent| parent.id == a.id)
+            .unwrap()
+            .pending_children
+            .contains(&child.id)
+    );
     assert!(!snapshot.messages.iter().any(|m| m.kind == "child_result"));
-    assert_eq!(command(&store, &p, Command::SubmitCandidate { submission: submission(&t, &a) }).unwrap_err().code, ErrorCode::Conflict);
-    command(&store, &p, Command::ReconcileWorker { stopped_attempt_ids: vec![child_attempt.id] }).unwrap();
+    assert_eq!(
+        command(
+            &store,
+            &p,
+            Command::SubmitCandidate {
+                submission: submission(&t, &a)
+            }
+        )
+        .unwrap_err()
+        .code,
+        ErrorCode::Conflict
+    );
+    command(
+        &store,
+        &p,
+        Command::ReconcileWorker {
+            stopped_attempt_ids: vec![child_attempt.id],
+        },
+    )
+    .unwrap();
     let snapshot = store.snapshot(&administrator()).unwrap();
-    assert_eq!(snapshot.tasks.iter().find(|t| t.id == child.id).unwrap().state, TaskState::Cancelled);
-    assert!(snapshot.attempts.iter().find(|parent| parent.id == a.id).unwrap().pending_children.is_empty());
+    assert_eq!(
+        snapshot
+            .tasks
+            .iter()
+            .find(|t| t.id == child.id)
+            .unwrap()
+            .state,
+        TaskState::Cancelled
+    );
+    assert!(
+        snapshot
+            .attempts
+            .iter()
+            .find(|parent| parent.id == a.id)
+            .unwrap()
+            .pending_children
+            .is_empty()
+    );
     assert!(snapshot.messages.iter().any(|m| m.kind == "child_result"));
 }
 
@@ -1152,20 +1447,84 @@ fn parent_cancellation_waits_for_child_publication_and_termination() {
     let (w, p) = enroll(&store, &project, "host", 2);
     let t = task(&store, &project, EffectClass::External);
     let a = admit(&store, &t, &w);
-    let delegated = command(&store, &p, Command::Delegate { parent_attempt_id: a.id.clone(), generation: a.generation, spec: spec(&project, EffectClass::External) }).unwrap();
+    let delegated = command(
+        &store,
+        &p,
+        Command::Delegate {
+            parent_attempt_id: a.id.clone(),
+            generation: a.generation,
+            spec: spec(&project, EffectClass::External),
+        },
+    )
+    .unwrap();
     let child: TaskRecord = serde_json::from_value(delegated["task"].clone()).unwrap();
-    let child_attempt: AttemptRecord = serde_json::from_value(delegated["attempt"].clone()).unwrap();
+    let child_attempt: AttemptRecord =
+        serde_json::from_value(delegated["attempt"].clone()).unwrap();
     let c = candidate(&store, &p, &child, &child_attempt);
     let publication = store.prepare_publication(&administrator(), &c.id).unwrap();
-    command(&store, &administrator(), Command::CancelTask { task_id: t.id.clone() }).unwrap();
-    command(&store, &p, Command::ReconcileWorker { stopped_attempt_ids: vec![a.id.clone()] }).unwrap();
-    assert!(!scheduling::terminal(store.snapshot(&administrator()).unwrap().tasks.iter().find(|r| r.id == t.id).unwrap().state));
-    store.finish_publication(&publication.id, Some(SHA)).unwrap();
-    assert!(!scheduling::terminal(store.snapshot(&administrator()).unwrap().tasks.iter().find(|r| r.id == t.id).unwrap().state));
-    command(&store, &p, Command::ReconcileWorker { stopped_attempt_ids: vec![child_attempt.id] }).unwrap();
+    command(
+        &store,
+        &administrator(),
+        Command::CancelTask {
+            task_id: t.id.clone(),
+        },
+    )
+    .unwrap();
+    command(
+        &store,
+        &p,
+        Command::ReconcileWorker {
+            stopped_attempt_ids: vec![a.id.clone()],
+        },
+    )
+    .unwrap();
+    assert!(!scheduling::terminal(
+        store
+            .snapshot(&administrator())
+            .unwrap()
+            .tasks
+            .iter()
+            .find(|r| r.id == t.id)
+            .unwrap()
+            .state
+    ));
+    store
+        .finish_publication(&publication.id, Some(SHA))
+        .unwrap();
+    assert!(!scheduling::terminal(
+        store
+            .snapshot(&administrator())
+            .unwrap()
+            .tasks
+            .iter()
+            .find(|r| r.id == t.id)
+            .unwrap()
+            .state
+    ));
+    command(
+        &store,
+        &p,
+        Command::ReconcileWorker {
+            stopped_attempt_ids: vec![child_attempt.id],
+        },
+    )
+    .unwrap();
     let snapshot = store.snapshot(&administrator()).unwrap();
-    assert!(snapshot.tasks.iter().all(|t| t.state == TaskState::Cancelled));
-    assert!(snapshot.attempts.iter().find(|r| r.id == a.id).unwrap().pending_children.is_empty());
+    assert!(
+        snapshot
+            .tasks
+            .iter()
+            .all(|t| t.state == TaskState::Cancelled)
+    );
+    assert!(
+        snapshot
+            .attempts
+            .iter()
+            .find(|r| r.id == a.id)
+            .unwrap()
+            .pending_children
+            .is_empty()
+    );
 }
 
 #[test]
@@ -1175,17 +1534,78 @@ fn stopped_event_preserves_waiting_parent_resume_and_capacity() {
     let (w, p) = enroll(&store, &project, "host", 2);
     let t = task(&store, &project, EffectClass::Workspace);
     let a = admit(&store, &t, &w);
-    let delegated = command(&store, &p, Command::Delegate { parent_attempt_id: a.id.clone(), generation: a.generation, spec: spec(&project, EffectClass::Workspace) }).unwrap();
+    let delegated = command(
+        &store,
+        &p,
+        Command::Delegate {
+            parent_attempt_id: a.id.clone(),
+            generation: a.generation,
+            spec: spec(&project, EffectClass::Workspace),
+        },
+    )
+    .unwrap();
     let child: TaskRecord = serde_json::from_value(delegated["task"].clone()).unwrap();
-    let child_attempt: AttemptRecord = serde_json::from_value(delegated["attempt"].clone()).unwrap();
-    command(&store, &p, Command::ReportEvent { attempt_id: a.id.clone(), generation: a.generation, sequence: 1, event: WorkerEvent::Stopped }).unwrap();
+    let child_attempt: AttemptRecord =
+        serde_json::from_value(delegated["attempt"].clone()).unwrap();
+    command(
+        &store,
+        &p,
+        Command::ReportEvent {
+            attempt_id: a.id.clone(),
+            generation: a.generation,
+            sequence: 1,
+            event: WorkerEvent::Stopped,
+        },
+    )
+    .unwrap();
     let snapshot = store.snapshot(&administrator()).unwrap();
-    assert_eq!(snapshot.attempts.iter().find(|r| r.id == a.id).unwrap().state, "waiting");
+    assert_eq!(
+        snapshot
+            .attempts
+            .iter()
+            .find(|r| r.id == a.id)
+            .unwrap()
+            .state,
+        "waiting"
+    );
     assert_eq!(snapshot.workers[0].reserved.agent_slots, 2);
-    command(&store, &administrator(), Command::CancelTask { task_id: child.id }).unwrap();
-    command(&store, &p, Command::ReconcileWorker { stopped_attempt_ids: vec![child_attempt.id] }).unwrap();
-    command(&store, &p, Command::ReportEvent { attempt_id: a.id.clone(), generation: a.generation, sequence: 2, event: WorkerEvent::Progress { message: "resumed with retained reservation".into() } }).unwrap();
-    command(&store, &p, Command::Delegate { parent_attempt_id: a.id.clone(), generation: a.generation, spec: spec(&project, EffectClass::Workspace) }).unwrap();
+    command(
+        &store,
+        &administrator(),
+        Command::CancelTask { task_id: child.id },
+    )
+    .unwrap();
+    command(
+        &store,
+        &p,
+        Command::ReconcileWorker {
+            stopped_attempt_ids: vec![child_attempt.id],
+        },
+    )
+    .unwrap();
+    command(
+        &store,
+        &p,
+        Command::ReportEvent {
+            attempt_id: a.id.clone(),
+            generation: a.generation,
+            sequence: 2,
+            event: WorkerEvent::Progress {
+                message: "resumed with retained reservation".into(),
+            },
+        },
+    )
+    .unwrap();
+    command(
+        &store,
+        &p,
+        Command::Delegate {
+            parent_attempt_id: a.id.clone(),
+            generation: a.generation,
+            spec: spec(&project, EffectClass::Workspace),
+        },
+    )
+    .unwrap();
     let snapshot = store.snapshot(&administrator()).unwrap();
     let resumed = snapshot.attempts.iter().find(|r| r.id == a.id).unwrap();
     assert_eq!(resumed.state, "executing");
@@ -1200,14 +1620,30 @@ fn workspace_parent_cannot_delegate_external_effects() {
     let (w, p) = enroll(&store, &project, "host", 2);
     let t = task(&store, &project, EffectClass::Workspace);
     let a = admit(&store, &t, &w);
-    assert_eq!(command(&store, &p, Command::Delegate { parent_attempt_id: a.id.clone(), generation: a.generation, spec: spec(&project, EffectClass::External) }).unwrap_err().code, ErrorCode::Forbidden);
+    assert_eq!(
+        command(
+            &store,
+            &p,
+            Command::Delegate {
+                parent_attempt_id: a.id.clone(),
+                generation: a.generation,
+                spec: spec(&project, EffectClass::External)
+            }
+        )
+        .unwrap_err()
+        .code,
+        ErrorCode::Forbidden
+    );
     let snapshot = store.snapshot(&administrator()).unwrap();
     assert_eq!(snapshot.tasks.len(), 1);
     assert!(snapshot.attempts[0].pending_children.is_empty());
     assert_eq!(snapshot.workers[0].reserved.agent_slots, 1);
     expire(&store, &a, &project);
     store.maintain().unwrap();
-    assert_eq!(store.snapshot(&administrator()).unwrap().tasks[0].state, TaskState::Ready);
+    assert_eq!(
+        store.snapshot(&administrator()).unwrap().tasks[0].state,
+        TaskState::Ready
+    );
 }
 
 #[test]
@@ -1221,13 +1657,33 @@ fn expired_original_external_completion_is_accepted_only_after_explicit_reconcil
     let a = admit(&store, &t, &w);
     expire(&store, &a, &project);
     store.maintain().unwrap();
-    assert_eq!(command(&store, &p, Command::SubmitCandidate { submission: submission(&t, &a) }).unwrap_err().code, ErrorCode::Conflict);
-    command(&store, &p, Command::ReconcileWorker { stopped_attempt_ids: vec![a.id.clone()] }).unwrap();
+    assert_eq!(
+        command(
+            &store,
+            &p,
+            Command::SubmitCandidate {
+                submission: submission(&t, &a)
+            }
+        )
+        .unwrap_err()
+        .code,
+        ErrorCode::Conflict
+    );
+    command(
+        &store,
+        &p,
+        Command::ReconcileWorker {
+            stopped_attempt_ids: vec![a.id.clone()],
+        },
+    )
+    .unwrap();
     drop(store);
     let store = Store::open(&path, ADMIN).unwrap();
     let c = candidate(&store, &p, &t, &a);
     let publication = store.prepare_publication(&administrator(), &c.id).unwrap();
-    store.finish_publication(&publication.id, Some(MERGE)).unwrap();
+    store
+        .finish_publication(&publication.id, Some(MERGE))
+        .unwrap();
     let snapshot = store.snapshot(&administrator()).unwrap();
     assert_eq!(snapshot.tasks[0].state, TaskState::Accepted);
     assert_eq!(snapshot.tasks[0].generation, a.generation);
@@ -1243,7 +1699,144 @@ fn reconciled_fenced_workspace_cannot_submit_original_completion() {
     let a = admit(&store, &t, &w);
     expire(&store, &a, &project);
     store.maintain().unwrap();
-    command(&store, &p, Command::ReconcileWorker { stopped_attempt_ids: vec![a.id.clone()] }).unwrap();
-    assert_eq!(command(&store, &p, Command::SubmitCandidate { submission: submission(&t, &a) }).unwrap_err().code, ErrorCode::Conflict);
-    assert!(store.snapshot(&administrator()).unwrap().candidates.is_empty());
+    command(
+        &store,
+        &p,
+        Command::ReconcileWorker {
+            stopped_attempt_ids: vec![a.id.clone()],
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        command(
+            &store,
+            &p,
+            Command::SubmitCandidate {
+                submission: submission(&t, &a)
+            }
+        )
+        .unwrap_err()
+        .code,
+        ErrorCode::Conflict
+    );
+    assert!(
+        store
+            .snapshot(&administrator())
+            .unwrap()
+            .candidates
+            .is_empty()
+    );
+}
+
+#[test]
+fn stopped_event_finishes_cancellation_without_reopening_the_task() {
+    let store = Store::open(":memory:", ADMIN).unwrap();
+    let project = create_project(&store);
+    let (worker, principal) = enroll(&store, &project, "host", 1);
+    let task = task(&store, &project, EffectClass::External);
+    let attempt = admit(&store, &task, &worker);
+    command(
+        &store,
+        &administrator(),
+        Command::CancelTask {
+            task_id: task.id.clone(),
+        },
+    )
+    .unwrap();
+    command(
+        &store,
+        &principal,
+        Command::ReportEvent {
+            attempt_id: attempt.id.clone(),
+            generation: attempt.generation,
+            sequence: 1,
+            event: WorkerEvent::Stopped,
+        },
+    )
+    .unwrap();
+    let snapshot = store.snapshot(&administrator()).unwrap();
+    assert_eq!(snapshot.tasks[0].state, TaskState::Cancelled);
+    assert_eq!(snapshot.workers[0].reserved.agent_slots, 0);
+    assert!(
+        command(
+            &store,
+            &principal,
+            Command::ReportEvent {
+                attempt_id: attempt.id,
+                generation: attempt.generation,
+                sequence: 2,
+                event: WorkerEvent::Progress {
+                    message: "late execution".into()
+                },
+            }
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn desktop_admission_requires_observation_and_excludes_reserved_desktops() {
+    let store = Store::open(":memory:", ADMIN).unwrap();
+    let project = create_project(&store);
+    let (worker, principal) = enroll(&store, &project, "desktop-owner", 2);
+    {
+        let db = store.lock().unwrap();
+        let mut record: WorkerRecord = get(&db, "worker", &worker.id).unwrap();
+        record.registration.capabilities.push("desktop".into());
+        put(&db, "worker", &worker.id, &project.id, &record).unwrap();
+    }
+    let make_task = || {
+        let mut spec = spec(&project, EffectClass::External);
+        spec.required_capabilities.push("desktop".into());
+        serde_json::from_value::<TaskRecord>(
+            command(&store, &administrator(), Command::CreateTask { spec }).unwrap(),
+        )
+        .unwrap()
+    };
+    let first = make_task();
+    let second = make_task();
+    let request = |task: &TaskRecord| {
+        command(
+            &store,
+            &administrator(),
+            Command::AdmitTask {
+                task_id: task.id.clone(),
+                worker_id: Some(worker.id.clone()),
+            },
+        )
+    };
+    assert_eq!(
+        request(&first).unwrap_err().code,
+        ErrorCode::CapacityUnavailable
+    );
+    let report = |paused| {
+        command(
+            &store,
+            &principal,
+            Command::ReportRuntimeStatus {
+                status: WorkerRuntimeStatus {
+                    worker_id: worker.id.clone(),
+                    provider_authenticated: Some(true),
+                    network_ready: None,
+                    desktop_session: Some("observed-owner-session".into()),
+                    desktop_active: false,
+                    desktop_paused: paused,
+                    observed_at: 0,
+                },
+            },
+        )
+        .unwrap()
+    };
+    report(true);
+    assert_eq!(
+        request(&first).unwrap_err().code,
+        ErrorCode::CapacityUnavailable
+    );
+    report(false);
+    let admitted: AttemptRecord = serde_json::from_value(request(&first).unwrap()).unwrap();
+    assert_eq!(admitted.task_id, first.id);
+    assert_eq!(
+        request(&second).unwrap_err().code,
+        ErrorCode::CapacityUnavailable
+    );
 }

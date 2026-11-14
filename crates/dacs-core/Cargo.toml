@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 dacs-protocol.workspace = true
+dacs-net-contract.workspace = true
+time.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 rusqlite.workspace = true

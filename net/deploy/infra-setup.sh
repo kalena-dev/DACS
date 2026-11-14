@@ -745,8 +745,8 @@ setup_netadmin() {
         mv -f -- "$key.tmp" "$key"
         mv -f -- "$cert.tmp" "$cert"
         changed=1
-    elif ! openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null | grep -q "IP Address:${INFRA_OVERLAY_IP}\$\|IP Address:${INFRA_OVERLAY_IP},"; then
-        warn "$cert does not cover $INFRA_OVERLAY_IP; delete $cert and $key and re-run to regenerate (Person 1 must re-pin)"
+    elif ! openssl x509 -in "$cert" -noout -checkip "$INFRA_OVERLAY_IP" >/dev/null 2>&1; then
+        die "$cert does not cover $INFRA_OVERLAY_IP; rotate its certificate/key explicitly and distribute the new public certificate to the coordinator before retrying"
     fi
     chown "$NETADMIN_USER:$NETADMIN_USER" -- "$key"
     chmod 0600 -- "$key"
@@ -812,6 +812,19 @@ setup_netadmin() {
         journalctl -u dacs-netadmin -n 40 --no-pager >&2 || true
         die "dacs-netadmin is not running"
     fi
+    # Active does not imply a listening, TLS-valid or Headscale-healthy service.
+    # This reads only the public health route; no operation/admin token is sent.
+    local health_ok=0
+    for ((i = 0; i < 15; i++)); do
+        if curl --noproxy '*' --cacert "$cert" -fsS --max-time 3 \
+            "https://${INFRA_OVERLAY_IP}:${NETADMIN_PORT}/v1/health" |
+            jq -e '.ok == true and .contract_revision == "dacs-net/2026-11-14.1"' >/dev/null; then
+            health_ok=1
+            break
+        fi
+        sleep 1
+    done
+    ((health_ok)) || die "netadmin failed verified HTTPS health checks; inspect its listener, TLS certificate and Headscale connectivity"
     info "dacs-netadmin active on https://${INFRA_OVERLAY_IP}:${NETADMIN_PORT}"
 }
 
@@ -846,8 +859,11 @@ summary() {
     ))
     dacs-netadmin (overlay only)     https://${INFRA_OVERLAY_IP}:${NETADMIN_PORT}
                                      (https://dacs-infra.dacs.internal:${NETADMIN_PORT})
-    netadmin cert SHA-256 (Person 1 pins this)
+    netadmin cert SHA-256 (verify over a separate trusted channel)
                                      ${NETADMIN_CERT_FP}
+    Public trust certificate         ${NETADMIN_TLS_DIR}/cert.pem
+                                     Copy ONLY this public file to the coordinator's network-config ca_file.
+                                     Never copy key.pem, headscale-api-key or operation-tokens.sha256.
     Operation token                  $(if ((NEW_TOKEN_ISSUED)); then echo "NEW token printed above - hand it to Person 1 privately"; else echo "unchanged (hash in ${TOKEN_HASH_FILE})"; fi)
 
   Firewall (cloud security group / host firewall)
@@ -873,7 +889,7 @@ EOF
 
 EOF
     else
-        printf '  Bootstrap relay active. Re-run this script whenever the coordinator overlay IP changes.\n\n'
+        printf '  Bootstrap routing configured, not application-verified. Run dacs-net preflight from the coordinator and an unenrolled host. Re-run this script whenever the coordinator overlay IP changes.\n\n'
     fi
 }
 

@@ -234,6 +234,10 @@ pub struct BuildProfile {
     pub cargo_lock_sha256: String,
     pub rustc_version: String,
     pub cargo_version: String,
+    /// Exact `rustc -vV`, including compiler commit, host and LLVM version.
+    pub rustc_verbose: String,
+    /// Digest of the selected sysroot bin/lib trees, computed by build_runner.
+    pub sysroot_sha256: String,
     pub target: String,
     pub package: String,
     pub features: Vec<String>,
@@ -279,6 +283,9 @@ impl BuildProfile {
             || self.package.trim().is_empty()
             || self.rustc_version.trim().is_empty()
             || self.cargo_version.trim().is_empty()
+            || self.rustc_verbose.trim().is_empty()
+            || self.sysroot_sha256.len() != 64
+            || !self.sysroot_sha256.bytes().all(|b| b.is_ascii_hexdigit())
         {
             return Err(BuildPlanError::Invalid(
                 "target, package and exact Cargo/rustc versions are required".into(),
@@ -290,7 +297,7 @@ impl BuildProfile {
             ));
         }
         for name in self.environment.keys() {
-            if name.starts_with("CARGO_") && name == "CARGO_INCREMENTAL" {
+            if name == "CARGO_INCREMENTAL" {
                 return Err(BuildPlanError::Invalid(
                     "CARGO_INCREMENTAL is controlled by DACS and must remain disabled".into(),
                 ));
@@ -301,6 +308,14 @@ impl BuildProfile {
                 || name == "RUSTC_WRAPPER"
                 || name == "CARGO_ENCODED_RUSTFLAGS"
                 || name == "RUSTFLAGS"
+                || name == "RUSTC_WORKSPACE_WRAPPER"
+                || name == "RUSTC"
+                || name == "CARGO_BUILD_RUSTC"
+                || name == "CARGO_BUILD_RUSTC_WRAPPER"
+                || name == "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"
+                || name == "CARGO_BUILD_TARGET"
+                || name == "CARGO_TARGET_DIR"
+                || name == "CARGO_BUILD_JOBS"
             {
                 return Err(BuildPlanError::Invalid(format!(
                     "environment key {name} is reserved by the build runner"
@@ -357,7 +372,6 @@ impl BuildProfile {
         run_root: impl Into<PathBuf>,
         sccache: impl Into<PathBuf>,
         sccache_config: impl Into<PathBuf>,
-        job_id: &str,
         reservation_id: &str,
     ) -> Result<ManagedChild, BuildPlanError> {
         let checkout = checkout.into();
@@ -503,6 +517,7 @@ pub struct CompileActionEvidence {
     pub remote: bool,
     pub success: bool,
     pub consumed_by_build: bool,
+    pub consumed_output_sha256: Option<String>,
     pub cache_hit: bool,
     pub local_fallback: bool,
     pub attempt_count: u32,
@@ -537,6 +552,18 @@ impl BuildEvidence {
         &self,
         expected_hosts: [&str; 2],
     ) -> Result<(), BuildPlanError> {
+        if expected_hosts.iter().any(|h| h.is_empty())
+            || self.actions.iter().any(|a| {
+                a.invocation_id.is_empty()
+                    || a.toolchain != self.rustc_version
+                    || a.target != self.target
+                    || (a.consumed_by_build && a.attempt_count == 0)
+            })
+        {
+            return Err(BuildPlanError::Invalid(
+                "action identity, toolchain, target or attempt count is invalid".into(),
+            ));
+        }
         if !self.clean_output || !self.cold_result_cache || self.exit_code != Some(0) {
             return Err(BuildPlanError::Invalid(
                 "required proof needs a successful build, clean outputs, and cold result cache"

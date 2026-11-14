@@ -1,8 +1,8 @@
 # DACS network and enrollment (Person 3)
 
-This workspace holds the DACS private network: Headscale/Tailscale/DERP deployment
+This directory holds the DACS private network: Headscale/Tailscale/DERP deployment
 files, the enrollment adapter that runs beside Headscale, the device-side network
-client and the wire contract shared with Persons 1, 2 and 4.
+client and the wire contract. Its crates are members of the repository-root workspace.
 
 Contract revision: `dacs-net/2026-11-14.1` (`CONTRACT_REVISION` in
 `crates/dacs-net-contract/src/lib.rs`). Admin-access disclosure revision:
@@ -21,10 +21,8 @@ Person 3 performs network operations only after Person 1's authorization and the
 owner's consent. Installation, project authorization and network membership are
 separate states; this code models only network membership (`MembershipState`).
 
-This `net/` directory is a standalone Cargo workspace only until Person 1's root
-workspace exists. Integration adds the three crates as members of the root
-workspace and removes `net/Cargo.toml` and `net/Cargo.lock` (see the comment at
-the top of `net/Cargo.toml`).
+The three network crates are members of the root Cargo workspace and use its
+lockfile. Run Cargo commands from the repository root; paths in the table below are relative to `net/`.
 
 | Path | Contents |
 |---|---|
@@ -37,7 +35,8 @@ the top of `net/Cargo.toml`).
 | `deploy/netadmin/config.example.json` | `dacs-netadmin` config (secrets referenced by path) |
 | `deploy/netadmin/enrollment-request.example.json` | Coordinator `EnrollmentRequest` for `dacs-netadmin issue` |
 | `deploy/netadmin/dacs-netadmin.service` | systemd unit (`check` before `serve`) |
-| `deploy/infra-setup.sh` | Infra host setup script (written separately; reference only) |
+| `deploy/infra-setup.sh` | Debian/Ubuntu infra deployment; never run on an agent PC without recorded risk acceptance |
+| `deploy/netadmin/preflight.example.json` | Read-only endpoint/TLS/bridge diagnostic configuration; replace every placeholder |
 
 ## Architecture
 
@@ -258,7 +257,8 @@ token; the single-use auth key is consumed by `join` and is not part of
 - Evidence commands (`dacs-net`, JSON on stdout):
   - `dacs-net compiler-check --endpoints <file> [--timeout-ms 3000]`: for each endpoint,
     TCP probe (`TcpProbe { target, overlay_private, reachable, connect_ms, error }`)
-    and an active `tailscale ping` path; `ok` requires overlay-private and reachable.
+    and an active `tailscale ping` path; `ok` requires overlay-private, reachable TCP
+    and a measured non-unreachable path. Rejects non-overlay addresses before probing.
     Exit 2 if any endpoint fails or the list is empty.
   - `dacs-net peers > before.json`, run the build, `dacs-net peers > after.json`, then
     `dacs-net traffic --before before.json --after after.json`: per peer
@@ -275,6 +275,7 @@ token; the single-use auth key is consumed by `join` and is not part of
 |---|---|
 | `status` | Local `TailnetClientState` |
 | `assess <LOGIN_SERVER>` | `TailnetAssessment`; no changes |
+| `preflight --config <file>` | Read-only DNS, verified TLS, health and bootstrap-to-netadmin bridge checks; no tokens or joins |
 | `join --grant <file> --consent <file> [--unattended] [--no-dns]` | Join with an `EnrollmentGrant` and `HostConsent`; prints `LocalJoinResult` |
 | `leave <LOGIN_SERVER>` | Log out of the DACS profile only |
 | `peers` | `Vec<PeerSnapshot>` |
@@ -284,7 +285,7 @@ token; the single-use auth key is consumed by `join` and is not part of
 | `traffic --before <file> --after <file>` | Per-peer byte deltas and path |
 
 Exit codes: 0 success, 2 the command ran but a check failed (`ping`, `probe`,
-`compiler-check`), 1 error. The CLI is found via `DACS_TAILSCALE_BIN`, then `PATH`,
+`compiler-check`, `preflight`), 1 error. The CLI is found via `DACS_TAILSCALE_BIN`, then `PATH`,
 then platform default install paths. No command prints the auth key.
 
 ## Coordinator-first bootstrap
@@ -320,6 +321,63 @@ Other `dacs-netadmin` subcommands: `serve --config <path>`, `check --config <pat
 (config, secret file permissions, Headscale connectivity), `hash-token` (hash of a
 token read from stdin). `--config` defaults to `/etc/dacs-netadmin/config.json`.
 
+### Integrated coordinator and deployment preflight
+
+Build the infrastructure binary on its supported Linux architecture from the
+repository root: `cargo build --release -p dacs-netadmin`. Deploy
+`target/release/dacs-netadmin` together with `net/deploy/`. The deployment script
+requires a real dedicated Debian/Ubuntu systemd host, two owner-controlled public
+DNS names, public IPv4, ACME email/consent and the Linux binary. It changes that
+host's packages/services/network; it is not an installation-time client action.
+
+The coordinator implementation is now available. Run `dacs serve` with
+`--listen COORDINATOR_OVERLAY_IP:7443 --bootstrap-listen COORDINATOR_OVERLAY_IP:7444`,
+`--tls-cert FILE --tls-key FILE`, `--public-url https://coordinator.dacs.internal:7443`,
+and `--network-config FILE`. Replace the overlay IP and use the approved
+coordinator hostname. The bridge config is
+`{"netadmin_url":"https://INFRA_OVERLAY_IP:9443","operation_token_file":"/private/netadmin.token","ca_file":"/private/netadmin-cert.pem"}`.
+Protect the token file; only the scoped operation token belongs on the coordinator.
+The script's printed certificate fingerprint is for out-of-band verification,
+not a substitute for the PEM `ca_file` required by the current bridge.
+
+Both coordinator listeners currently share one certificate/key. Its SANs must
+cover the public bootstrap name **and** the configured control hostname/address.
+The infra script provisions only Headscale's public certificate and netadmin's
+private certificate; it does not provision the coordinator certificate. Public
+CAs cannot certify `.internal` names: use a privately trusted CA covering both
+names (install its public root on invitees before bootstrap), or use an
+owner-controlled public DNS control name resolving to the overlay and obtain the
+appropriate certificate outside this script. Never disable TLS verification or
+copy private CA/Headscale credentials onto agent PCs. Keep certificate renewal
+and application reload under the owners' control.
+
+Copy `net/deploy/netadmin/preflight.example.json` to an owner-private config,
+replace endpoint placeholders and specify only public CA certificate files.
+Run `dacs-net preflight --config FILE` from the enrolled coordinator to check:
+
+- Headscale's real `/health`, bootstrap/control `/health` and protocol version;
+- bootstrap `/api/network/contract`, which exercises the live bridge with its
+  server-side operation token and validates the current disclosure/contract;
+- netadmin `/v1/health`, including its actual Headscale dependency.
+
+The client resolves DNS, records addresses/status/elapsed time, verifies TLS and
+hostname, disables redirects/proxies, bounds response size/time, and refuses
+private control/netadmin targets resolving outside the overlay before connecting.
+It reads local Tailscale assessment without changing login or membership. No
+token is accepted in this config or sent by diagnostics. `ok` describes the
+requested HTTP checks only, not enrollment readiness or fleet proof;
+`private_endpoints_checked` explicitly distinguishes a public-only run.
+For an **unenrolled** invitee, omit `control_url` and `netadmin_url` (or set them
+to null) and run the same check against public bootstrap/Headscale. Never widen
+the ACL to make netadmin available to invitees. An unavailable bridge is a failed
+check, even when the bootstrap listener itself is healthy.
+
+Run existing `compiler-check` separately from each role that must reach compiler
+ports. `peers`/`ping`/`traffic` record direct/DERP and measured transfer evidence;
+preflight does not prove STUN/DERP operation, revocation, reconnect, compilation,
+or access from another physical host. Linux compile guests need their own node.
+
+
 ## Ports and ACL (`deploy/headscale/policy.hujson`)
 
 Default deny; only these grants exist. Tags are owned by `group:dacs-admins`.
@@ -336,10 +394,10 @@ Public ports on the infra host: tcp/443 (nginx SNI router), tcp/80 (ACME HTTP-01
 `/generate_204`, redirect to HTTPS), udp/3478 (STUN). Headscale (8080), its metrics
 (9090) and gRPC (50443) listen on loopback only.
 
-Ports 7443/7444 are proposals pending Person 1's confirmation; 10600/10501 are the
-sccache-dist defaults pending Person 4's confirmation. Changing a port means editing
-`policy.hujson` (and `compiler_ports` in the netadmin config, or the nginx upstream
-for 7444).
+Coordinator ports 7443/7444 are confirmed for integration. The application uses
+separate TLS control and bootstrap listeners; see `../docs/team-integration.md`.
+Ports 10600/10501 remain the sccache-dist defaults pending the actual compiler
+configuration. Port changes must also update the ACL and relevant upstream.
 
 ## Security model and limits
 
@@ -376,11 +434,11 @@ for 7444).
 
 ## Build and test
 
-From `net/`:
+From the repository root:
 
 ```sh
-cargo test --workspace
-cargo clippy --workspace --all-targets
+cargo test -p dacs-net-contract -p dacs-netadmin -p dacs-netclient
+cargo clippy -p dacs-net-contract -p dacs-netadmin -p dacs-netclient --all-targets
 ```
 
 Tests use an in-memory Headscale fake and Tailscale CLI output fixtures; they do not
@@ -390,12 +448,30 @@ contact a real Headscale server or modify the local Tailscale client.
 
 | Check | Result | Evidence |
 |---|---|---|
-| Unit tests (`cargo test --workspace`, 33 tests) and `cargo clippy --workspace --all-targets` | Passed | Run from `net/` on Windows, Rust 1.100 |
+| Historical standalone network tests (33 tests) and Clippy | Previously passed before root-workspace integration; not rerun for this change | Prior Person 3 contribution |
 | `dacs-netadmin` against real Headscale v0.29.7 + Tailscale 1.104.7 client (isolated WSL): enroll, single-use reuse refused, join, rename, membership, compiler endpoints, 401/400/409, revoke, no reconnect, revoke-before-use | Passed | `evidence/local-headscale-integration.md` |
 | `dacs-net status` / `assess` against the real Windows Tailscale 1.104.7 client (logged out) | Passed: `logged_out`, no switch consent needed | Local run |
-| `deploy/infra-setup.sh` | Syntax and ShellCheck only; not executed. Its policy-before-user ordering is confirmed: in the WSL run Headscale started with the unchanged policy before `dacs-admin` existed | — |
+| `deploy/infra-setup.sh` | Prior version received syntax/ShellCheck only. Current verified-HTTPS health/certificate changes are not executed or checked here | Parent owns final checks |
 | Public Linux server, DNS, Let's Encrypt TLS, nginx SNI router, public DERP/STUN | Not run: no server, domain or DNS access was available | — |
 | netadmin over TLS on the infra overlay IP | Not run | — |
 | `dacs-net join` end to end, tailnet-switch consent on a host with an existing login | Not run (decision logic unit-tested only) | — |
 | Direct vs DERP paths between fleet PCs, compiler reachability (10600/10501), Linux compile guest as its own node, revocation on real hosts | Not run: needs the fleet and the public infra host | — |
-| Task-board Leptos frontend (four-agent demo) | Not started: must run through completed DACS against Person 2's API | — |
+| Task-board backend/server and Leptos CSR assets | Implemented in the integrated workspace; current checks/browser proof delegated to integration owner, not run here | `crates/dacs-app/src/task_board.rs`, `crates/dacs-worker/src/task_board.rs`, `examples/task-board-web/` |
+| Current deployment inputs | Templates still contain `HS_DOMAIN`, `BOOTSTRAP_DOMAIN`, `INFRA_OVERLAY_IP`; no approved fleet/server mapping or deployable public DNS/certificate configuration found. A configured SSH alias alone is not evidence of authorized DACS infrastructure | Repository deployment templates; no server contacted or tailnet changed |
+| Read-only `preflight` | Implemented; no live endpoints supplied, not run | `net/crates/dacs-netclient/src/preflight.rs` |
+
+### Private task-board preview
+
+Build the CSR assets with Trunk in `examples/task-board-web/`, then run the
+integrated `dacs task-board --listen 127.0.0.1:7311 --data /private/board.redb
+--assets examples/task-board-web/dist`. `--data` is a redb **file**, not a
+directory, and must be outside the static asset root. The server rejects
+non-loopback binds and missing assets. Use the displayed bound loopback address.
+Mutations require exact same-origin Origin headers; foreign/null origins and
+DNS-rebinding Host headers are refused. Static paths are canonically confined;
+Trunk's generated inline loader gets an exact CSP SHA-256 hash, not unsafe-inline.
+Stop with Ctrl-C (or SIGTERM on Unix), wait for shutdown, then restart with the
+same data file. The table is created even on an empty board; edits/status changes
+are atomic transactions and deletions remain deleted through restart.
+This private preview is not multiuser authentication and does not sandbox other
+local processes. It is not the four-agent/three-physical-PC execution proof.

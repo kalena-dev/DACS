@@ -8,7 +8,12 @@ publish = false
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+fs2 = "0.4"
 
 [[bin]]
 name = "dacs-build-preflight"
 path = "preflight.rs"
+
+[[bin]]
+name = "dacs-rustc-provenance"
+path = "src/rustc_provenance.rs"

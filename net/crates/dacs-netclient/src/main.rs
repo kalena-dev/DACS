@@ -27,6 +27,11 @@ enum Command {
     Status,
     /// Check whether joining LOGIN_SERVER needs tailnet-switch consent. No changes.
     Assess { login_server: String },
+    /// Read-only DNS/TLS/application/bridge checks. No enrollment or tailnet changes.
+    Preflight {
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// Join with a device grant after owner consent (both JSON files).
     Join {
         #[arg(long)]
@@ -52,6 +57,7 @@ enum Command {
     },
     /// TCP reachability of one or more ADDR:PORT targets.
     Probe {
+        #[arg(required = true, num_args = 1..)]
         targets: Vec<SocketAddr>,
         #[arg(long, default_value_t = 3000)]
         timeout_ms: u64,
@@ -118,6 +124,13 @@ async fn run(cli: Cli) -> Result<bool, String> {
     match cli.command {
         Command::Status => print(&detect().await),
         Command::Assess { login_server } => print(&assess(&login_server).await),
+        Command::Preflight { config } => {
+            let config: dacs_netclient::preflight::PreflightConfig = read_json(&config)?;
+            let report = dacs_netclient::preflight::run(&config).await?;
+            let ok = report.ok;
+            print(&report);
+            return Ok(ok);
+        }
         Command::Join {
             grant,
             consent,
@@ -170,9 +183,19 @@ async fn run(cli: Cli) -> Result<bool, String> {
             let mut all = !endpoints.is_empty();
             let mut out = Vec::new();
             for ep in endpoints {
+                if !dacs_net_contract::is_overlay_ip(ep.overlay_ip) {
+                    return Err(
+                        "compiler endpoints must use private overlay addresses; no probe sent"
+                            .into(),
+                    );
+                }
                 let tcp = probe_tcp(ep.socket_addr(), Duration::from_millis(timeout_ms)).await;
                 let path = ping(&ep.overlay_ip.to_string(), 3).await.ok();
-                let ok = tcp.overlay_private && tcp.reachable;
+                let ok = tcp.overlay_private
+                    && tcp.reachable
+                    && path.as_ref().is_some_and(|p| {
+                        !matches!(p.path, dacs_net_contract::PeerPath::Unreachable { .. })
+                    });
                 all &= ok;
                 out.push(CompilerCheck {
                     endpoint: ep,

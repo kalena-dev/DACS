@@ -817,12 +817,16 @@ dependencies = [
  "anyhow",
  "axum",
  "axum-server",
+ "base64 0.22.1",
  "clap",
  "dacs-core",
+ "dacs-net-contract",
+ "dacs-netclient",
  "dacs-protocol",
  "dacs-setup",
  "dacs-source",
  "dacs-ui",
+ "dacs-worker",
  "hex",
  "rand 0.9.5",
  "rcgen",
@@ -831,6 +835,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "time",
  "tokio",
  "tower-http",
  "tracing",
@@ -844,6 +849,7 @@ name = "dacs-core"
 version = "0.1.0"
 dependencies = [
  "chacha20poly1305",
+ "dacs-net-contract",
  "dacs-protocol",
  "hex",
  "rand 0.9.5",
@@ -852,6 +858,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "time",
  "uuid",
 ]
 
@@ -895,12 +902,14 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "dacs-net-contract",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "time",
  "tokio",
+ "url",
 ]
 
 [[package]]
@@ -916,6 +925,7 @@ dependencies = [
 name = "dacs-release-audit"
 version = "0.1.0"
 dependencies = [
+ "fs2",
  "serde",
  "serde_json",
  "sha2",
@@ -961,6 +971,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dacs-task-board-web"
+version = "0.1.0"
+dependencies = [
+ "form_urlencoded",
+ "gloo-net",
+ "leptos",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "dacs-ui"
 version = "0.1.0"
 dependencies = [
@@ -981,12 +1002,21 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
+ "dacs-protocol",
+ "dacs-release-audit",
+ "fs2",
  "hex",
+ "nix 0.30.1",
+ "process-wrap",
  "redb",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
  "sha2",
+ "sysinfo",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -2314,6 +2344,7 @@ dependencies = [
  "cfg-if",
  "either_of",
  "futures",
+ "getrandom 0.4.3",
  "hydration_context",
  "leptos_config",
  "leptos_dom",
@@ -2663,6 +2694,39 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "60993920e071b0c9b66f14e2b32740a4e27ffc82854dcd72035887f336a09a28"
 
 [[package]]
+name = "nix"
+version = "0.30.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
+dependencies = [
+ "bitflags 2.13.2",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
+
+[[package]]
+name = "nix"
+version = "0.31.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
+dependencies = [
+ "bitflags 2.13.2",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
+
+[[package]]
+name = "ntapi"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3b335231dfd352ffb0f8017f3b6027a4917f7df785ea2143d8af2adc66980ae"
+dependencies = [
+ "winapi",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2821,6 +2885,16 @@ checksum = "e3e0adef53c21f888deb4fa59fc59f7eb17404926ee8a6f59f5df0fd7f9f3272"
 dependencies = [
  "bitflags 2.13.2",
  "objc2",
+ "objc2-core-foundation",
+]
+
+[[package]]
+name = "objc2-io-kit"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33fafba39597d6dc1fb709123dfa8289d39406734be322956a69f0931c73bb15"
+dependencies = [
+ "libc",
  "objc2-core-foundation",
 ]
 
@@ -3243,6 +3317,20 @@ dependencies = [
  "quote",
  "syn 3.0.10",
  "version_check",
+]
+
+[[package]]
+name = "process-wrap"
+version = "10.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f21b97672d2dc848e7b25701ab4535618b92f4861c13cc3f7f7bed52ad3c8da"
+dependencies = [
+ "futures",
+ "indexmap",
+ "nix 0.31.3",
+ "tokio",
+ "tracing",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -4154,6 +4242,20 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.10",
+]
+
+[[package]]
+name = "sysinfo"
+version = "0.37.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16607d5caffd1c07ce073528f9ed972d88db15dd44023fa57142963be3feb11f"
+dependencies = [
+ "libc",
+ "memchr",
+ "ntapi",
+ "objc2-core-foundation",
+ "objc2-io-kit",
+ "windows 0.61.3",
 ]
 
 [[package]]

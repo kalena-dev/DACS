@@ -1,4 +1,5 @@
 use crate::local::{self, Jobs};
+use crate::network::{self, NetworkConfig, NetworkService};
 use axum::{
     Form, Json, Router,
     body::Bytes,
@@ -25,6 +26,8 @@ use tokio::sync::Notify;
 #[derive(Clone)]
 pub struct Config {
     pub listen: SocketAddr,
+    pub bootstrap_listen: Option<SocketAddr>,
+    pub network_config: Option<PathBuf>,
     pub public_url: String,
     pub host_name: String,
     pub data_dir: PathBuf,
@@ -35,27 +38,28 @@ pub struct Config {
 }
 
 #[derive(Clone)]
-struct Session {
-    bearer: String,
-    csrf: String,
+pub(crate) struct Session {
+    pub(crate) bearer: String,
+    pub(crate) csrf: String,
     expires: i64,
     flash: Option<String>,
 }
 
 #[derive(Clone)]
-struct App {
-    store: Store,
+pub(crate) struct App {
+    pub(crate) store: Store,
     source: SourceService,
-    config: Arc<Config>,
+    pub(crate) config: Arc<Config>,
     sessions: Arc<Mutex<HashMap<String, Session>>>,
     login_nonces: Arc<Mutex<HashMap<String, i64>>>,
-    jobs: Jobs,
+    pub(crate) jobs: Jobs,
+    network: NetworkService,
     shutdown: Arc<Notify>,
     pending_update: Arc<Mutex<Option<Value>>>,
 }
 
-struct WebError(ApiError);
-type WebResult<T> = std::result::Result<T, WebError>;
+pub(crate) struct WebError(pub(crate) ApiError);
+pub(crate) type WebResult<T> = std::result::Result<T, WebError>;
 impl From<ApiError> for WebError {
     fn from(error: ApiError) -> Self {
         Self(error)
@@ -111,7 +115,7 @@ fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
         })
 }
 
-fn session(app: &App, headers: &HeaderMap) -> WebResult<(String, Session)> {
+pub(crate) fn session(app: &App, headers: &HeaderMap) -> WebResult<(String, Session)> {
     let id = cookie(headers, "dacs_session").ok_or_else(unauthorized)?;
     let mut sessions = app
         .sessions
@@ -136,7 +140,7 @@ fn origin_check(app: &App, headers: &HeaderMap) -> WebResult<()> {
     Ok(())
 }
 
-fn authenticate(app: &App, headers: &HeaderMap, mutation: bool) -> WebResult<Principal> {
+pub(crate) fn authenticate(app: &App, headers: &HeaderMap, mutation: bool) -> WebResult<Principal> {
     if let Some(value) = headers.get(header::AUTHORIZATION) {
         let token = value
             .to_str()
@@ -159,7 +163,7 @@ fn authenticate(app: &App, headers: &HeaderMap, mutation: bool) -> WebResult<Pri
     app.store.authenticate(&session.bearer).map_err(Into::into)
 }
 
-fn form_auth(
+pub(crate) fn form_auth(
     app: &App,
     headers: &HeaderMap,
     form: &HashMap<String, String>,
@@ -175,7 +179,7 @@ fn form_auth(
     Ok((app.store.authenticate(&session.bearer)?, id))
 }
 
-fn local_admin(app: &App, principal: &Principal) -> WebResult<()> {
+pub(crate) fn local_admin(app: &App, principal: &Principal) -> WebResult<()> {
     if !app.config.local_setup || !app.config.listen.ip().is_loopback() {
         return Err(forbidden("Local setup is disabled on this listener"));
     }
@@ -203,7 +207,7 @@ async fn security_headers(request: axum::extract::Request, next: Next) -> Respon
     headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'self'; script-src 'none'; style-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"));
     headers.insert(
         header::REFERRER_POLICY,
-        HeaderValue::from_static("no-referrer"),
+        HeaderValue::from_static("strict-origin"),
     );
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
@@ -317,6 +321,19 @@ async fn dashboard(State(app): State<App>, headers: HeaderMap) -> WebResult<Resp
     .into_response())
 }
 
+async fn network_page(State(app): State<App>, headers: HeaderMap) -> WebResult<Response> {
+    let principal = authenticate(&app, &headers, false)?;
+    let network = app.network.clone();
+    let status = blocking(move || network.snapshot(&principal)).await?;
+    Ok(Html(dacs_ui::render_network(&status)).into_response())
+}
+
+async fn compiler_pools_page(State(app): State<App>, headers: HeaderMap) -> WebResult<Response> {
+    let principal = authenticate(&app, &headers, false)?;
+    let pools = blocking(move || app.store.compiler_pools(&principal)).await?;
+    Ok(Html(dacs_ui::render_compiler_pools(&pools)).into_response())
+}
+
 async fn logout(
     State(app): State<App>,
     headers: HeaderMap,
@@ -337,10 +354,15 @@ async fn logout(
 async fn logout_api(State(app): State<App>, headers: HeaderMap) -> WebResult<Response> {
     authenticate(&app, &headers, true)?;
     if let Some(id) = cookie(&headers, "dacs_session") {
-        app.sessions.lock().map_err(|_| forbidden("Session service unavailable"))?.remove(id);
+        app.sessions
+            .lock()
+            .map_err(|_| forbidden("Session service unavailable"))?
+            .remove(id);
     }
     let mut response = StatusCode::NO_CONTENT.into_response();
-    response.headers_mut().append(header::SET_COOKIE, set_cookie(&app, "dacs_session", "", 0));
+    response
+        .headers_mut()
+        .append(header::SET_COOKIE, set_cookie(&app, "dacs_session", "", 0));
     Ok(response)
 }
 
@@ -358,8 +380,69 @@ async fn execute(
 ) -> WebResult<Json<CommandResponse>> {
     let principal = authenticate(&app, &headers, true)?;
     Ok(Json(
-        blocking(move || app.store.execute(&principal, envelope)).await?,
+        blocking(move || {
+            validate_workflow_artifact(&app, &principal, &envelope.command)?;
+            app.store.execute(&principal, envelope)
+        })
+        .await?,
     ))
+}
+
+fn validate_workflow_artifact(
+    app: &App,
+    principal: &Principal,
+    command: &Command,
+) -> dacs_protocol::Result<()> {
+    let Command::ReportEvent {
+        attempt_id,
+        generation,
+        event:
+            WorkerEvent::WorkflowCompleted {
+                success,
+                artifact_digest,
+                evidence,
+            },
+        ..
+    } = command
+    else {
+        return Ok(());
+    };
+    let (attempt, task) = app
+        .store
+        .attempt_context(principal, attempt_id, *generation)?;
+    let bytes = app
+        .source
+        .get_artifact(principal, &task.spec.project_id, artifact_digest)?;
+    let result: dacs_protocol::workflow::WorkflowResult =
+        serde_json::from_slice(&bytes).map_err(|_| {
+            ApiError::new(
+                ErrorCode::Invalid,
+                "Workflow artifact is not a typed result",
+            )
+        })?;
+    let checks_match = result.checks.len() == evidence.len()
+        && result.checks.iter().zip(evidence).all(|(a, b)| {
+            a.name == b.name
+                && a.command == b.command
+                && a.source_sha == b.source_sha
+                && a.passed == b.passed
+                && a.artifact_digest == b.artifact_digest
+        });
+    if result.task_id != task.id
+        || result.attempt_id != attempt.id
+        || result.generation != attempt.generation
+        || result.source_commit != task.spec.source_commit
+        || result.success != *success
+        || !result.processes_reconciled
+        || !checks_match
+        || (*success && (result.exit_code != Some(0) || result.distribution_failure.is_some()))
+    {
+        return Err(ApiError::new(
+            ErrorCode::Conflict,
+            "Workflow result does not match the owned execution and completion evidence",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -938,6 +1021,28 @@ async fn setup_form_inner(
     }
 }
 
+async fn serve_listener(
+    listener: std::net::TcpListener,
+    router: Router,
+    tls: Option<axum_server::tls_rustls::RustlsConfig>,
+    handle: axum_server::Handle,
+) -> std::io::Result<()> {
+    match tls {
+        Some(tls) => {
+            axum_server::from_tcp_rustls(listener, tls)
+                .handle(handle)
+                .serve(router.into_make_service())
+                .await
+        }
+        None => {
+            axum_server::from_tcp(listener)
+                .handle(handle)
+                .serve(router.into_make_service())
+                .await
+        }
+    }
+}
+
 pub async fn run(mut config: Config) -> anyhow::Result<Option<Value>> {
     let tls = config.tls_cert.is_some() && config.tls_key.is_some();
     anyhow::ensure!(
@@ -948,6 +1053,13 @@ pub async fn run(mut config: Config) -> anyhow::Result<Option<Value>> {
         config.listen.ip().is_loopback() || tls,
         "Non-loopback listeners require TLS"
     );
+    if let Some(bootstrap) = config.bootstrap_listen {
+        anyhow::ensure!(tls, "Bootstrap listener requires TLS");
+        anyhow::ensure!(
+            bootstrap != config.listen,
+            "Bootstrap and control listener addresses must differ"
+        );
+    }
     anyhow::ensure!(
         !config.local_setup || config.listen.ip().is_loopback(),
         "Local setup cannot be enabled on a non-loopback listener"
@@ -968,6 +1080,14 @@ pub async fn run(mut config: Config) -> anyhow::Result<Option<Value>> {
     let token = local::admin_token(&config.data_dir)?;
     let store = Store::open(config.data_dir.join("coordinator.db"), &token)?;
     let source = SourceService::new(config.data_dir.join("source"), store.clone())?;
+    let network_config: Option<NetworkConfig> = config
+        .network_config
+        .as_deref()
+        .map(|path| -> anyhow::Result<NetworkConfig> {
+            Ok(serde_json::from_value(local::read_json(path)?)?)
+        })
+        .transpose()?;
+    let network = NetworkService::new(store.clone(), network_config)?;
     let jobs = Jobs::open(config.data_dir.join("jobs"))?;
     let shutdown = Arc::new(Notify::new());
     let pending_update = Arc::new(Mutex::new(None));
@@ -978,6 +1098,7 @@ pub async fn run(mut config: Config) -> anyhow::Result<Option<Value>> {
         sessions: Arc::new(Mutex::new(HashMap::new())),
         login_nonces: Arc::new(Mutex::new(HashMap::new())),
         jobs: jobs.clone(),
+        network: network.clone(),
         shutdown: shutdown.clone(),
         pending_update: pending_update.clone(),
     };
@@ -985,6 +1106,8 @@ pub async fn run(mut config: Config) -> anyhow::Result<Option<Value>> {
         .route("/health", get(health))
         .route("/assets/dacs.css", get(css))
         .route("/", get(dashboard))
+        .route("/network", get(network_page))
+        .route("/builds", get(compiler_pools_page))
         .route("/login", get(login))
         .route("/session", post(login_submit).delete(logout_api))
         .route("/ui/logout", post(logout))
@@ -1020,9 +1143,47 @@ pub async fn run(mut config: Config) -> anyhow::Result<Option<Value>> {
         .route("/api/setup/jobs/{id}", get(job_api))
         .route("/api/setup/{operation}", post(setup_operation))
         .route("/api/setup/update/{operation}", post(update_operation))
+        .merge(crate::onboarding::router())
+        .with_state(app.clone())
+        .merge(network::router(network.clone()))
+        .merge(crate::builds::router(app.store.clone()))
         .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
-        .layer(middleware::from_fn(security_headers))
-        .with_state(app);
+        .layer(middleware::from_fn(security_headers));
+    // Deliberately separate route tree: adding a control route never publishes it
+    // on the public bootstrap listener. Enrollment uses device bearer tokens,
+    // not browser sessions or administrator login.
+    let bootstrap_router = Router::new()
+        .route("/health", get(health))
+        .route("/assets/dacs.css", get(css))
+        .route("/invite/{token}", get(invitation_page))
+        .route("/api/invitations/{token}", get(invitation_api))
+        .route("/api/enroll", post(enroll))
+        .with_state(app)
+        .merge(network::bootstrap_router(network.clone()))
+        .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
+        .layer(middleware::from_fn(security_headers));
+    let rustls = if tls {
+        Some(
+            axum_server::tls_rustls::RustlsConfig::from_pem_file(
+                config.tls_cert.as_ref().expect("checked certificate"),
+                config.tls_key.as_ref().expect("checked key"),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    // Bind every socket before spawning any server or announcing readiness.
+    // An error drops already-bound sockets, so partial startup cannot survive.
+    let control_listener = std::net::TcpListener::bind(config.listen)?;
+    control_listener.set_nonblocking(true)?;
+    let bootstrap_listener = config
+        .bootstrap_listen
+        .map(std::net::TcpListener::bind)
+        .transpose()?;
+    if let Some(listener) = &bootstrap_listener {
+        listener.set_nonblocking(true)?;
+    }
     let maintenance = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(5));
         loop {
@@ -1031,39 +1192,58 @@ pub async fn run(mut config: Config) -> anyhow::Result<Option<Value>> {
             if let Err(error) = blocking(move || store.maintain()).await {
                 tracing::error!("Coordinator maintenance failed: {}", error.0.message);
             }
+            if let Err(error) = network.maintain().await {
+                tracing::error!("Network maintenance failed: {}", error.message);
+            }
         }
     });
+    let handles = [axum_server::Handle::new(), axum_server::Handle::new()];
+    let stop_handles = handles.clone();
+    let stop = tokio::spawn(async move {
+        tokio::select! { _ = shutdown.notified() => {}, _ = tokio::signal::ctrl_c() => {} };
+        for handle in &stop_handles {
+            handle.graceful_shutdown(Some(Duration::from_secs(30)));
+        }
+    });
+    let mut servers = tokio::task::JoinSet::new();
+    servers.spawn(serve_listener(
+        control_listener,
+        router,
+        rustls.clone(),
+        handles[0].clone(),
+    ));
+    if let Some(listener) = bootstrap_listener {
+        servers.spawn(serve_listener(
+            listener,
+            bootstrap_router,
+            rustls,
+            handles[1].clone(),
+        ));
+    }
     tracing::info!(
-        "DACS listening at {}; admin token file: {}",
+        "DACS listening at {}; bootstrap: {:?}; admin token file: {}",
         config.public_url,
+        config.bootstrap_listen,
         config.data_dir.join("admin.token").display()
     );
-    if tls {
-        let rustls = axum_server::tls_rustls::RustlsConfig::from_pem_file(
-            config.tls_cert.as_ref().expect("checked certificate"),
-            config.tls_key.as_ref().expect("checked key"),
-        )
-        .await?;
-        let handle = axum_server::Handle::new();
-        let stop = handle.clone();
-        tokio::spawn(async move {
-            tokio::select! { _ = shutdown.notified() => {}, _ = tokio::signal::ctrl_c() => {} };
-            stop.graceful_shutdown(Some(Duration::from_secs(30)));
-        });
-        axum_server::bind_rustls(config.listen, rustls)
-            .handle(handle)
-            .serve(router.into_make_service())
-            .await?;
-    } else {
-        let listener = tokio::net::TcpListener::bind(config.listen).await?;
-        axum::serve(listener, router)
-            .with_graceful_shutdown(async move {
-                tokio::select! { _ = shutdown.notified() => {}, _ = tokio::signal::ctrl_c() => {} }
-            })
-            .await?;
+    let mut result = Ok(());
+    while let Some(completed) = servers.join_next().await {
+        // A failed or unexpectedly terminated listener also stops its sibling.
+        for handle in &handles {
+            handle.graceful_shutdown(Some(Duration::from_secs(30)));
+        }
+        if result.is_ok() {
+            result = completed
+                .map_err(anyhow::Error::from)
+                .and_then(|value| value.map_err(anyhow::Error::from));
+        }
     }
+    stop.abort();
+    let _ = stop.await;
     maintenance.abort();
+    let _ = maintenance.await;
     jobs.drain().await;
+    result?;
     let update = pending_update
         .lock()
         .map_err(|_| anyhow::anyhow!("Update handoff unavailable"))?

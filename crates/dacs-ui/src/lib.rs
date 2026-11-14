@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 
 #[cfg(feature = "native")]
 pub mod native;
+pub mod onboarding;
 mod setup;
 pub use setup::render_setup;
 pub const CSS: &str = include_str!("style.css");
@@ -75,10 +76,10 @@ pub(crate) fn page(title: &str, notice: Option<&str>, body: impl IntoView) -> St
     let html = view! {
         <html lang="en">
             <head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-                <meta name="referrer" content="no-referrer"/><title>{title}</title><link rel="stylesheet" href="/assets/dacs.css"/>
+                <meta name="referrer" content="strict-origin"/><title>{title}</title><link rel="stylesheet" href="/assets/dacs.css"/>
             </head>
             <body><a class="skip" href="#main">"Skip to content"</a>
-                <header><a class="brand" href="/">"DACS"</a><nav aria-label="Primary"><a href="/">"Dashboard"</a><a href="/setup">"Local setup"</a><a href="/login">"Sign in"</a></nav></header>
+                <header><a class="brand" href="/">"DACS"</a><nav aria-label="Primary"><a href="/">"Dashboard"</a><a href="/builds">"Compiler pools"</a><a href="/network">"Network"</a><a href="/onboarding">"Join a project"</a><a href="/setup">"Local setup"</a><a href="/login">"Sign in"</a></nav></header>
                 <main id="main">{notice}{body}</main>
                 <footer>"State is a server snapshot. Refresh to see new events. Unknown and not-run states are not successes."</footer>
             </body>
@@ -97,6 +98,47 @@ pub fn render_login(error: Option<&str>, csrf: &str) -> String {
                 {form("/session", csrf, view! { <label><span>"Access token"</span><input type="password" name="token" autocomplete="current-password" required=true/></label> }, "Sign in")}
                 <p>"Signing in does not consent to local administrator access, start a worker or join a network."</p>
             </section>
+        },
+    )
+}
+
+pub fn render_network(status: &Value) -> String {
+    let configured = match status.get("configured").and_then(Value::as_bool) {
+        Some(true) => "Network adapter configured",
+        Some(false) => "Network adapter not configured",
+        None => "Network configuration status unavailable",
+    };
+    page(
+        "Network",
+        None,
+        view! {
+            <section><h1>"Network membership"</h1><p>{configured}</p>
+                <p>"Configuration and issued grants do not prove membership. Device records show the latest observed membership or an unresolved operation."</p>
+                <pre>{pretty(status)}</pre>
+                <p><a href="/onboarding">"Open local owner onboarding"</a></p>
+            </section>
+        },
+    )
+}
+
+pub fn render_compiler_pools(pools: &[dacs_protocol::workflow::PoolOwnership]) -> String {
+    let entries = pools.iter().map(|pool| view! {
+        <article><h2>{pool.pool_id.clone()}</h2>
+            <p>{if pool.released { "All owned execution reconciled; reservation released" } else { "Reservation held until build and every compiler service stop" }}</p>
+            <dl><dt>"Project"</dt><dd>{pool.project_id.clone()}</dd>
+                <dt>"Build attempt"</dt><dd>{pool.holder_attempt_id.clone()}</dd>
+                <dt>"Physical compiler hosts"</dt><dd>{pool.physical_hosts.join(", ")}</dd>
+                <dt>"Service attempts"</dt><dd>{pool.service_attempt_ids.join(", ")}</dd></dl>
+        </article>
+    }).collect_view();
+    page(
+        "Compiler pools",
+        None,
+        view! {
+            <h1>"Compiler pool reservations"</h1>
+            <p>"Reservations describe ownership, not successful remote compilation. Workflow tasks link to immutable result evidence."</p>
+            {empty(pools.is_empty(), "No compiler pool has been reserved.")}{entries}
+            <p><a href="/builds">"Refresh reservations"</a></p>
         },
     )
 }
@@ -230,6 +272,13 @@ fn task_view(task: &TaskRecord, csrf: &str) -> AnyView {
         <dl><dt>"Pinned source"</dt><dd><code>{task.spec.source_commit.clone()}</code></dd><dt>"Integrated revision"</dt><dd>{task.integrated_sha.clone().unwrap_or_else(|| "Not integrated".into())}</dd><dt>"Blocked reason"</dt><dd>{task.blocked_reason.clone().unwrap_or_else(|| "None recorded (not a readiness guarantee)".into())}</dd><dt>"Parent"</dt><dd>{task.parent_task_id.clone().unwrap_or_else(|| "Root task".into())}</dd><dt>"Current attempt"</dt><dd>{task.attempt_id.clone().unwrap_or_else(|| "Not admitted".into())}</dd><dt>"Cancellation"</dt><dd>{if task.cancel_requested { "Requested; await terminal outcome" } else { "Not requested" }}</dd></dl>
         <h4>"Prerequisites"</h4>{empty(task.spec.dependencies.is_empty(), "No prerequisite edges.")}<ul>{dependencies}</ul>
         {json_details("Task instructions, resources and pinned revisions", &task.spec)}
+        {task.workflow_result.as_ref().map(|result| view! {
+            <section><h4>"Workflow result"</h4>
+                <p>{if result.success { "Recorded successful result" } else { "Recorded failed result" }}</p>
+                <p><a href=format!("/api/projects/{}/artifacts/{}", task.spec.project_id, result.artifact_digest)>"Download immutable result evidence"</a></p>
+                {checks("Checks reported by the worker", &result.evidence)}
+            </section>
+        })}
         <div class="actions">{(!terminal).then(|| command_button(Command::AdmitTask { task_id: task.id.clone(), worker_id: None }, csrf, "Request admission"))}
             {(!terminal && !task.cancel_requested).then(|| command_button(Command::CancelTask { task_id: task.id.clone() }, csrf, "Request cancellation"))}</div>
     </article> }.into_any()
