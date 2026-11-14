@@ -114,22 +114,35 @@ impl HeadscaleClient {
             .bearer_auth(self.api_key.expose())
             .send()
             .await
-            .map_err(|e| HeadscaleError::Transport(e.without_url().to_string()))?;
+            .map_err(|e| HeadscaleError::Transport(self.redact(&e.without_url().to_string())))?;
         let status = resp.status();
         let body = resp
             .text()
             .await
-            .map_err(|e| HeadscaleError::Transport(e.to_string()))?;
+            .map_err(|e| HeadscaleError::Transport(self.redact(&e.to_string())))?;
         if !status.is_success() {
+            // Redact before truncating so no partial key survives the cut.
             return Err(HeadscaleError::Status {
                 status: status.as_u16(),
-                body: truncate(&body, 500),
+                body: truncate(&self.redact(&body), 500),
             });
         }
         if body.trim().is_empty() {
             return Ok(serde_json::Value::Null);
         }
-        serde_json::from_str(&body).map_err(|e| HeadscaleError::Decode(e.to_string()))
+        serde_json::from_str(&body).map_err(|e| HeadscaleError::Decode(self.redact(&e.to_string())))
+    }
+
+    /// Upstream text ends up in API errors and logs: strip the API key (a
+    /// proxy or debug front end may echo the `Authorization` header) and
+    /// anything shaped like a Headscale key.
+    fn redact(&self, text: &str) -> String {
+        let key = self.api_key.expose();
+        if key.is_empty() {
+            redact_keys(text)
+        } else {
+            redact_keys(&text.replace(key, "[redacted]"))
+        }
     }
 
     fn url(&self, path: &str) -> String {
@@ -147,7 +160,27 @@ fn field<T: for<'de> Deserialize<'de>>(
         .or_else(|| v.get(snake))
         .cloned()
         .ok_or_else(|| HeadscaleError::Decode(format!("missing field {camel}")))?;
-    serde_json::from_value(inner).map_err(|e| HeadscaleError::Decode(format!("{camel}: {e}")))
+    serde_json::from_value(inner)
+        .map_err(|e| HeadscaleError::Decode(redact_keys(&format!("{camel}: {e}"))))
+}
+
+/// serde type errors quote the offending value; Headscale API keys and
+/// pre-auth keys share the `hskey-` prefix, so mask whatever follows it.
+fn redact_keys(text: &str) -> String {
+    const PREFIX: &str = "hskey-";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find(PREFIX) {
+        out.push_str(&rest[..i]);
+        out.push_str("hskey-[redacted]");
+        let tail = &rest[i + PREFIX.len()..];
+        let end = tail
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+            .unwrap_or(tail.len());
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn list<T: for<'de> Deserialize<'de>>(
@@ -158,7 +191,7 @@ fn list<T: for<'de> Deserialize<'de>>(
     match v.get(camel).or_else(|| v.get(snake)) {
         None | Some(serde_json::Value::Null) => Ok(Vec::new()),
         Some(inner) => serde_json::from_value(inner.clone())
-            .map_err(|e| HeadscaleError::Decode(format!("{camel}: {e}"))),
+            .map_err(|e| HeadscaleError::Decode(redact_keys(&format!("{camel}: {e}")))),
     }
 }
 
