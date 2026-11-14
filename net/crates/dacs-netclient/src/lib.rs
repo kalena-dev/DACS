@@ -275,13 +275,22 @@ pub async fn join(
     if opts.unattended && cfg!(windows) {
         args.push("--unattended");
     }
-    let result = ts.run(&args, timeout + Duration::from_secs(10)).await;
+    let dacs = normalize_url(&grant.login_server);
+    let login = ts.run(&args, timeout + Duration::from_secs(10));
+    tokio::pin!(login);
+    let first = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut nudge = tokio::time::interval_at(first, Duration::from_secs(5));
+    let result = loop {
+        tokio::select! {
+            r = &mut login => break r,
+            _ = nudge.tick() => nudge_stalled_start(&ts, &dacs).await,
+        }
+    };
     // Remove the key file before inspecting the result.
     drop(key_file);
     result?;
 
     let deadline = Instant::now() + Duration::from_secs(30);
-    let dacs = normalize_url(&grant.login_server);
     loop {
         let state = read_state(&ts).await;
         if let TailnetClientState::LoggedIn {
@@ -310,6 +319,25 @@ pub async fn join(
             });
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// After switching from another control server, Tailscale 1.104.7 can keep the
+/// previous network's home DERP region, which is absent from the DACS DERP map
+/// (`derpMap.Regions[N] is nil`). The client then stays in `Starting` with no
+/// relay connection until `login` times out. A re-STUN re-selects the home
+/// region from the current map. Best effort: the outcome is still judged by
+/// the `Running` + overlay-IP check after login.
+async fn nudge_stalled_start(ts: &Tailscale, dacs: &str) {
+    if let TailnetClientState::LoggedIn {
+        control_url,
+        backend_state,
+        ..
+    } = read_state(ts).await
+        && backend_state == "Starting"
+        && normalize_url(&control_url) == dacs
+    {
+        let _ = ts.run(&["debug", "restun"], SHORT).await;
     }
 }
 
