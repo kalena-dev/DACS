@@ -17,14 +17,6 @@ impl TaskStatus {
         }
     }
 
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Todo => "Todo",
-            Self::InProgress => "In progress",
-            Self::Done => "Done",
-        }
-    }
-
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "todo" => Some(Self::Todo),
@@ -200,7 +192,6 @@ mod tests {
                 format!("\"{}\"", status.wire())
             );
             assert_eq!(TaskStatus::parse(status.wire()), Some(status));
-            assert!(!status.label().is_empty());
         }
         assert_eq!(TaskStatus::parse("in-progress"), None);
     }

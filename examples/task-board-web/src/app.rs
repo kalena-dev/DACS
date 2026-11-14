@@ -49,7 +49,7 @@ impl Board {
         self.description.set(task.description.clone());
         self.confirming_delete.set(None);
         self.notice
-            .set("Editing task. Save changes or cancel below.".to_owned());
+            .set("Editing task. Save changes or cancel in the task editor.".to_owned());
         if let Some(input) = self.title_input.get() {
             let _ = input.focus();
         }
@@ -145,10 +145,10 @@ pub fn App() -> impl IntoView {
         <a class="skip-link" href="#task-list">"Skip to tasks"</a>
         <main>
             <header class="page-header">
-                <div>
-                    <p class="eyebrow">"DACS / PRIVATE PREVIEW"</p>
+                <div class="workspace-title">
+                    <span class="workspace-name">"DACS"</span>
+                    <span class="workspace-divider" aria-hidden="true">"/"</span>
                     <h1>"Task board"</h1>
-                    <p>"Plan work, track progress, and keep tasks saved on your server."</p>
                 </div>
                 <button type="button" class="secondary" disabled=move || board.busy()
                     on:click=move |_| board.refresh()>"Refresh from server"</button>
@@ -184,7 +184,7 @@ pub fn App() -> impl IntoView {
             </Show>
 
             <div class="workspace">
-                <section class="panel editor" aria-labelledby="editor-heading">
+                <section class="editor" aria-labelledby="editor-heading">
                     <h2 id="editor-heading">{move || if board.editing.get().is_some() { "Edit task" } else { "Create task" }}</h2>
                     <form on:submit=move |event| {
                         event.prevent_default();
@@ -209,7 +209,7 @@ pub fn App() -> impl IntoView {
                                 prop:value=move || board.title.get()
                                 on:input=move |event| board.title.set(event_target_value(&event)) />
                             <label for="task-description">"Description"</label>
-                            <textarea id="task-description" name="description" rows="5"
+                            <textarea id="task-description" name="description" rows="4"
                                 prop:value=move || board.description.get()
                                 on:input=move |event| board.description.set(event_target_value(&event)) />
                             <p class="hint">"New tasks start in Todo. Change their status in the task list."</p>
@@ -229,29 +229,33 @@ pub fn App() -> impl IntoView {
 
                 <section class="task-area" aria-labelledby="task-list" aria-busy=move || board.busy().to_string()>
                     <h2 id="task-list" tabindex="-1" node_ref=board.list_heading>"Tasks"</h2>
-                    <form class="panel filters" on:submit=move |event| {
+                    <form class="filters" on:submit=move |event| {
                         event.prevent_default();
                         if board.busy_untracked() { return; }
                         board.query.set(filter_query.get_untracked());
                         board.status.set(TaskStatus::parse(&filter_status.get_untracked()));
                         board.refresh();
                     }>
-                        <fieldset disabled=move || board.busy()>
-                            <legend>"Filter tasks"</legend>
-                            <label for="filter-text">"Search title or description"</label>
-                            <input id="filter-text" name="q" type="search"
-                                prop:value=move || filter_query.get()
-                                on:input=move |event| filter_query.set(event_target_value(&event)) />
-                            <label for="filter-status">"Status filter"</label>
-                            <select id="filter-status" name="status" prop:value=move || filter_status.get()
-                                on:change=move |event| filter_status.set(event_target_value(&event))>
-                                <option value="">"All statuses"</option>
-                                <option value="todo">"Todo"</option>
-                                <option value="in_progress">"In progress"</option>
-                                <option value="done">"Done"</option>
-                            </select>
+                        <fieldset class="filter-toolbar" disabled=move || board.busy()>
+                            <legend class="visually-hidden">"Filter tasks"</legend>
+                            <div class="search-field">
+                                <label for="filter-text">"Search title or description"</label>
+                                <input id="filter-text" name="q" type="search"
+                                    prop:value=move || filter_query.get()
+                                    on:input=move |event| filter_query.set(event_target_value(&event)) />
+                            </div>
+                            <div class="filter-status">
+                                <label for="filter-status">"Status filter"</label>
+                                <select id="filter-status" name="status" prop:value=move || filter_status.get()
+                                    on:change=move |event| filter_status.set(event_target_value(&event))>
+                                    <option value="">"All statuses"</option>
+                                    <option value="todo">"Todo"</option>
+                                    <option value="in_progress">"In progress"</option>
+                                    <option value="done">"Done"</option>
+                                </select>
+                            </div>
                             <div class="actions">
-                                <button type="submit">"Apply filters"</button>
+                                <button type="submit" class="secondary">"Apply filters"</button>
                                 <button type="button" class="secondary" on:click=move |_| {
                                     filter_query.set(String::new());
                                     filter_status.set(String::new());
@@ -263,13 +267,16 @@ pub fn App() -> impl IntoView {
                         </fieldset>
                     </form>
                     <Show when=move || board.loaded.get()>
-                        <p class="list-summary" role="status">{move || format!("{} task(s) in the last server response", board.tasks.with(Vec::len))}</p>
+                        <p class="list-summary" role="status">{move || {
+                            let count = board.tasks.with(Vec::len);
+                            format!("{count} {} in the last server response", if count == 1 { "task" } else { "tasks" })
+                        }}</p>
                         <Show when=move || board.tasks.with(Vec::is_empty)>
-                            <p class="panel empty">"No tasks match these filters. Create a task or clear the filters."</p>
+                            <p class="empty">"No tasks match these filters. Create a task or clear the filters."</p>
                         </Show>
                         <ul class="task-list">
                             <For each=move || board.tasks.get() key=|task| task.clone()
-                                children=move |task| view! { <TaskCard task board /> } />
+                                children=move |task| view! { <TaskRow task board /> } />
                         </ul>
                     </Show>
                 </section>
@@ -279,7 +286,7 @@ pub fn App() -> impl IntoView {
 }
 
 #[component]
-fn TaskCard(task: BoardTask, board: Board) -> impl IntoView {
+fn TaskRow(task: BoardTask, board: Board) -> impl IntoView {
     let status_select = NodeRef::<html::Select>::new();
     let edit_task = task.clone();
     let status_id = task.id.clone();
@@ -296,17 +303,18 @@ fn TaskCard(task: BoardTask, board: Board) -> impl IntoView {
     let delete_label = format!("Delete {}", task.title);
     let original_status = task.status;
     view! {
-        <li class="panel task-card">
+        <li class="task-row">
             <article aria-labelledby=labelled_by>
-                <div class="card-heading">
+                <div class="task-content">
                     <h3 id=heading_id>{task.title}</h3>
-                    <span class="status-badge" data-status=task.status.wire()>{task.status.label()}</span>
+                    {(!task.description.is_empty()).then(|| view! {
+                        <p class="description">{task.description}</p>
+                    })}
                 </div>
-                <p class="description">{if task.description.is_empty() { "No description.".to_owned() } else { task.description }}</p>
-                <div class="card-controls">
+                <div class="task-controls">
                     <div class="status-control">
                         <label for=select_id.clone()>"Status"</label>
-                        <select id=select_id aria-label=status_label node_ref=status_select
+                        <select id=select_id aria-label=status_label node_ref=status_select data-status=original_status.wire()
                             disabled=move || board.busy() prop:value=original_status.wire()
                             on:change=move |event| {
                                 let selected = TaskStatus::parse(&event_target_value(&event));

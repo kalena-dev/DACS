@@ -71,6 +71,25 @@ pub(crate) fn json_details(label: &str, value: &impl Serialize) -> AnyView {
 }
 
 pub(crate) fn page(title: &str, notice: Option<&str>, body: impl IntoView) -> String {
+    let active = match title {
+        "Dashboard" | "Candidate source" => "/",
+        "Compiler pools" => "/builds",
+        "Network" => "/network",
+        "Local owner onboarding" => "/onboarding",
+        "Local setup" => "/setup",
+        "Sign in" => "/login",
+        _ => "",
+    };
+    let navigation = [
+        ("/", "Dashboard"),
+        ("/builds", "Compiler pools"),
+        ("/network", "Network"),
+        ("/onboarding", "Join a project"),
+        ("/setup", "Local setup"),
+        ("/login", "Sign in"),
+    ].into_iter().map(|(href, label)| view! {
+        <a href=href aria-current=(href == active).then_some("page")>{label}</a>
+    }).collect_view();
     let title = format!("{title} · DACS");
     let notice = notice.map(|text| view! { <p class="notice" role="status">{text.to_owned()}</p> });
     let html = view! {
@@ -79,9 +98,9 @@ pub(crate) fn page(title: &str, notice: Option<&str>, body: impl IntoView) -> St
                 <meta name="referrer" content="strict-origin"/><title>{title}</title><link rel="stylesheet" href="/assets/dacs.css"/>
             </head>
             <body><a class="skip" href="#main">"Skip to content"</a>
-                <header><a class="brand" href="/">"DACS"</a><nav aria-label="Primary"><a href="/">"Dashboard"</a><a href="/builds">"Compiler pools"</a><a href="/network">"Network"</a><a href="/onboarding">"Join a project"</a><a href="/setup">"Local setup"</a><a href="/login">"Sign in"</a></nav></header>
-                <main id="main">{notice}{body}</main>
-                <footer>"State is a server snapshot. Refresh to see new events. Unknown and not-run states are not successes."</footer>
+                <header class="app-rail"><a class="brand" href="/">"DACS"</a><p class="rail-label">"Workspace"</p><nav aria-label="Primary">{navigation}</nav></header>
+                <main id="main" tabindex="-1">{notice}{body}</main>
+                <footer class="app-footer">"State is a server snapshot. Refresh to see new events. Unknown and not-run states are not successes."</footer>
             </body>
         </html>
     }.to_html();
@@ -114,7 +133,7 @@ pub fn render_network(status: &Value) -> String {
         view! {
             <section><h1>"Network membership"</h1><p>{configured}</p>
                 <p>"Configuration and issued grants do not prove membership. Device records show the latest observed membership or an unresolved operation."</p>
-                <pre>{pretty(status)}</pre>
+                {json_details("Network state and device records", status)}
                 <p><a href="/onboarding">"Open local owner onboarding"</a></p>
             </section>
         },
@@ -198,14 +217,8 @@ pub fn render_dashboard(snapshot: &Snapshot, notice: Option<&str>, csrf: &str) -
         notice,
         view! {
             <div class="heading"><h1>"Coordinator dashboard"</h1><div class="actions"><a class="button" href="/">"Refresh state"</a>{form("/ui/logout", csrf, (), "Sign out")}</div></div>
-            <nav class="sections" aria-label="Dashboard sections"><a href="#projects">"Projects"</a><a href="#tasks">"Tasks and DAG"</a><a href="#workers">"Workers"</a><a href="#attempts">"Attempts"</a><a href="#candidates">"Candidates"</a><a href="#publications">"Publication"</a><a href="#messages">"Messages"</a><a href="#events">"Events"</a><a href="#commands">"Commands"</a></nav>
-            <aside class="warning"><strong>"Full-trust execution"</strong><p>"Elevated restrictions are advisory, not a sandbox. Coordinator approval is separate from local owner consent, network membership, installed requirements and manual OMP login. Local runtime/desktop control and network readiness are unavailable until their adapters report them. No remote pause button is represented as local consent."</p></aside>
-            <section id="projects"><h2>{format!("Projects ({})", snapshot.projects.len())}</h2>{empty(snapshot.projects.is_empty(), "No authorized projects.")}{projects}
-                <details><summary>"Create project"</summary>{form("/ui/create-project", csrf, view! {
-                    {input("Name", "name", "text", "", true)}{input("Integration target branch", "target_branch", "text", "main", true)}
-                    {input("Maximum tasks", "max_tasks", "number", "", true)}{input("Maximum delegation depth", "max_depth", "number", "", true)}
-                }, "Create project")}</details>
-            </section>
+            <nav class="sections" aria-label="Dashboard sections"><a href="#tasks">"Tasks and DAG"</a><a href="#workers">"Workers"</a><a href="#projects">"Projects"</a><a href="#attempts">"Attempts"</a><a href="#candidates">"Candidates"</a><a href="#publications">"Publication"</a><a href="#messages">"Messages"</a><a href="#events">"Events"</a><a href="#commands">"Commands"</a></nav>
+            <aside class="warning"><details><summary>"Full-trust execution · elevated restrictions are not a sandbox"</summary><p>"Elevated restrictions are advisory, not a sandbox. Coordinator approval is separate from local owner consent, network membership, installed requirements and manual OMP login. Local runtime/desktop control and network readiness are unavailable until their adapters report them. No remote pause button is represented as local consent."</p></details></aside>
             <section id="tasks"><h2>{format!("Tasks and dependency graph ({})", snapshot.tasks.len())}</h2><p>"Dependency edges below point from a task to its prerequisites. Only accepted, integrated outputs release dependants."</p>{empty(snapshot.tasks.is_empty(), "No tasks have been created.")}{tasks}
                 <details><summary>"Create task with pinned contract"</summary>
                     <p>"Choose a project below for its current contract and policy revisions. Supply instructions, source commit and resources. Dependencies and capabilities are JSON string arrays; effects are workspace or external."</p>
@@ -216,6 +229,12 @@ pub fn render_dashboard(snapshot: &Snapshot, notice: Option<&str>, csrf: &str) -
                 </details>
             </section>
             <section id="workers"><h2>{format!("Workers ({})", snapshot.workers.len())}</h2><p>"Reported capacity and held reservations are not measured usage. Reservations on unreachable workers remain held until reconciliation. Heartbeat time alone never permits a retry."</p>{empty(snapshot.workers.is_empty(), "No enrolled workers.")}{workers}<h3>"Runtime and desktop observations"</h3>{empty(snapshot.runtime_status.is_empty(), "Runtime, provider login, network and desktop status: unknown; no adapter observations supplied.")}{runtime}</section>
+            <section id="projects"><h2>{format!("Projects ({})", snapshot.projects.len())}</h2>{empty(snapshot.projects.is_empty(), "No authorized projects.")}{projects}
+                <details><summary>"Create project"</summary>{form("/ui/create-project", csrf, view! {
+                    {input("Name", "name", "text", "", true)}{input("Integration target branch", "target_branch", "text", "main", true)}
+                    {input("Maximum tasks", "max_tasks", "number", "", true)}{input("Maximum delegation depth", "max_depth", "number", "", true)}
+                }, "Create project")}</details>
+            </section>
             <section id="attempts"><h2>{format!("Attempts ({})", snapshot.attempts.len())}</h2>{empty(snapshot.attempts.is_empty(), "No attempts have been admitted.")}{attempts}<p>"CPU utilization: unknown; no CPU telemetry supplied. A settled OMP session is not an accepted result."</p>
                 <h3>"Usage observations"</h3>{empty(snapshot.usage.is_empty(), "Token usage and cost: unknown; no usage telemetry supplied.")}
                 <div class="table-scroll"><table><caption>"Per-attempt usage records; estimates are not measurements"</caption><thead><tr><th scope="col">"Attempt"</th><th scope="col">"Worker"</th><th scope="col">"Basis"</th><th scope="col">"Input tokens"</th><th scope="col">"Output tokens"</th><th scope="col">"Cost USD"</th><th scope="col">"Observed (Unix seconds)"</th></tr></thead><tbody>{usage}</tbody></table></div>
@@ -224,17 +243,19 @@ pub fn render_dashboard(snapshot: &Snapshot, notice: Option<&str>, csrf: &str) -
             <section id="publications"><h2>"Publication and reconciliation"</h2>{empty(snapshot.publications.is_empty(), "No publication intents recorded.")}<div class="table-scroll"><table><caption>"Durable publication intents; Git and SQLite are not an atomic transaction"</caption><thead><tr><th scope="col">"Intent"</th><th scope="col">"Task"</th><th scope="col">"Branch"</th><th scope="col">"Expected head"</th><th scope="col">"Candidate"</th><th scope="col">"State"</th></tr></thead><tbody>{publications}</tbody></table></div></section>
             <section id="messages"><h2>"Messages"</h2><p>"Messages and acknowledgments are durable commands. Delivery evidence appears in the event history; a send acknowledgment is not task completion."</p>
                 {empty(snapshot.messages.is_empty(), "No visible durable messages.")}{messages}
+                <details><summary>"Send a durable message"</summary>
                 {form("/ui/message", csrf, view! {
                     {input("Project ID", "project_id", "text", "", true)}{input("Recipient task ID", "recipient_task_id", "text", "", true)}
                     {input("Unique message ID (reuse only for exact replay)", "message_id", "text", "", true)}{input("Message kind", "kind", "text", "", true)}
                     {textarea("Body (JSON)", "body", "", true)}
                 }, "Send message")}
+                </details>
             </section>
             <section id="events"><h2>{format!("Event history ({})", snapshot.events.len())}</h2>{empty(snapshot.events.is_empty(), "No recorded events.")}{events}</section>
-            <section id="commands"><h2>"Advanced protocol controls"</h2><p>"Submit a typed protocol Command. Authorization and current generation checks apply on the server. Worker heartbeat, delegation, candidate submission, reconciliation and acknowledgments require the corresponding device identity; an administrator must not impersonate local owner approval."</p>
+            <section id="commands"><details class="advanced"><summary>"Advanced protocol controls"</summary><p>"Submit a typed protocol Command. Authorization and current generation checks apply on the server. Worker heartbeat, delegation, candidate submission, reconciliation and acknowledgments require the corresponding device identity; an administrator must not impersonate local owner approval."</p>
                 {form("/ui/command", csrf, textarea("Command JSON", "command", "", true), "Submit command")}
                 <details><summary>"Supported command types"</summary><p>"create_project, set_requirements, create_invitation, revoke_invitation, approve_worker, revoke_worker, set_draining, heartbeat, create_task, admit_task, delegate, report_event, submit_candidate, review_candidate, cancel_task, abandon_attempt, reconcile_worker, invalidate_contract, send_message, acknowledge_messages, report_runtime_status, request_desktop_pause"</p></details>
-            </section>
+            </details></section>
         },
     )
 }
@@ -269,9 +290,12 @@ fn task_view(task: &TaskRecord, csrf: &str) -> AnyView {
     );
     view! { <article><h3>{task.spec.title.clone()}<span class="badge">{format!("{:?}", task.state)}</span></h3>
         <p><code>{task.id.clone()}</code>{format!(" · project {} · generation {} · {:?} effects", task.spec.project_id, task.generation, task.spec.effect_class)}</p>
+        {task.blocked_reason.as_ref().map(|reason| view! { <p class="warning">{reason.clone()}</p> })}
+        <details><summary>"Task details and prerequisites"</summary>
         <dl><dt>"Pinned source"</dt><dd><code>{task.spec.source_commit.clone()}</code></dd><dt>"Integrated revision"</dt><dd>{task.integrated_sha.clone().unwrap_or_else(|| "Not integrated".into())}</dd><dt>"Blocked reason"</dt><dd>{task.blocked_reason.clone().unwrap_or_else(|| "None recorded (not a readiness guarantee)".into())}</dd><dt>"Parent"</dt><dd>{task.parent_task_id.clone().unwrap_or_else(|| "Root task".into())}</dd><dt>"Current attempt"</dt><dd>{task.attempt_id.clone().unwrap_or_else(|| "Not admitted".into())}</dd><dt>"Cancellation"</dt><dd>{if task.cancel_requested { "Requested; await terminal outcome" } else { "Not requested" }}</dd></dl>
         <h4>"Prerequisites"</h4>{empty(task.spec.dependencies.is_empty(), "No prerequisite edges.")}<ul>{dependencies}</ul>
         {json_details("Task instructions, resources and pinned revisions", &task.spec)}
+        </details>
         {task.workflow_result.as_ref().map(|result| view! {
             <section><h4>"Workflow result"</h4>
                 <p>{if result.success { "Recorded successful result" } else { "Recorded failed result" }}</p>
@@ -285,7 +309,7 @@ fn task_view(task: &TaskRecord, csrf: &str) -> AnyView {
 }
 
 fn resources(label: &str, r: &Resources) -> AnyView {
-    view! { <p><strong>{label.to_owned()}</strong>{format!(": {} agent slots · {} CPU millicores · {} MiB memory · {} MiB disk", r.agent_slots, r.cpu_millis, r.memory_mb, r.disk_mb)}</p> }.into_any()
+    view! { <p class="resources"><strong>{label.to_owned()}</strong><span>{format!("{} agent slots", r.agent_slots)}</span><span>{format!("{} CPU millicores", r.cpu_millis)}</span><span>{format!("{} MiB memory", r.memory_mb)}</span><span>{format!("{} MiB disk", r.disk_mb)}</span></p> }.into_any()
 }
 
 fn worker_view(worker: &WorkerRecord, csrf: &str) -> AnyView {
