@@ -97,7 +97,7 @@ Do not assume a teammate's WSL/macOS environment is available on this computer. 
 - [Real single-machine network run and its limits](../net/evidence/wsl-netns-e2e.md)
 - [Frontend browser acceptance](../examples/task-board-web/ACCEPTANCE.md)
 - [Package production, tool pins and release evidence](person4-build-release-status.md)
-- [macOS crate-test evidence](evidence/macos-crate-tests.md)
+- [macOS platform row: builds, tests and loopback smoke](evidence/macos-platform.md)
 - [Original shared requirements](assignments/00-general-plan.md)
 
 Local proof artifacts, private tooling and MSI outputs under `.local/` are not committed and are not portable prerequisites. The runtime handoff and package-status document identify their retained evidence and exact source pins.
