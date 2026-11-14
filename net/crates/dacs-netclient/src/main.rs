@@ -85,6 +85,9 @@ enum Command {
         #[arg(long)]
         after: PathBuf,
     },
+    /// Measured compiler-path availability and overlay transfer evidence.
+    #[command(subcommand)]
+    Measure(dacs_netclient::measure::MeasureCommand),
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &PathBuf) -> Result<T, String> {
@@ -114,6 +117,7 @@ async fn main() -> ExitCode {
 /// Returns Ok(false) when the command ran but a check failed.
 async fn run(cli: Cli) -> Result<bool, String> {
     match cli.command {
+        Command::Measure(cmd) => return dacs_netclient::measure::run_cli(cmd).await,
         Command::Status => print(&detect().await),
         Command::Assess { login_server } => print(&assess(&login_server).await),
         Command::Preflight { config } => {

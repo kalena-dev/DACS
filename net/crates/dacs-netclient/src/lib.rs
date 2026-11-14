@@ -12,6 +12,7 @@
 //!   counters and private reachability for build evidence.
 
 pub mod compiler;
+pub mod measure;
 pub mod preflight;
 pub mod tailscale;
 pub mod traffic;
