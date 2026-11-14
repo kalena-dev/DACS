@@ -15,5 +15,7 @@ pub mod task_board;
 mod workspace;
 
 pub use journal::{Journal, JournalError, PendingCommand, PendingResult};
-pub use omp::{OmpEvent, OmpRpc, OmpRpcError, OmpToolCall};
+pub use omp::{
+    OmpEvent, OmpRpc, OmpRpcError, OmpToolCall, check_pinned_version, installed_version,
+};
 pub use supervisor::{ManagedChild, ProcessIo, ProcessState, ReservationUsage, Supervisor};

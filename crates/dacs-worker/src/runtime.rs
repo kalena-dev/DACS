@@ -460,10 +460,12 @@ pub async fn run(mut config: WorkerConfig) -> Result<()> {
     )
     .await?;
     anyhow::ensure!(
-        version.0 == 0
-            && version_matches(&String::from_utf8_lossy(&version.1), &config.omp_version),
-        "installed OMP does not match pinned version"
+        version.0 == 0,
+        "`omp --version` failed with exit code {}",
+        version.0
     );
+    crate::omp::check_pinned_version(&String::from_utf8_lossy(&version.1), &config.omp_version)
+        .map_err(anyhow::Error::msg)?;
     let mut status = LocalStatus { worker_id:config.worker_id.clone(), running:true, elevated,
         limitations:vec!["Native desktop capabilities are observed at launch, not cross-platform certification. Permission/lock/backend failures refuse access.".into(),
         "Tools inherit the owner token; DACS never silently elevates or replaces the owner profile. Restrictions are advisory, not containment.".into(),
@@ -736,11 +738,54 @@ pub async fn run(mut config: WorkerConfig) -> Result<()> {
     Ok(())
 }
 
-fn managed_overlay(desktop: bool) -> String {
+/// The `--config` overlay of every managed OMP session: native async/task/
+/// launch spawning paths off so scheduled children are admitted by DACS.
+pub fn managed_overlay(desktop: bool) -> String {
     // Never override session.maxCost or owner provider/model configuration.
     format!(
         "async:\n  enabled: false\nlaunch:\n  enabled: false\n  persist: false\nbash:\n  autoBackground:\n    enabled: false\ntask:\n  maxRecursionDepth: 0\neval:\n  py: false\n  js: {desktop}\ncomputer:\n  enabled: {desktop}\ntools:\n  xdev: false\n  approval:\n    computer: allow\n    computer.control: allow\nupdate:\n  auto: false\n"
     )
+}
+
+/// Arguments of every managed OMP launch: headless JSONL RPC and an explicit
+/// tool allowlist without OMP's native `task`/`wait` spawning tools.
+pub fn managed_omp_args(
+    overlay: &Path,
+    session_dir: &Path,
+    profile: Option<&str>,
+    probe: bool,
+    desktop: bool,
+) -> Vec<String> {
+    let mut args = vec![
+        "--mode".into(),
+        "rpc".into(),
+        "--no-ui".into(),
+        "--no-extensions".into(),
+        "--no-pty".into(),
+        "--config".into(),
+        overlay.to_string_lossy().into_owned(),
+        "--session-dir".into(),
+        session_dir.to_string_lossy().into_owned(),
+    ];
+    if probe && !desktop {
+        args.push("--no-tools".into());
+    } else if probe {
+        args.extend(["--tools".into(), "eval".into()]);
+    } else {
+        args.extend([
+            "--tools".into(),
+            if desktop {
+                "read,write,edit,bash,grep,glob,web_search,eval"
+            } else {
+                "read,write,edit,bash,grep,glob,web_search"
+            }
+            .into(),
+        ]);
+    }
+    if let Some(profile) = profile {
+        args.extend(["--profile".into(), profile.to_owned()]);
+    }
+    args
 }
 
 async fn launch_omp(
@@ -760,35 +805,13 @@ async fn launch_omp(
     std::fs::create_dir_all(state)?;
     let overlay = state.join("managed.yml");
     std::fs::write(&overlay, managed_overlay(desktop))?;
-    let mut args = vec![
-        "--mode".into(),
-        "rpc".into(),
-        "--no-ui".into(),
-        "--no-extensions".into(),
-        "--no-pty".into(),
-        "--config".into(),
-        overlay.to_string_lossy().into_owned(),
-        "--session-dir".into(),
-        state.join("session").to_string_lossy().into_owned(),
-    ];
-    if probe && !desktop {
-        args.push("--no-tools".into());
-    } else if probe {
-        args.extend(["--tools".into(), "eval".into()]);
-    } else {
-        args.extend([
-            "--tools".into(),
-            if desktop {
-                "read,write,edit,bash,grep,glob,web_search,eval"
-            } else {
-                "read,write,edit,bash,grep,glob,web_search"
-            }
-            .into(),
-        ]);
-    }
-    if let Some(profile) = &config.omp_profile {
-        args.extend(["--profile".into(), profile.clone()]);
-    }
+    let args = managed_omp_args(
+        &overlay,
+        &state.join("session"),
+        config.omp_profile.as_deref(),
+        probe,
+        desktop,
+    );
     let id = uuid::Uuid::new_v4().to_string();
     supervisor
         .launch(
@@ -1103,7 +1126,8 @@ fn write_durable(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn host_tools() -> Value {
+/// DACS host tools registered with `set_host_tools` in every managed session.
+pub fn host_tools() -> Value {
     json!([
         {"name":"dacs_delegate","label":"Delegate DACS task","description":"Request admission of a child TaskSpec. Returns immediately with an admitted task ID or durable pending receipt. Completion arrives in the mailbox; parent reservation remains held.","loadMode":"essential","parameters":{"type":"object","properties":{"spec":{"type":"object"}},"required":["spec"],"additionalProperties":false}},
         {"name":"dacs_workflow","label":"Submit build/test workflow","description":"Admit a workflow child using TaskSpec execution.kind=workflow and effect_class=external. Never execute a distributed build outside admitted capacity.","loadMode":"essential","parameters":{"type":"object","properties":{"spec":{"type":"object"}},"required":["spec"],"additionalProperties":false}},
@@ -1251,13 +1275,14 @@ async fn agent_attempt(
                             // A durable admitted child is not cancelled by loss of
                             // its transient host call. Its coordinator ID survives.
                         }
+                        event @ OmpEvent::PromptResult { .. } if event.cost_capped().is_some() => {
+                            let error = event.cost_capped().cloned().unwrap_or(Value::Null);
+                            coordinator.journal.event(&task.id,&attempt.id,attempt.generation,attempt.last_sequence,WorkerEvent::CostCapped { message:error.to_string() })?;
+                            return Ok(());
+                        }
                         OmpEvent::PromptResult { status,error,session_settled,.. } => {
                             if status == "error" {
                                 let error = error.unwrap_or(Value::Null);
-                                if error["code"] == "cost_cap" {
-                                    coordinator.journal.event(&task.id,&attempt.id,attempt.generation,attempt.last_sequence,WorkerEvent::CostCapped { message:error.to_string() })?;
-                                    return Ok(());
-                                }
                                 coordinator.journal.set_value("provider_authenticated",&Some(false))?;
                                 bail!("OMP provider turn failed: {error}");
                             }
@@ -1745,27 +1770,5 @@ mod tests {
                 0
             );
         }
-    }
-}
-
-fn version_matches(output: &str, pin: &str) -> bool {
-    let expected = pin
-        .strip_prefix("omp/")
-        .unwrap_or(pin)
-        .trim_start_matches('v');
-    output.split_whitespace().any(|part| {
-        part.strip_prefix("omp/")
-            .unwrap_or(part)
-            .trim_start_matches('v')
-            == expected
-    })
-}
-
-#[cfg(test)]
-mod version_tests {
-    #[test]
-    fn installed_cli_prefix_is_accepted_without_loosening_pin() {
-        assert!(super::version_matches("omp/18.20.0\n", "18.20.0"));
-        assert!(!super::version_matches("omp/18.20.1\n", "18.20.0"));
     }
 }
