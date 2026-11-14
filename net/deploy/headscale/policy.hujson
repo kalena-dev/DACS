@@ -1,0 +1,58 @@
+// DACS Headscale policy (grants). Default deny: only the flows below exist.
+//
+// Ports to confirm with owners before the final demo:
+//   7443  coordinator control API (Person 1)        -- application TLS + device auth
+//   7444  coordinator bootstrap API (Person 1)      -- reached only via the infra relay
+//   9443  dacs-netadmin operation API (Person 3)    -- infra host, overlay only
+//   10600 sccache-dist scheduler (Person 4)
+//   10501 sccache-dist build server (Person 4)
+{
+  "groups": {
+    // Infrastructure administrators. This Headscale user owns no nodes; it
+    // only defines who may own the DACS tags.
+    "group:dacs-admins": ["dacs-admin@"]
+  },
+
+  "tagOwners": {
+    "tag:dacs-infra": ["group:dacs-admins"],
+    "tag:dacs-coordinator": ["group:dacs-admins"],
+    "tag:dacs-worker": ["group:dacs-admins"],
+    "tag:dacs-sccache-scheduler": ["group:dacs-admins"],
+    "tag:dacs-sccache-server": ["group:dacs-admins"]
+  },
+
+  "grants": [
+    // Workers (and compile nodes, which also run the DACS worker) reach the
+    // coordinator control API.
+    {
+      "src": ["tag:dacs-worker", "tag:dacs-sccache-scheduler", "tag:dacs-sccache-server"],
+      "dst": ["tag:dacs-coordinator"],
+      "ip": ["tcp:7443"]
+    },
+    // The public bootstrap relay on the infra host forwards TLS (passthrough)
+    // to the coordinator bootstrap API.
+    {
+      "src": ["tag:dacs-infra"],
+      "dst": ["tag:dacs-coordinator"],
+      "ip": ["tcp:7444"]
+    },
+    // Only the coordinator calls the enrollment adapter.
+    {
+      "src": ["tag:dacs-coordinator"],
+      "dst": ["tag:dacs-infra"],
+      "ip": ["tcp:9443"]
+    },
+    // sccache-dist: build initiators and servers -> scheduler.
+    {
+      "src": ["tag:dacs-worker", "tag:dacs-coordinator", "tag:dacs-sccache-server"],
+      "dst": ["tag:dacs-sccache-scheduler"],
+      "ip": ["tcp:10600"]
+    },
+    // sccache-dist: scheduler and build initiators -> build servers.
+    {
+      "src": ["tag:dacs-sccache-scheduler", "tag:dacs-worker", "tag:dacs-coordinator"],
+      "dst": ["tag:dacs-sccache-server"],
+      "ip": ["tcp:10501"]
+    }
+  ]
+}

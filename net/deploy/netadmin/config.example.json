@@ -1,0 +1,18 @@
+{
+  "listen": "INFRA_OVERLAY_IP:9443",
+  "tls": {
+    "cert_path": "/etc/dacs-netadmin/tls/cert.pem",
+    "key_path": "/etc/dacs-netadmin/tls/key.pem"
+  },
+  "headscale_url": "http://127.0.0.1:8080",
+  "headscale_api_key_path": "/etc/dacs-netadmin/headscale-api-key",
+  "operation_token_hashes_path": "/etc/dacs-netadmin/operation-tokens.sha256",
+  "login_server": "https://HS_DOMAIN",
+  "coordinator": {
+    "bootstrap_url": "https://BOOTSTRAP_DOMAIN",
+    "overlay_url": "https://coordinator.dacs.internal:7443"
+  },
+  "key_ttl_minutes": 15,
+  "audit_log_path": "/var/lib/dacs-netadmin/audit.jsonl",
+  "compiler_ports": { "scheduler": 10600, "server": 10501 }
+}
