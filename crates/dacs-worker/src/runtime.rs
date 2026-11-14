@@ -346,6 +346,17 @@ struct Running {
     desktop: bool,
     resources: Resources,
     capabilities: Vec<String>,
+    /// The journaled assignment's spec: the attempt's bound source/contract/policy pins.
+    pins: TaskSpec,
+}
+
+/// An attempt runs only under its assignment's pins; a coordinator record of the
+/// same generation with other pins is treated as stale, never adopted.
+fn same_pins(current: &TaskSpec, assigned: &TaskSpec) -> bool {
+    current.project_id == assigned.project_id
+        && current.source_commit == assigned.source_commit
+        && current.contract_revision == assigned.contract_revision
+        && current.policy_revision == assigned.policy_revision
 }
 
 /// Ordinary close requests: Ctrl-C, and on Unix also SIGTERM and SIGHUP (the
@@ -600,6 +611,7 @@ pub async fn run(mut config: WorkerConfig) -> Result<()> {
         status.active_attempt_ids.sort();
         status.active_attempt_ids.dedup();
         journal.set_value("local_status", &status)?;
+        let mut refused = Vec::new();
         let cycle: Result<()> = async {
             coordinator.flush().await?;
             // Narrowed by local withdrawals; a heartbeat never widens consent.
@@ -622,6 +634,14 @@ pub async fn run(mut config: WorkerConfig) -> Result<()> {
                 match journal.receive(&command) {
                     Ok(_) => (),
                     Err(crate::JournalError::StaleGeneration) => { through = through.max(message.sequence); continue; },
+                    // Same id, different body: never applied (the original stays bound),
+                    // recorded, and it must not wedge later stops/fencing in this queue.
+                    Err(crate::JournalError::DuplicateMismatch) => {
+                        journal.set_value(&format!("refused-message:{}", message.id), &json!({"sequence":message.sequence,"reason":"message id already received with a different body"}))?;
+                        refused.push(message.id.clone());
+                        through = through.max(message.sequence);
+                        continue;
+                    },
                     Err(error) => return Err(error.into()),
                 }
                 if message.kind == "stop" {
@@ -651,7 +671,7 @@ pub async fn run(mut config: WorkerConfig) -> Result<()> {
             for (id, runtime) in &running {
                 let current = snapshot.attempts.iter().find(|a| a.id == *id);
                 let stale = current.is_none_or(|a| {
-                    a.worker_id != config.worker_id || matches!(a.state.as_str(), "fenced" | "abandoned" | "stopping" | "stopped") || snapshot.tasks.iter().find(|t| t.id == a.task_id).is_none_or(|t| t.generation != a.generation || t.attempt_id.as_deref() != Some(id) || t.cancel_requested || matches!(t.state,TaskState::Accepted|TaskState::Cancelled|TaskState::Failed))
+                    a.worker_id != config.worker_id || matches!(a.state.as_str(), "fenced" | "abandoned" | "stopping" | "stopped") || snapshot.tasks.iter().find(|t| t.id == a.task_id).is_none_or(|t| t.generation != a.generation || t.attempt_id.as_deref() != Some(id) || t.cancel_requested || matches!(t.state,TaskState::Accepted|TaskState::Cancelled|TaskState::Failed) || !same_pins(&t.spec, &runtime.pins))
                 });
                 if stale {
                     let reason = if current.and_then(|a| snapshot.tasks.iter().find(|t| t.id == a.task_id)).is_some_and(|t| t.cancel_requested) { "coordinator_cancel" } else { "coordinator_fenced" };
@@ -667,7 +687,7 @@ pub async fn run(mut config: WorkerConfig) -> Result<()> {
                 let Some(attempt) = snapshot.attempts.iter().find(|a| a.id == original.id) else { continue };
                 let latest = snapshot.tasks.iter().find(|t| t.id == task.id);
                 let stopped = journal.get_value::<bool>(&format!("stop:{}", attempt.id))?.unwrap_or(false);
-                let valid = attempt.worker_id == config.worker_id && attempt.generation == original.generation && !matches!(attempt.state.as_str(),"fenced"|"abandoned"|"stopped"|"stopping") && latest.is_some_and(|t| t.generation == attempt.generation && t.attempt_id.as_deref() == Some(&attempt.id) && !t.cancel_requested && !matches!(t.state,TaskState::Accepted|TaskState::Failed|TaskState::Cancelled));
+                let valid = attempt.worker_id == config.worker_id && attempt.generation == original.generation && !matches!(attempt.state.as_str(),"fenced"|"abandoned"|"stopped"|"stopping") && latest.is_some_and(|t| t.generation == attempt.generation && t.attempt_id.as_deref() == Some(&attempt.id) && !t.cancel_requested && !matches!(t.state,TaskState::Accepted|TaskState::Failed|TaskState::Cancelled) && same_pins(&t.spec, &task.spec));
                 if !valid || stopped || controls.emergency_cancel {
                     let reason = if controls.emergency_cancel { "emergency_cancel" } else if latest.is_some_and(|t| t.cancel_requested) { "coordinator_cancel" } else { "coordinator_stop" };
                     local_control::record_stop(&journal, &attempt.id, reason)?;
@@ -713,11 +733,19 @@ pub async fn run(mut config: WorkerConfig) -> Result<()> {
                 let desktop = task.spec.required_capabilities.iter().any(|c| c.starts_with("desktop"));
                 let resources = attempt.resources.clone();
                 let capabilities = task.spec.required_capabilities.clone();
+                let pins = task.spec.clone();
                 let join = tokio::spawn(async move { execute_attempt(config,coordinator,supervisor,task,attempt,command.command_id,receiver).await });
-                running.insert(id, Running { stop, join, desktop, resources, capabilities });
+                running.insert(id, Running { stop, join, desktop, resources, capabilities, pins });
             }
             Ok(())
         }.await;
+        if !refused.is_empty() {
+            status.last_error = Some(format!(
+                "Refused control message(s) {} redelivered with a different body; the original receipt stays bound",
+                refused.join(", ")
+            ));
+            journal.set_value("local_status", &status)?;
+        }
         if let Err(error) = cycle {
             status.last_error = Some(format!(
                 "Coordinator unavailable/refused reconciliation: {error:#}"
@@ -1345,7 +1373,9 @@ async fn host_call(
         return Ok(receipt["result"].clone());
     }
     if name == "dacs_pending" {
-        let snapshot: Snapshot = coordinator.get("/api/state").await?;
+        let snapshot: Snapshot = coordinator.get("/api/state").await.context(
+            "coordinator unavailable: durable obligations cannot be read; continue only already admitted work",
+        )?;
         return Ok(serde_json::to_value(
             snapshot
                 .attempts
@@ -1453,7 +1483,7 @@ async fn host_call(
             attempt.generation,
             command,
         )?;
-        let _ = tokio::time::timeout(Duration::from_millis(500), coordinator.flush()).await;
+        let delivery = tokio::time::timeout(Duration::from_millis(500), coordinator.flush()).await;
         if let Some(receipt) = coordinator.journal.receipt(operation)? {
             anyhow::ensure!(
                 receipt["ok"] == true,
@@ -1467,6 +1497,18 @@ async fn host_call(
         if !pending.iter().any(|id| id == operation) {
             pending.push(operation.into());
             coordinator.journal.set_value(&key, &pending)?;
+        }
+        // Coordinator loss is reported explicitly: nothing was admitted and no
+        // capacity is reserved until the coordinator answers after reconnection.
+        let unavailable = match delivery {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(format!("{error:#}")),
+            Err(_) => Some("coordinator did not answer within 500 ms".to_owned()),
+        };
+        if let Some(reason) = unavailable {
+            return Ok(
+                json!({"pending":true,"operation_id":operation,"coordinator_unavailable":reason,"message":"Coordinator unreachable: this operation is persisted locally but NOT admitted and holds no capacity. Do not run it locally or elsewhere and do not repeat it; its durable outcome arrives after reconnection."}),
+            );
         }
     }
     Ok(
