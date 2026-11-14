@@ -65,6 +65,32 @@ fn is_dacs_tagset(tags: &[String]) -> bool {
             .all(|t| NodeRole::from_tag(t).is_some_and(|r| ENROLLABLE_ROLES.contains(&r)))
 }
 
+/// Why a freshly created key must not be handed out, if it must not. The
+/// grant reports the requested tags and expiry, so the key must match them.
+fn unusable_key(key: &PreAuthKey, tags: &[String], expires_at: OffsetDateTime) -> Option<&'static str> {
+    let mut got = key.acl_tags.clone();
+    got.sort();
+    got.dedup();
+    let mut want = tags.to_vec();
+    want.sort();
+    if key.key.is_empty() {
+        Some("pre-auth key returned without secret")
+    } else if key.reusable || key.ephemeral {
+        Some("headscale created a reusable/ephemeral key")
+    } else if key.used {
+        Some("headscale returned an already used key")
+    } else if got != want {
+        Some("headscale created a key with other tags than requested")
+    } else if key
+        .expiration
+        .is_none_or(|e| e > expires_at + time::Duration::minutes(1))
+    {
+        Some("headscale created a key that outlives the requested expiry")
+    } else {
+        None
+    }
+}
+
 fn parse_ips(node: &Node) -> Vec<IpAddr> {
     node.ip_addresses
         .iter()
@@ -123,16 +149,26 @@ impl<H: HeadscaleApi> Service<H> {
 
         let expires_at = now + self.settings.key_ttl;
         let key = self.hs.create_tagged_key(&tags, expires_at).await?;
-        if key.key.is_empty() {
+        if let Some(problem) = unusable_key(&key, &tags, expires_at) {
+            // Never hand out a key that could enroll more than one device, carry
+            // other tags or outlive the grant. Expire it and audit the refusal so
+            // a failed cleanup can still be reconciled by key id.
+            let expired = self.hs.expire_key(key.id).await;
+            if let Err(e) = &expired {
+                tracing::error!(auth_key_id = key.id, error = %e, "could not expire refused pre-auth key");
+            }
+            self.audit.record(
+                "enroll_refused",
+                serde_json::json!({
+                    "device_id": req.device_id,
+                    "host_name": req.host_name,
+                    "auth_key_id": key.id,
+                    "problem": problem,
+                    "key_expired": expired.is_ok(),
+                }),
+            );
             return Err(ServiceError::Upstream(HeadscaleError::Decode(
-                "pre-auth key returned without secret".into(),
-            )));
-        }
-        if key.reusable || key.ephemeral {
-            // Never hand out a key that could enroll more than one device.
-            let _ = self.hs.expire_key(key.id).await;
-            return Err(ServiceError::Upstream(HeadscaleError::Decode(
-                "headscale created a reusable/ephemeral key".into(),
+                problem.into(),
             )));
         }
 
@@ -311,13 +347,14 @@ impl<H: HeadscaleApi> Service<H> {
             )));
         }
 
-        let mut key_expired = false;
+        // A key without an expiry never expires in Headscale; expire it too.
+        let mut expire_sent = false;
         if let Some(k) = &key
             && !k.used
-            && k.expiration.is_some_and(|e| e > now)
+            && k.expiration.is_none_or(|e| e > now)
         {
             self.hs.expire_key(k.id).await?;
-            key_expired = true;
+            expire_sent = true;
         }
 
         let mut node_deleted = None;
@@ -330,10 +367,28 @@ impl<H: HeadscaleApi> Service<H> {
         }
 
         let after = self.hs.list_nodes().await?;
-        let verified_absent = matches!(
+        let node_absent = matches!(
             Self::find_node(&after, req.node_id.or(node_deleted), req.auth_key_id),
             Ok(None)
         );
+        // Re-read the key instead of trusting the expire reply: a no-op expire,
+        // or a retry after a lost reply, must report what Headscale now holds.
+        // Headscale stamps the expiry with its own clock, so compare against
+        // the current time rather than the request time.
+        let (key_expired, key_unusable) = match req.auth_key_id {
+            Some(key_id) => {
+                let checked_at = OffsetDateTime::now_utc().max(now);
+                match self.find_key(key_id).await? {
+                    Some(k) => {
+                        let expired = k.expiration.is_some_and(|e| e <= checked_at);
+                        (!k.used && expired, k.used || expired)
+                    }
+                    None => (false, true),
+                }
+            }
+            None => (false, true),
+        };
+        let verified_absent = node_absent && key_unusable;
 
         self.audit.record(
             "revoke",
@@ -343,6 +398,7 @@ impl<H: HeadscaleApi> Service<H> {
                 "node_id": req.node_id,
                 "requested_by": req.requested_by,
                 "reason": req.reason,
+                "expire_sent": expire_sent,
                 "key_expired": key_expired,
                 "node_deleted": node_deleted,
                 "verified_absent": verified_absent,

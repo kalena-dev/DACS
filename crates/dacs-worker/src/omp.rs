@@ -20,8 +20,13 @@ pub enum OmpRpcError {
     Closed,
     #[error("OMP RPC request timed out")]
     Timeout,
-    #[error("OMP returned an error: {0}")]
-    Remote(String),
+    /// A correlated `success: false` response. `code` is OMP's machine-readable
+    /// reason (for example `session_busy`) when it sent one.
+    #[error("OMP returned an error: {message}{}", .code.as_deref().map(|c| format!(" [{c}]")).unwrap_or_default())]
+    Remote {
+        message: String,
+        code: Option<String>,
+    },
     #[error("invalid OMP JSONL: {0}")]
     Json(#[from] serde_json::Error),
     #[error("OMP transport I/O failed: {0}")]
@@ -61,15 +66,52 @@ pub enum OmpEvent {
     },
 }
 
+impl OmpRpcError {
+    /// OMP's machine-readable failure reason for a correlated error response.
+    pub fn code(&self) -> Option<&str> {
+        match self {
+            Self::Remote { code, .. } => code.as_deref(),
+            _ => None,
+        }
+    }
+}
+
+impl OmpEvent {
+    /// The error of a `prompt_result` refused by the owner's OMP cost cap
+    /// (`session.maxCost` / `--max-cost`). Any other failure returns `None`, so
+    /// a cost-capped turn is never reported as a provider or login failure.
+    pub fn cost_capped(&self) -> Option<&Value> {
+        match self {
+            Self::PromptResult {
+                status,
+                error: Some(error),
+                ..
+            } if status == "error" && error["code"] == "cost_cap" => Some(error),
+            _ => None,
+        }
+    }
+}
+
+/// Dialog methods that block an OMP turn until the host answers.
+const BLOCKING_UI_METHODS: [&str; 5] = ["select", "confirm", "input", "editor", "ask"];
+
+type Writer = Arc<Mutex<Option<ChildStdin>>>;
+
 #[derive(Clone)]
 pub struct OmpRpc {
-    writer: Arc<Mutex<Option<ChildStdin>>>,
+    writer: Writer,
     pending: Pending,
     ready: watch::Receiver<Option<Value>>,
 }
 
 impl OmpRpc {
     /// The supervisor retains process ownership. The caller must also drain stderr.
+    ///
+    /// Blocking `extension_ui_request` dialogs (tool approval selects, confirms,
+    /// inputs) are declined immediately with `cancelled: true` and still
+    /// forwarded as [`OmpEvent::Unknown`]: a managed session has no local
+    /// person at the dialog, and remote coordinator messages must not approve
+    /// local control requests. Without an answer OMP would wait indefinitely.
     pub fn from_io(
         stdin: ChildStdin,
         stdout: ChildStdout,
@@ -78,10 +120,17 @@ impl OmpRpc {
         let (events, receiver) = mpsc::channel(capacity.max(32));
         let (ready_tx, ready) = watch::channel(None);
         let pending = Arc::new(Mutex::new(BTreeMap::new()));
-        tokio::spawn(read_loop(stdout, pending.clone(), events, ready_tx));
+        let writer: Writer = Arc::new(Mutex::new(Some(stdin)));
+        tokio::spawn(read_loop(
+            stdout,
+            pending.clone(),
+            events,
+            ready_tx,
+            writer.clone(),
+        ));
         (
             Self {
-                writer: Arc::new(Mutex::new(Some(stdin))),
+                writer,
                 pending,
                 ready,
             },
@@ -179,18 +228,70 @@ impl OmpRpc {
     }
 
     async fn send(&self, frame: Value) -> Result<(), OmpRpcError> {
-        let bytes = serde_json::to_vec(&frame)?;
-        if bytes.len() >= MAX_FRAME {
-            return Err(OmpRpcError::Protocol(
-                "inbound command exceeds physical frame limit".into(),
-            ));
+        write_frame(&self.writer, frame).await
+    }
+}
+
+async fn write_frame(writer: &Writer, frame: Value) -> Result<(), OmpRpcError> {
+    let bytes = serde_json::to_vec(&frame)?;
+    // OMP reassembles chunks only on its output; host frames are single lines.
+    if bytes.len() >= MAX_FRAME {
+        return Err(OmpRpcError::Protocol(
+            "inbound command exceeds physical frame limit".into(),
+        ));
+    }
+    let mut writer = writer.lock().await;
+    let stdin = writer.as_mut().ok_or(OmpRpcError::Closed)?;
+    stdin.write_all(&bytes).await?;
+    stdin.write_all(b"\n").await?;
+    stdin.flush().await?;
+    Ok(())
+}
+
+/// Version reported by `omp --version` (`omp/18.16.0`; `omp v18.16.0` and a
+/// bare `18.16.0` are also read).
+pub fn installed_version(output: &str) -> Option<&str> {
+    let mut parts = output.split_whitespace().peekable();
+    while let Some(part) = parts.next() {
+        let version = match part.strip_prefix("omp/") {
+            Some(version) => version,
+            None if part == "omp" => parts.peek().copied().unwrap_or(""),
+            None if part.starts_with(|c: char| c.is_ascii_digit()) => part,
+            None => continue,
         }
-        let mut writer = self.writer.lock().await;
-        let stdin = writer.as_mut().ok_or(OmpRpcError::Closed)?;
-        stdin.write_all(&bytes).await?;
-        stdin.write_all(b"\n").await?;
-        stdin.flush().await?;
-        Ok(())
+        .trim_start_matches('v');
+        if !version.is_empty() {
+            return Some(version);
+        }
+    }
+    None
+}
+
+/// Compares `omp --version` output with the configured pin. Acceptance is an
+/// exact version match; a mismatch names both versions rather than failing
+/// with a generic error or passing as a near match.
+pub fn check_pinned_version(output: &str, pin: &str) -> Result<String, String> {
+    let expected = pin.trim();
+    let expected = expected
+        .strip_prefix("omp/")
+        .unwrap_or(expected)
+        .trim_start_matches('v');
+    let matches = !expected.is_empty()
+        && output.split_whitespace().any(|part| {
+            part.strip_prefix("omp/")
+                .unwrap_or(part)
+                .trim_start_matches('v')
+                == expected
+        });
+    match installed_version(output) {
+        _ if matches => Ok(expected.to_owned()),
+        Some(found) => Err(format!(
+            "installed OMP is {found} but the pinned version is {expected:?}; install the pinned OMP or correct the pin"
+        )),
+        None => Err(format!(
+            "could not read the installed OMP version from `omp --version` output {:?}; pinned version is {expected:?}",
+            output.trim()
+        )),
     }
 }
 
@@ -272,6 +373,7 @@ async fn read_loop(
     pending: Pending,
     events: mpsc::Sender<OmpEvent>,
     ready: watch::Sender<Option<Value>>,
+    writer: Writer,
 ) {
     let outcome: Result<(), OmpRpcError> = async {
         let mut reader = BufReader::new(stdout);
@@ -320,12 +422,27 @@ async fn read_loop(
                         let response = if value["success"] == true {
                             Ok(value.get("data").cloned().unwrap_or(Value::Null))
                         } else {
-                            Err(OmpRpcError::Remote(value["error"].to_string()))
+                            Err(OmpRpcError::Remote {
+                                message: value["error"]
+                                    .as_str()
+                                    .map_or_else(|| value["error"].to_string(), str::to_owned),
+                                code: value["code"].as_str().map(str::to_owned),
+                            })
                         };
                         let _ = tx.send(response);
                         continue;
                     }
                 }
+            }
+            if value["type"] == "extension_ui_request"
+                && BLOCKING_UI_METHODS.contains(&value["method"].as_str().unwrap_or(""))
+                && let Some(id) = value["id"].as_str()
+            {
+                write_frame(
+                    &writer,
+                    json!({"type":"extension_ui_response","id":id,"cancelled":true}),
+                )
+                .await?;
             }
             // Overflow fails the session instead of dropping a submission or
             // blocking command responses behind an undrained event queue.
@@ -378,6 +495,60 @@ mod tests {
         assert!(
             matches!(classify_event(json!({"type":"prompt_result","status":"error","error":{"code":"cost_cap"},"sessionSettled":true})),
             OmpEvent::PromptResult { error: Some(e), .. } if e["code"] == "cost_cap")
+        );
+    }
+
+    #[test]
+    fn cost_cap_is_distinct_from_other_prompt_failures() {
+        let capped = classify_event(
+            json!({"type":"prompt_result","id":"p","agentInvoked":true,"status":"error","sessionSettled":true,"error":{"message":"Cost cap reached","retryable":false,"code":"cost_cap"}}),
+        );
+        assert_eq!(capped.cost_capped().unwrap()["message"], "Cost cap reached");
+        for other in [
+            json!({"type":"prompt_result","status":"error","sessionSettled":true,"error":{"message":"Couldn't connect","retryable":true}}),
+            json!({"type":"prompt_result","status":"aborted","sessionSettled":true}),
+            json!({"type":"prompt_result","status":"completed","sessionSettled":true,"error":{"code":"cost_cap"}}),
+            json!({"type":"notice","level":"error","source":"cost-gate","message":"Cost cap reached"}),
+        ] {
+            assert!(classify_event(other).cost_capped().is_none());
+        }
+    }
+
+    #[test]
+    fn pinned_version_mismatch_names_both_versions() {
+        assert_eq!(
+            check_pinned_version("omp/18.20.0\n", "18.20.0").unwrap(),
+            "18.20.0"
+        );
+        assert_eq!(
+            check_pinned_version("omp/18.20.0\n", "omp/v18.20.0").unwrap(),
+            "18.20.0"
+        );
+        let error = check_pinned_version("omp/18.16.0\n", "18.20.0").unwrap_err();
+        assert!(
+            error.contains("18.16.0") && error.contains("18.20.0"),
+            "{error}"
+        );
+        assert!(check_pinned_version("omp/18.20.1\n", "18.20.0").is_err());
+        // Former runtime::version_matches acceptance is unchanged.
+        assert!(check_pinned_version("18.20.0\n", "18.20.0").is_ok());
+        assert!(check_pinned_version("omp/18.20.0-rc1\n", "18.20.0").is_err());
+        assert!(check_pinned_version("omp/18.20.0\n", "").is_err());
+        assert!(check_pinned_version("", "18.20.0").is_err());
+        assert_eq!(installed_version("omp v18.16.0\n"), Some("18.16.0"));
+        assert_eq!(installed_version("18.16.0\n"), Some("18.16.0"));
+    }
+
+    #[test]
+    fn remote_errors_keep_message_and_code() {
+        let error = OmpRpcError::Remote {
+            message: "Entry x not found".into(),
+            code: Some("entry_not_found".into()),
+        };
+        assert_eq!(error.code(), Some("entry_not_found"));
+        assert_eq!(
+            error.to_string(),
+            "OMP returned an error: Entry x not found [entry_not_found]"
         );
     }
 

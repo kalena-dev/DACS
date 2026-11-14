@@ -5,6 +5,7 @@
 /// Person 4 build planning/evidence adapter over Person 2's process descriptor.
 pub mod build_execution;
 pub mod build_runner;
+pub mod capacity;
 mod journal;
 pub mod local_control;
 mod omp;
@@ -14,5 +15,7 @@ pub mod task_board;
 mod workspace;
 
 pub use journal::{Journal, JournalError, PendingCommand, PendingResult};
-pub use omp::{OmpEvent, OmpRpc, OmpRpcError, OmpToolCall};
-pub use supervisor::{ManagedChild, ProcessIo, ProcessState, Supervisor};
+pub use omp::{
+    OmpEvent, OmpRpc, OmpRpcError, OmpToolCall, check_pinned_version, installed_version,
+};
+pub use supervisor::{ManagedChild, ProcessIo, ProcessState, ReservationUsage, Supervisor};

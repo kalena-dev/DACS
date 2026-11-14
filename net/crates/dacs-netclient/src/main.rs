@@ -7,9 +7,10 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use dacs_net_contract::{CompilerEndpoint, EnrollmentGrant, HostConsent, PeerSnapshot};
+use dacs_net_contract::{CompilerEndpoint, EnrollmentGrant, HostConsent};
 use dacs_netclient::compiler::{self, CompilerSide};
-use dacs_netclient::{JoinOptions, assess, detect, join, leave, peers, ping, probe_tcp};
+use dacs_netclient::traffic::{self, SnapshotFile};
+use dacs_netclient::{JoinOptions, assess, detect, join, leave, ping, probe_tcp};
 use serde::Serialize;
 
 #[derive(Parser)]
@@ -48,7 +49,8 @@ enum Command {
     },
     /// Log out of the DACS profile only.
     Leave { login_server: String },
-    /// Passive per-peer path and transfer counters.
+    /// Passive per-peer path and transfer counters with the client's backend
+    /// state. Exit 2 when the client is not Running (values are last-known).
     Peers,
     /// Active path probe to a peer (name or overlay IP).
     Ping {
@@ -76,12 +78,16 @@ enum Command {
         from: Option<CompilerSide>,
     },
     /// Per-peer transfer between two `peers` snapshots (e.g. around a build).
+    /// Flags counter resets, vanished peers and non-running snapshots (exit 2).
     Traffic {
         #[arg(long)]
         before: PathBuf,
         #[arg(long)]
         after: PathBuf,
     },
+    /// Measured compiler-path availability and overlay transfer evidence.
+    #[command(subcommand)]
+    Measure(dacs_netclient::measure::MeasureCommand),
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &PathBuf) -> Result<T, String> {
@@ -94,14 +100,6 @@ fn print<T: Serialize>(value: &T) {
         "{}",
         serde_json::to_string_pretty(value).expect("serializable")
     );
-}
-
-#[derive(Serialize)]
-struct Traffic {
-    host_name: String,
-    path_after: dacs_net_contract::PeerPath,
-    rx_bytes: u64,
-    tx_bytes: u64,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -119,6 +117,7 @@ async fn main() -> ExitCode {
 /// Returns Ok(false) when the command ran but a check failed.
 async fn run(cli: Cli) -> Result<bool, String> {
     match cli.command {
+        Command::Measure(cmd) => return dacs_netclient::measure::run_cli(cmd).await,
         Command::Status => print(&detect().await),
         Command::Assess { login_server } => print(&assess(&login_server).await),
         Command::Preflight { config } => {
@@ -151,7 +150,11 @@ async fn run(cli: Cli) -> Result<bool, String> {
             leave(&login_server).await.map_err(|e| e.to_string())?;
             print(&serde_json::json!({ "left": login_server }));
         }
-        Command::Peers => print(&peers().await.map_err(|e| e.to_string())?),
+        Command::Peers => {
+            let report = traffic::capture().await.map_err(|e| e.to_string())?;
+            print(&report);
+            return Ok(report.running);
+        }
         Command::Ping { peer, count } => {
             let probe = ping(&peer, count).await.map_err(|e| e.to_string())?;
             let ok = !matches!(probe.path, dacs_net_contract::PeerPath::Unreachable { .. });
@@ -195,21 +198,11 @@ async fn run(cli: Cli) -> Result<bool, String> {
             return Ok(!checks.is_empty() && checks.iter().all(|c| c.ok));
         }
         Command::Traffic { before, after } => {
-            let before: Vec<PeerSnapshot> = read_json(&before)?;
-            let after: Vec<PeerSnapshot> = read_json(&after)?;
-            let out: Vec<Traffic> = after
-                .into_iter()
-                .map(|a| {
-                    let b = before.iter().find(|b| b.host_name == a.host_name);
-                    Traffic {
-                        rx_bytes: a.rx_bytes.saturating_sub(b.map_or(0, |b| b.rx_bytes)),
-                        tx_bytes: a.tx_bytes.saturating_sub(b.map_or(0, |b| b.tx_bytes)),
-                        host_name: a.host_name,
-                        path_after: a.path,
-                    }
-                })
-                .collect();
-            print(&out);
+            let before: SnapshotFile = read_json(&before)?;
+            let after: SnapshotFile = read_json(&after)?;
+            let report = traffic::diff(&before, &after);
+            print(&report);
+            return Ok(report.ok);
         }
     }
     Ok(true)

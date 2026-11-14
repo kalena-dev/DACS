@@ -261,11 +261,23 @@ token; the single-use auth key is consumed by `join` and is not part of
     and a measured non-unreachable path. Rejects non-overlay addresses before probing.
     Exit 2 if any endpoint fails or the list is empty.
   - `dacs-net peers > before.json`, run the build, `dacs-net peers > after.json`, then
-    `dacs-net traffic --before before.json --after after.json`: per peer
-    `{host_name, path_after, rx_bytes, tx_bytes}` deltas. `PeerSnapshot { host_name, overlay_ips, online, path, rx_bytes, tx_bytes }`.
-    Passive paths can show only the home DERP region for idle peers.
+    `dacs-net traffic --before before.json --after after.json`.
+    `peers` prints `PeersReport { captured_at, backend_state, running, warning, peers: Vec<PeerSnapshot> }`
+    (`PeerSnapshot { host_name, overlay_ips, online, path, rx_bytes, tx_bytes }`) and exits 2
+    when the client is not `Running`: a stopped client (seen on macOS 1.102.4) still lists
+    peers online over their last path, so those values are last-known, not current.
+    `traffic` prints `TrafficReport { before_backend_state, after_backend_state, counters_current, warnings, peers, ok }`
+    with per peer `{host_name, status, rx_bytes, tx_bytes, path_after}`; `status` is
+    `measured` | `counter_reset` (a counter went down; both deltas null, not 0) |
+    `new_peer` | `missing_after` (in the first snapshot only; deltas null). `path_after`
+    is shown only when the second snapshot is known to be `Running`. It is passive (idle
+    peers can show only the home DERP region), so path evidence comes from active probes
+    (`ping`, `compiler-check`, `measure`). Exit 2 on any warning. Older bare-array `peers`
+    files are accepted with a warning (backend state unknown, `path_after` withheld).
   - `dacs-net ping <peer> [--count 5]`: `PathProbe { peer, path, rtt_ms, measured_at }`; exit 2 if unreachable.
   - `dacs-net probe <addr:port>... [--timeout-ms 3000]`: TCP reachability; exit 2 if any fails.
+  - `dacs-net measure evidence ...`: availability window and overlay transfers as one
+    JSON record per build; see [Measured availability and transfer](#measured-availability-and-transfer-cratesdacs-netclientsrcmeasurers).
 - `PeerPath` (tag `path`): `direct { endpoint }` | `derp { region }` | `peer_relay { relay }` |
   `unreachable { detail }`. `direct` vs `derp` is the direct/relayed distinction to report.
 
@@ -278,15 +290,62 @@ token; the single-use auth key is consumed by `join` and is not part of
 | `preflight --config <file>` | Read-only DNS, verified TLS, health and bootstrap-to-netadmin bridge checks; no tokens or joins |
 | `join --grant <file> --consent <file> [--unattended] [--no-dns]` | Join with an `EnrollmentGrant` and `HostConsent`; prints `LocalJoinResult` |
 | `leave <LOGIN_SERVER>` | Log out of the DACS profile only |
-| `peers` | `Vec<PeerSnapshot>` |
+| `peers` | `PeersReport` (backend state + `Vec<PeerSnapshot>`); exit 2 if not `Running` |
 | `ping <peer> [--count N]` | `PathProbe` |
 | `probe <ADDR:PORT>... [--timeout-ms N]` | `Vec<TcpProbe>` |
 | `compiler-check --endpoints <file> [--timeout-ms N]` | Compiler endpoint reachability and path |
-| `traffic --before <file> --after <file>` | Per-peer byte deltas and path |
+| `traffic --before <file> --after <file>` | `TrafficReport`: per-peer byte deltas, resets, missing peers, passive path |
+| `measure availability\|sink\|send\|evidence ...` | Measured compiler-path availability and overlay transfer; see below |
 
 Exit codes: 0 success, 2 the command ran but a check failed (`ping`, `probe`,
-`compiler-check`, `preflight`), 1 error. The CLI is found via `DACS_TAILSCALE_BIN`, then `PATH`,
+`compiler-check`, `preflight`, `peers`, `traffic`, `measure`), 1 error. The CLI is found via `DACS_TAILSCALE_BIN`, then `PATH`,
 then platform default install paths. No command prints the auth key.
+
+### Measured availability and transfer (`crates/dacs-netclient/src/measure.rs`)
+
+For item 8: which path a build used, and measured availability/transfer on it.
+Every address must be an overlay address (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`);
+`0.0.0.0`, LAN and loopback addresses are refused before anything is probed, bound
+or sent. A target on this host's own overlay IP is measured but labelled `local`
+and never counts as overlay proof.
+
+```sh
+# Availability window: repeat compiler-check N times (start-to-start interval).
+dacs-net measure availability --endpoints eps.json --from client --samples 30 --interval-ms 2000
+# Transfer: on the receiving node, on a port the ACL grants between the two nodes
+# (e.g. 10501 on a compile server before sccache-dist binds it) ...
+dacs-net measure sink --listen 100.64.0.5:10501 [--count 1] [--max-bytes 1073741824]
+# ... and on the sending node:
+dacs-net measure send --to 100.64.0.5:10501 --bytes 67108864
+# One record to attach to a build: window, then transfers to running sinks.
+dacs-net measure evidence --endpoints eps.json --from client --samples 30 \
+  --transfer-to 100.64.0.5:10501 --bytes 67108864 --build <build-id> > net-evidence.json
+```
+
+- `availability` (`AvailabilityReport`): per endpoint `samples`, `successes`,
+  `success_ratio`, `overlay_successes` (local excluded), `paths` (counts per class),
+  `path_changes` and `direct_relay_flips`, `connect_ms`/`rtt_ms` as
+  `{count, min, median, p95, max}` (nearest rank, observed values), and the raw
+  `series` of `{at, ok, tcp_reachable, connect_ms, path_class, rtt_ms, error}`. With
+  `--from`, `roles` gives the rounds in which each required role was reached over the
+  overlay. `ok` (exit 0) only if every round passed `compiler-check`.
+- `send` (`TransferResult`): `requested_bytes`, `sent_bytes`, `acknowledged_bytes`,
+  `connect_ms`, `duration_ms` (first payload byte until the sink's acknowledgement),
+  `mib_per_s`, `mbit_per_s`, `sink_duration_ms`, `path_before`/`path_after`
+  (`tailscale ping`) with `path_class_before`/`_after`, `complete`, `overlay_proof`
+  (complete and both probes `direct` or `relayed`). Exit 0 only when `overlay_proof`.
+  `sink` prints `SinkReport { listen, results, stopped, ok }`; it refuses transfers over
+  `--max-bytes` before any payload and gives up after `--wait-secs` (600).
+- `evidence` (`MeasureEvidence`, `schema: dacs-net/measure-evidence/1`): `build`,
+  `created_at`, `tools { dacs_net, contract_revision, tailscale }`,
+  `local_overlay_ips`, `from`, `availability`, `transfers`, `paths_observed`,
+  `overlay_proof`, `ok` (every round passed and every transfer is overlay proof) and
+  `notes` (local/relayed/path-change caveats).
+
+One TCP stream and one window per figure: a measurement, not a capacity or
+build-speed claim, and relayed figures say nothing about relay throughput elsewhere.
+Tested only with scripted probers and loopback sockets; no transfer between physical
+hosts has been measured with this tool yet.
 
 ## Coordinator-first bootstrap
 
@@ -451,6 +510,7 @@ contact a real Headscale server or modify the local Tailscale client.
 | `cargo test -p dacs-net-contract -p dacs-netadmin -p dacs-netclient` (root workspace) | Passed: 36 tests (6 + 16 + 14), plus clippy clean on `dacs-netclient` | Local run 2026-11-14 |
 | `dacs-netadmin` against real Headscale v0.29.7 + Tailscale 1.104.7 client (isolated WSL): enroll, single-use reuse refused, join, rename, membership, compiler endpoints, 401/400/409, revoke, no reconnect, revoke-before-use | Passed | `evidence/local-headscale-integration.md` |
 | `dacs-net status` / `assess` against the real Windows Tailscale 1.104.7 client (logged out) | Passed: `logged_out`, no switch consent needed | Local run |
+| `dacs-net status` / `assess` / `preflight` (read-only) against the real macOS standalone Tailscale 1.102.4 app, stopped with an existing SaaS login | Passed: `logged_in`/`Stopped` detected, switch consent and disclosure required, client state digests unchanged, template preflight refused offline. macOS join/switch/revoke/paths not run | `evidence/macos-device-client.md` |
 | `deploy/infra-setup.sh` static checks (offline, WSL Ubuntu 24.04) | Passed: `bash -n` clean, ShellCheck 0.9.0 `-x` clean (no disable directives added). One real defect found and fixed: the policy check used `headscale policy check` over gRPC, which fails when no headscale is running (every first install died there); it now validates the rendered policy offline against a throwaway config/DB before installing anything. The fixed block was exercised in isolation (valid policy accepted, undefined tag rejected, no `/var`/`/etc` paths touched). The script itself was never executed; HTTPS health/certificate/systemd paths remain unexecuted | Local static run; commit `d7d5737` |
 | `deploy/nginx/dacs.conf` (rendered and split like `infra-setup.sh`) | Passed `nginx -t` (nginx 1.24.0 Ubuntu + `ngx_stream_module`, scratch `-p` prefix, self-signed throwaway cert) for coordinator-enrolled, coordinator-not-enrolled and ACME-bootstrap renders. Only the nginx < 1.25.1 `listen ... ssl http2` variant was tested; the `http2 on;` variant (nginx >= 1.25.1) was not. Nothing was started or bound | Local static run |
 | `deploy/headscale/config.yaml` and `policy.hujson` | Passed: Headscale 0.29.7 `configtest` on rendered temp copies (with and without `PUBLIC_IPV6`, paths redirected to a temp dir); `policy check --bypass-grpc-and-access-database-directly` on a temp DB reported "Policy is valid" (and rejected a deliberately broken copy). `serve` was not run | Local static run |

@@ -12,8 +12,10 @@
 //!   counters and private reachability for build evidence.
 
 pub mod compiler;
+pub mod measure;
 pub mod preflight;
 pub mod tailscale;
+pub mod traffic;
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -369,21 +371,7 @@ pub async fn leave(login_server: &str) -> Result<(), NetError> {
 pub async fn peers() -> Result<Vec<PeerSnapshot>, NetError> {
     let ts = Tailscale::locate()?;
     let status = parse_status(&ts.run(&["status", "--json"], SHORT).await?.stdout)?;
-    let mut out: Vec<PeerSnapshot> = status
-        .peer
-        .unwrap_or_default()
-        .into_values()
-        .map(|p| PeerSnapshot {
-            host_name: p.host_name.clone(),
-            overlay_ips: p.ips(),
-            online: p.online,
-            path: p.path(),
-            rx_bytes: p.rx_bytes,
-            tx_bytes: p.tx_bytes,
-        })
-        .collect();
-    out.sort_by(|a, b| a.host_name.cmp(&b.host_name));
-    Ok(out)
+    Ok(traffic::snapshots(&status))
 }
 
 /// Active path probe: sends `count` disco pings without stopping at the first

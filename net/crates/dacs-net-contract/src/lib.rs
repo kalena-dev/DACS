@@ -361,11 +361,14 @@ pub struct RevocationRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RevocationOutcome {
     pub device_id: DeviceId,
-    /// The pre-auth key was unused and is now expired.
+    /// The pre-auth key was unused and is now expired (as re-read from
+    /// Headscale after the operation, so a retry reports the same).
     pub key_expired: bool,
-    /// A node was found and deleted from Headscale.
+    /// A node was found and deleted from Headscale by this call.
     pub node_deleted: Option<u64>,
-    /// After the operation, no node for this device remains registered.
+    /// After the operation, no node for this device remains registered and its
+    /// pre-auth key (if named) is used, expired or gone. False means the
+    /// revocation is still pending; retry it.
     pub verified_absent: bool,
     #[serde(with = "time::serde::rfc3339")]
     pub at: OffsetDateTime,

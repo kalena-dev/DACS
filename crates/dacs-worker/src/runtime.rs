@@ -344,6 +344,45 @@ struct Running {
     stop: watch::Sender<bool>,
     join: tokio::task::JoinHandle<Result<()>>,
     desktop: bool,
+    resources: Resources,
+    capabilities: Vec<String>,
+}
+
+/// Ordinary close requests: Ctrl-C, and on Unix also SIGTERM and SIGHUP (the
+/// terminal window closing). Each requests a drain, never a kill.
+async fn close_requests(journal: Arc<Journal>) {
+    let drain = || {
+        let mut controls: OwnerControls = journal
+            .get_value("owner_controls")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        controls.draining = true;
+        let _ = journal.set_value("owner_controls", &controls);
+    };
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let (Ok(mut interrupt), Ok(mut terminate), Ok(mut hangup)) = (
+            signal(SignalKind::interrupt()),
+            signal(SignalKind::terminate()),
+            signal(SignalKind::hangup()),
+        ) else {
+            return;
+        };
+        loop {
+            tokio::select! {
+                Some(()) = interrupt.recv() => drain(),
+                Some(()) = terminate.recv() => drain(),
+                Some(()) = hangup.recv() => drain(),
+                else => return,
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    while tokio::signal::ctrl_c().await.is_ok() {
+        drain();
+    }
 }
 
 /// Manually invoked; neither public installation nor invitation starts this loop.
@@ -368,6 +407,12 @@ pub async fn run(mut config: WorkerConfig) -> Result<()> {
     config.workspaces_dir = std::fs::canonicalize(&config.workspaces_dir)?;
     config.omp_executable =
         std::fs::canonicalize(&config.omp_executable).context("pinned OMP executable missing")?;
+    // Never advertise capacity the physical host cannot back; refuse before
+    // any lock, process launch or coordinator contact.
+    crate::capacity::check_declared(
+        &config.registration.capacity,
+        &crate::capacity::observe(&config.workspaces_dir)?,
+    )?;
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -415,10 +460,12 @@ pub async fn run(mut config: WorkerConfig) -> Result<()> {
     )
     .await?;
     anyhow::ensure!(
-        version.0 == 0
-            && version_matches(&String::from_utf8_lossy(&version.1), &config.omp_version),
-        "installed OMP does not match pinned version"
+        version.0 == 0,
+        "`omp --version` failed with exit code {}",
+        version.0
     );
+    crate::omp::check_pinned_version(&String::from_utf8_lossy(&version.1), &config.omp_version)
+        .map_err(anyhow::Error::msg)?;
     let mut status = LocalStatus { worker_id:config.worker_id.clone(), running:true, elevated,
         limitations:vec!["Native desktop capabilities are observed at launch, not cross-platform certification. Permission/lock/backend failures refuse access.".into(),
         "Tools inherit the owner token; DACS never silently elevates or replaces the owner profile. Restrictions are advisory, not containment.".into(),
@@ -449,21 +496,8 @@ pub async fn run(mut config: WorkerConfig) -> Result<()> {
     journal.set_value("local_status", &status)?;
     let mut running = BTreeMap::<String, Running>::new();
     let mut interval = tokio::time::interval(Duration::from_millis(config.poll_interval_ms));
-    let signal_journal = journal.clone();
-    let signal = tokio::spawn(async move {
-        loop {
-            if tokio::signal::ctrl_c().await.is_err() {
-                break;
-            }
-            let mut controls: OwnerControls = signal_journal
-                .get_value("owner_controls")
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-            controls.draining = true;
-            let _ = signal_journal.set_value("owner_controls", &controls);
-        }
-    });
+    let signal = tokio::spawn(close_requests(journal.clone()));
+    let mut last_snapshot: Option<Snapshot> = None;
     let mut was_draining = true; // Manual startup explicitly resumes the device.
     loop {
         interval.tick().await;
@@ -473,12 +507,19 @@ pub async fn run(mut config: WorkerConfig) -> Result<()> {
                 .get_value::<bool>("coordinator_revoked")?
                 .unwrap_or(false)
         {
-            for runtime in running.values() {
+            for (id, runtime) in &running {
+                let reason = if controls.emergency_cancel {
+                    "emergency_cancel"
+                } else {
+                    "worker_revoked"
+                };
+                local_control::record_stop(&journal, id, reason)?;
                 let _ = runtime.stop.send(true);
             }
         }
         if controls.desktop_paused {
-            for runtime in running.values().filter(|r| r.desktop) {
+            for (id, runtime) in running.iter().filter(|(_, r)| r.desktop) {
+                local_control::record_stop(&journal, id, "desktop_paused")?;
                 let _ = runtime.stop.send(true);
             }
         }
@@ -514,13 +555,55 @@ pub async fn run(mut config: WorkerConfig) -> Result<()> {
         status.desktop_active = running.values().any(|r| r.desktop)
             || desktop_owner.is_some_and(|id| live_attempts.contains(&id));
         status.desktop_paused = controls.desktop_paused && !status.desktop_active;
+        // Permission reduction drains: report what is still exercised.
+        let mut registration = config.registration.clone();
+        registration
+            .capabilities
+            .retain(|cap| !local_control::withdrawn(&controls.withdrawn_capabilities, cap));
+        status.effective_capabilities = registration.capabilities.clone();
+        let exercised: Vec<_> = running
+            .iter()
+            .map(|(id, r)| (id.clone(), r.capabilities.clone()))
+            .collect();
+        (
+            status.pending_permission_changes,
+            status.active_broader_permissions,
+        ) = local_control::permission_drain(&controls.withdrawn_capabilities, &exercised);
+        let stop_requests: Vec<(String, String)> =
+            journal.get_value("stop_requests")?.unwrap_or_default();
+        let unreported = journal.pending_results(4096)?;
+        status.stops = stop_requests
+            .into_iter()
+            .map(|(id, reason)| {
+                let attempt = last_snapshot
+                    .as_ref()
+                    .and_then(|s| s.attempts.iter().find(|a| a.id == id));
+                let task = attempt.and_then(|a| {
+                    last_snapshot
+                        .as_ref()
+                        .and_then(|s| s.tasks.iter().find(|t| t.id == a.task_id))
+                });
+                let phase = local_control::stop_phase(
+                    running.contains_key(&id) || live_attempts.contains(&id),
+                    unreported.iter().any(|r| r.attempt_id == id),
+                    attempt,
+                    task,
+                );
+                local_control::StopStatus {
+                    attempt_id: id,
+                    reason,
+                    phase,
+                }
+            })
+            .collect();
         status.active_attempt_ids = running.keys().cloned().chain(live_attempts).collect();
         status.active_attempt_ids.sort();
         status.active_attempt_ids.dedup();
         journal.set_value("local_status", &status)?;
         let cycle: Result<()> = async {
             coordinator.flush().await?;
-            coordinator.command(Command::Heartbeat { registration:config.registration.clone() }).await?;
+            // Narrowed by local withdrawals; a heartbeat never widens consent.
+            coordinator.command(Command::Heartbeat { registration:registration.clone() }).await?;
             coordinator.command(Command::ReportRuntimeStatus { status:WorkerRuntimeStatus {
                 worker_id:config.worker_id.clone(),provider_authenticated:status.provider_authenticated,network_ready:Some(true),
                 desktop_session:status.desktop_supported.then(|| format!("owner:{}",config.registration.physical_host_id)),
@@ -544,10 +627,13 @@ pub async fn run(mut config: WorkerConfig) -> Result<()> {
                 if message.kind == "stop" {
                     if let Some(id) = &message.attempt_id {
                         journal.set_value(&format!("stop:{id}"), &true)?;
+                        local_control::record_stop(&journal, id, "coordinator_stop")?;
                         if let Some(runtime) = running.get(id) { let _ = runtime.stop.send(true); }
                     }
                     journal.mark_command(&message.id, "done")?;
-                } else if message.kind == "desktop_pause" {
+                } else if matches!(message.kind.as_str(), "pause_desktop" | "desktop_pause") {
+                    // The coordinator may only narrow: pause. Nothing it sends
+                    // resumes the desktop, clears a drain, or widens consent.
                     local_control::request(&config.data_dir, local_control::ControlAction::PauseDesktop)?;
                     journal.mark_command(&message.id, "done")?;
                 }
@@ -559,6 +645,7 @@ pub async fn run(mut config: WorkerConfig) -> Result<()> {
             }
             if through > 0 { coordinator.command(Command::AcknowledgeMessages { through_sequence:through }).await?; }
             let snapshot: Snapshot = coordinator.get("/api/state").await?;
+            last_snapshot = Some(snapshot.clone());
             let worker = snapshot.workers.iter().find(|w| w.id == config.worker_id).context("worker missing from coordinator snapshot")?;
             if worker.revoked { for runtime in running.values() { let _ = runtime.stop.send(true); } bail!("worker was revoked"); }
             for (id, runtime) in &running {
@@ -566,7 +653,11 @@ pub async fn run(mut config: WorkerConfig) -> Result<()> {
                 let stale = current.is_none_or(|a| {
                     a.worker_id != config.worker_id || matches!(a.state.as_str(), "fenced" | "abandoned" | "stopping" | "stopped") || snapshot.tasks.iter().find(|t| t.id == a.task_id).is_none_or(|t| t.generation != a.generation || t.attempt_id.as_deref() != Some(id) || t.cancel_requested || matches!(t.state,TaskState::Accepted|TaskState::Cancelled|TaskState::Failed))
                 });
-                if stale { let _ = runtime.stop.send(true); }
+                if stale {
+                    let reason = if current.and_then(|a| snapshot.tasks.iter().find(|t| t.id == a.task_id)).is_some_and(|t| t.cancel_requested) { "coordinator_cancel" } else { "coordinator_fenced" };
+                    local_control::record_stop(&journal, id, reason)?;
+                    let _ = runtime.stop.send(true);
+                }
             }
             for command in journal.pending_commands()? {
                 let message: ControlMessage = serde_json::from_value(command.payload.clone())?;
@@ -578,6 +669,8 @@ pub async fn run(mut config: WorkerConfig) -> Result<()> {
                 let stopped = journal.get_value::<bool>(&format!("stop:{}", attempt.id))?.unwrap_or(false);
                 let valid = attempt.worker_id == config.worker_id && attempt.generation == original.generation && !matches!(attempt.state.as_str(),"fenced"|"abandoned"|"stopped"|"stopping") && latest.is_some_and(|t| t.generation == attempt.generation && t.attempt_id.as_deref() == Some(&attempt.id) && !t.cancel_requested && !matches!(t.state,TaskState::Accepted|TaskState::Failed|TaskState::Cancelled));
                 if !valid || stopped || controls.emergency_cancel {
+                    let reason = if controls.emergency_cancel { "emergency_cancel" } else if latest.is_some_and(|t| t.cancel_requested) { "coordinator_cancel" } else { "coordinator_stop" };
+                    local_control::record_stop(&journal, &attempt.id, reason)?;
                     anyhow::ensure!(supervisor.terminate_attempt(&attempt.id, Duration::from_secs(10)).await?, "attempt process tree could not be stopped");
                     coordinator.command(Command::ReconcileWorker { stopped_attempt_ids:vec![attempt.id.clone()] }).await?;
                     journal.mark_command(&command.command_id,"done")?;
@@ -593,6 +686,22 @@ pub async fn run(mut config: WorkerConfig) -> Result<()> {
                     journal.mark_command(&command.command_id,"done")?;
                     continue;
                 }
+                if let Some(capability) = task.spec.required_capabilities.iter().find(|cap| local_control::withdrawn(&controls.withdrawn_capabilities, cap)) {
+                    // Permission reduction drains running work but never starts
+                    // new use of the withdrawn grant. Refuse explicitly so the
+                    // coordinator can release the reservation and reschedule.
+                    journal.event(&task.id,&attempt.id,attempt.generation,attempt.last_sequence,WorkerEvent::Failed { message:format!("Owner withdrew local capability {capability} before this attempt started; not executed") })?;
+                    journal.event(&task.id,&attempt.id,attempt.generation,attempt.last_sequence,WorkerEvent::Stopped)?;
+                    journal.set_value(&format!("phase:{}",attempt.id),&"finished")?;
+                    journal.mark_command(&command.command_id,"done")?;
+                    continue;
+                }
+                // Defense in depth against over-admission: OMP, its tools and
+                // build/compiler processes all run under this reservation.
+                if !crate::capacity::fits(running.values().map(|r| &r.resources), &attempt.resources, &config.registration.capacity) {
+                    tracing::warn!(attempt = %attempt.id, "assignment exceeds remaining declared capacity; held unstarted");
+                    continue;
+                }
                 // Previously admitted work resumes even while draining. No local
                 // task creation or reservation growth occurs during outages.
                 let (stop, receiver) = watch::channel(false);
@@ -602,8 +711,10 @@ pub async fn run(mut config: WorkerConfig) -> Result<()> {
                 let attempt = attempt.clone();
                 let id = attempt.id.clone();
                 let desktop = task.spec.required_capabilities.iter().any(|c| c.starts_with("desktop"));
+                let resources = attempt.resources.clone();
+                let capabilities = task.spec.required_capabilities.clone();
                 let join = tokio::spawn(async move { execute_attempt(config,coordinator,supervisor,task,attempt,command.command_id,receiver).await });
-                running.insert(id, Running { stop, join, desktop });
+                running.insert(id, Running { stop, join, desktop, resources, capabilities });
             }
             Ok(())
         }.await;
@@ -627,11 +738,54 @@ pub async fn run(mut config: WorkerConfig) -> Result<()> {
     Ok(())
 }
 
-fn managed_overlay(desktop: bool) -> String {
+/// The `--config` overlay of every managed OMP session: native async/task/
+/// launch spawning paths off so scheduled children are admitted by DACS.
+pub fn managed_overlay(desktop: bool) -> String {
     // Never override session.maxCost or owner provider/model configuration.
     format!(
         "async:\n  enabled: false\nlaunch:\n  enabled: false\n  persist: false\nbash:\n  autoBackground:\n    enabled: false\ntask:\n  maxRecursionDepth: 0\neval:\n  py: false\n  js: {desktop}\ncomputer:\n  enabled: {desktop}\ntools:\n  xdev: false\n  approval:\n    computer: allow\n    computer.control: allow\nupdate:\n  auto: false\n"
     )
+}
+
+/// Arguments of every managed OMP launch: headless JSONL RPC and an explicit
+/// tool allowlist without OMP's native `task`/`wait` spawning tools.
+pub fn managed_omp_args(
+    overlay: &Path,
+    session_dir: &Path,
+    profile: Option<&str>,
+    probe: bool,
+    desktop: bool,
+) -> Vec<String> {
+    let mut args = vec![
+        "--mode".into(),
+        "rpc".into(),
+        "--no-ui".into(),
+        "--no-extensions".into(),
+        "--no-pty".into(),
+        "--config".into(),
+        overlay.to_string_lossy().into_owned(),
+        "--session-dir".into(),
+        session_dir.to_string_lossy().into_owned(),
+    ];
+    if probe && !desktop {
+        args.push("--no-tools".into());
+    } else if probe {
+        args.extend(["--tools".into(), "eval".into()]);
+    } else {
+        args.extend([
+            "--tools".into(),
+            if desktop {
+                "read,write,edit,bash,grep,glob,web_search,eval"
+            } else {
+                "read,write,edit,bash,grep,glob,web_search"
+            }
+            .into(),
+        ]);
+    }
+    if let Some(profile) = profile {
+        args.extend(["--profile".into(), profile.to_owned()]);
+    }
+    args
 }
 
 async fn launch_omp(
@@ -651,35 +805,13 @@ async fn launch_omp(
     std::fs::create_dir_all(state)?;
     let overlay = state.join("managed.yml");
     std::fs::write(&overlay, managed_overlay(desktop))?;
-    let mut args = vec![
-        "--mode".into(),
-        "rpc".into(),
-        "--no-ui".into(),
-        "--no-extensions".into(),
-        "--no-pty".into(),
-        "--config".into(),
-        overlay.to_string_lossy().into_owned(),
-        "--session-dir".into(),
-        state.join("session").to_string_lossy().into_owned(),
-    ];
-    if probe && !desktop {
-        args.push("--no-tools".into());
-    } else if probe {
-        args.extend(["--tools".into(), "eval".into()]);
-    } else {
-        args.extend([
-            "--tools".into(),
-            if desktop {
-                "read,write,edit,bash,grep,glob,web_search,eval"
-            } else {
-                "read,write,edit,bash,grep,glob,web_search"
-            }
-            .into(),
-        ]);
-    }
-    if let Some(profile) = &config.omp_profile {
-        args.extend(["--profile".into(), profile.clone()]);
-    }
+    let args = managed_omp_args(
+        &overlay,
+        &state.join("session"),
+        config.omp_profile.as_deref(),
+        probe,
+        desktop,
+    );
     let id = uuid::Uuid::new_v4().to_string();
     supervisor
         .launch(
@@ -994,7 +1126,8 @@ fn write_durable(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn host_tools() -> Value {
+/// DACS host tools registered with `set_host_tools` in every managed session.
+pub fn host_tools() -> Value {
     json!([
         {"name":"dacs_delegate","label":"Delegate DACS task","description":"Request admission of a child TaskSpec. Returns immediately with an admitted task ID or durable pending receipt. Completion arrives in the mailbox; parent reservation remains held.","loadMode":"essential","parameters":{"type":"object","properties":{"spec":{"type":"object"}},"required":["spec"],"additionalProperties":false}},
         {"name":"dacs_workflow","label":"Submit build/test workflow","description":"Admit a workflow child using TaskSpec execution.kind=workflow and effect_class=external. Never execute a distributed build outside admitted capacity.","loadMode":"essential","parameters":{"type":"object","properties":{"spec":{"type":"object"}},"required":["spec"],"additionalProperties":false}},
@@ -1142,13 +1275,14 @@ async fn agent_attempt(
                             // A durable admitted child is not cancelled by loss of
                             // its transient host call. Its coordinator ID survives.
                         }
+                        event @ OmpEvent::PromptResult { .. } if event.cost_capped().is_some() => {
+                            let error = event.cost_capped().cloned().unwrap_or(Value::Null);
+                            coordinator.journal.event(&task.id,&attempt.id,attempt.generation,attempt.last_sequence,WorkerEvent::CostCapped { message:error.to_string() })?;
+                            return Ok(());
+                        }
                         OmpEvent::PromptResult { status,error,session_settled,.. } => {
                             if status == "error" {
                                 let error = error.unwrap_or(Value::Null);
-                                if error["code"] == "cost_cap" {
-                                    coordinator.journal.event(&task.id,&attempt.id,attempt.generation,attempt.last_sequence,WorkerEvent::CostCapped { message:error.to_string() })?;
-                                    return Ok(());
-                                }
                                 coordinator.journal.set_value("provider_authenticated",&Some(false))?;
                                 bail!("OMP provider turn failed: {error}");
                             }
@@ -1636,27 +1770,5 @@ mod tests {
                 0
             );
         }
-    }
-}
-
-fn version_matches(output: &str, pin: &str) -> bool {
-    let expected = pin
-        .strip_prefix("omp/")
-        .unwrap_or(pin)
-        .trim_start_matches('v');
-    output.split_whitespace().any(|part| {
-        part.strip_prefix("omp/")
-            .unwrap_or(part)
-            .trim_start_matches('v')
-            == expected
-    })
-}
-
-#[cfg(test)]
-mod version_tests {
-    #[test]
-    fn installed_cli_prefix_is_accepted_without_loosening_pin() {
-        assert!(super::version_matches("omp/18.20.0\n", "18.20.0"));
-        assert!(!super::version_matches("omp/18.20.1\n", "18.20.0"));
     }
 }
